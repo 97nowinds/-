@@ -1,0 +1,12 @@
+[
+  {
+    "id": "cam_1",
+    "name": "海康 HK-H1P4M-P",
+    "source_env": "LAB_CAM_1_RTSP"
+  },
+  {
+    "id": "cam_2",
+    "name": "手机摄像头",
+    "source": 2
+  }
+]

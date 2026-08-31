@@ -1,0 +1,80 @@
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>实验人员人脸采集</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/faces.css">
+  </head>
+  <body>
+    <main class="face-shell">
+      <header class="face-topbar">
+        <div>
+          <a id="monitorLink" class="back-link" href="/">返回监控</a>
+          <h1>实验人员人脸采集</h1>
+          <p>同一现场采集不同姿态，系统只保存通过质量检查的有效人脸。</p>
+        </div>
+        <span id="faceServiceState" class="service-state">连接中</span>
+      </header>
+
+      <section class="face-workspace">
+        <section class="face-form-panel">
+          <h2>1. 建立采集会话</h2>
+          <form id="registrationForm" novalidate>
+            <label>人员 ID<input id="personId" required maxlength="40" placeholder="person_001"></label>
+            <label>显示姓名<input id="personName" required maxlength="40" placeholder="张三"></label>
+            <label>注册序号<input id="personLabel" required type="number" min="1" step="1" placeholder="1"></label>
+            <label>采集摄像头<select id="cameraId" required></select><small>正式注册默认使用海康 Camera 1；Camera 2 可作为备用采集视角。</small></label>
+            <label>有效样本数量
+              <input id="targetSamples" type="number" min="50" max="80" value="60">
+              <small>建议 60 张；允许范围 50～80 张</small>
+            </label>
+            <label class="check-label"><input id="replaceExisting" type="checkbox" checked>同一 ID 重新采集时替换旧样本</label>
+            <button id="startSession" class="primary-action" type="submit">开始采集会话</button>
+          </form>
+          <button id="cancelSession" class="secondary-action" type="button" disabled>取消并删除本次样本</button>
+        </section>
+
+        <section class="capture-panel">
+          <div class="capture-header">
+            <div><h2>2. 按引导采集</h2><span id="sessionState">尚未开始</span></div>
+            <span id="captureCount" class="capture-count">0 / 60</span>
+          </div>
+          <div class="capture-preview">
+            <img id="captureStream" alt="采集摄像头画面">
+            <div id="previewMessage" class="preview-message">海康摄像头连接后显示实时画面</div>
+            <div id="liveGuidance" class="live-guidance idle">等待实时检测</div>
+          </div>
+          <div class="pose-guidance">
+            <span id="poseLabel" class="pose-label">等待开始</span>
+            <strong id="poseInstruction">填写资料并选择海康摄像头，然后点击“开始采集会话”</strong>
+            <span id="poseProgress">当前姿态 0 / 0</span>
+          </div>
+          <div class="capture-actions">
+            <button id="captureButton" class="primary-action" type="button" disabled>采集一张</button>
+            <button id="finishButton" class="finish-action" type="button" disabled>完成注册</button>
+          </div>
+          <div id="captureMessage" class="capture-message" role="status">请先建立采集会话。</div>
+        </section>
+      </section>
+
+      <section class="face-rules">
+        <h2>采集要求</h2>
+        <div class="rule-grid">
+          <p><b>现场一致：</b>在正式使用的实验室、同一摄像头高度和主要光照下采集。</p>
+          <p><b>单人入镜：</b>画面只能出现当前采集人员，其他人请离开视野。</p>
+          <p><b>姿态覆盖：</b>正脸、左右转头、轻微低头、近距离和较远距离均按窗口引导完成。</p>
+          <p><b>失败重采：</b>显示“未捕捉到”“脸过小”“模糊”等提示时，调整后再次点击，不会污染样本库。</p>
+        </div>
+      </section>
+      <section class="face-steps">
+        <span class="step active">1 填写人员资料</span>
+        <span class="step">2 选择海康摄像头</span>
+        <span class="step">3 点击开始采集会话</span>
+        <span class="step">4 按姿态提示点击采集一张</span>
+        <span class="step">5 达到样本数后完成注册</span>
+      </section>
+    </main>
+    <script src="/static/faces.js"></script>
+  </body>
+</html>

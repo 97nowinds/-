@@ -1,0 +1,47 @@
+.face-shell { width: min(1180px, 100%); margin: 0 auto; padding: 18px; }
+.face-topbar { display: flex; justify-content: space-between; gap: 18px; padding-bottom: 16px; border-bottom: 1px solid #2d343c; }
+.face-topbar h1 { margin-top: 9px; font-size: 21px; }
+.face-topbar p { margin-top: 7px; color: #8f9ba7; font-size: 13px; }
+.back-link { color: #8fc5e8; text-decoration: none; font-size: 12px; }
+.face-workspace { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 14px; margin-top: 14px; }
+.face-form-panel, .capture-panel, .face-rules { border: 1px solid #2d343c; border-radius: 7px; background: #171b20; }
+.face-form-panel { padding: 14px; }
+.face-form-panel h2, .capture-panel h2, .face-rules h2 { font-size: 15px; }
+#registrationForm { display: grid; gap: 11px; margin-top: 14px; }
+#registrationForm label { display: grid; gap: 6px; color: #9ba6b1; font-size: 11px; }
+#registrationForm input, #registrationForm select { width: 100%; height: 36px; padding: 0 9px; border: 1px solid #38424c; border-radius: 5px; outline: none; background: #101419; color: #edf1f5; font: inherit; font-size: 13px; }
+#registrationForm small { color: #71808d; font-size: 10px; }
+.check-label { display: flex !important; grid-template-columns: auto 1fr; align-items: center; gap: 7px !important; color: #c1cbd4 !important; }
+.check-label input { width: 15px !important; height: 15px !important; }
+.primary-action, .secondary-action, .finish-action { min-height: 36px; padding: 0 12px; border: 1px solid transparent; border-radius: 5px; color: #f4f7fa; font-weight: 700; cursor: pointer; }
+.primary-action { background: #176a47; border-color: #23835b; }
+.finish-action { background: #8a5b22; border-color: #b47d31; }
+.secondary-action { width: 100%; margin-top: 9px; background: #29313a; border-color: #3b4651; }
+.primary-action:disabled, .finish-action:disabled, .secondary-action:disabled { cursor: not-allowed; opacity: .45; }
+.capture-panel { overflow: hidden; }
+.capture-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 13px 14px; border-bottom: 1px solid #2d343c; }
+.capture-header div { display: grid; gap: 5px; }
+.capture-header span { color: #84909c; font-size: 11px; }
+.capture-count { color: #86e9ad !important; font-size: 15px !important; font-weight: 700; }
+.capture-preview { position: relative; aspect-ratio: 16 / 9; min-height: 0; overflow: hidden; background: #050607; }
+.capture-preview img { position: relative; z-index: 1; display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; }
+.preview-message { position: absolute; inset: 50% auto auto 50%; transform: translate(-50%, -50%); color: #9ba6b1; font-size: 13px; }
+.live-guidance { position: absolute; z-index: 2; left: 12px; right: 12px; bottom: 12px; min-height: 42px; padding: 11px 13px; border: 1px solid #814541; border-radius: 5px; background: rgba(69, 27, 25, .94); color: #ffb0a9; font-size: 13px; font-weight: 700; }
+.live-guidance.ready { border-color: #287c56; background: rgba(18, 65, 43, .93); color: #91edb6; }
+.live-guidance.idle { border-color: #3c4650; background: rgba(30, 36, 42, .9); color: #aab5bf; }
+.pose-guidance { display: grid; gap: 5px; padding: 12px 14px; border-top: 1px solid #2d343c; }
+.pose-label { color: #d6a85c; font-size: 12px; font-weight: 700; }
+.pose-instruction, #poseInstruction { color: #edf1f5; font-size: 14px; }
+#poseProgress { color: #84909c; font-size: 11px; }
+.capture-actions { display: flex; gap: 8px; padding: 0 14px 12px; }
+.capture-actions button { flex: 1; }
+.capture-message { min-height: 42px; padding: 10px 14px; border-top: 1px solid #2d343c; color: #86e9ad; font-size: 12px; }
+.capture-message.error { color: #ff9c9c; }
+.face-rules { margin-top: 14px; padding: 14px; }
+.face-steps { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.step { padding: 8px 10px; border: 1px solid #3a4651; border-radius: 5px; background: #171b20; color: #aab5bf; font-size: 11px; }
+.step.active { border-color: #3b9d6d; color: #91edb6; }
+.rule-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 20px; margin-top: 11px; }
+.rule-grid p { color: #aab5bf; font-size: 12px; line-height: 1.6; }
+.rule-grid b { color: #e2e8ed; }
+@media (max-width: 800px) { .face-workspace, .rule-grid { grid-template-columns: 1fr; } .capture-preview, .capture-preview img { min-height: 0; } }

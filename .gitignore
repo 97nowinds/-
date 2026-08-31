@@ -1,0 +1,29 @@
+# Local Python/runtime environments
+.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Offline installation and deployment bundles
+linux_wheels/
+*.zip
+*.tar.gz
+tools/mediamtx/
+
+# Large model weights are deployed separately from source history
+person_track/weights/
+
+# Scheduler and runtime output
+*.out
+*.err
+*.log
+runs/
+
+# Local secrets and editor files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

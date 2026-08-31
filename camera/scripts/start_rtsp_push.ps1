@@ -1,0 +1,101 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^rtsps?://')]
+    [string]$RemoteBaseUrl,
+    [string]$Camera1Ip = "192.168.1.64",
+    [string]$Camera2Ip = "192.168.1.65",
+    [string]$Camera1Username = "admin",
+    [string]$Camera2Username = "admin",
+    [string]$RemoteUsername = "",
+    [ValidateSet("101", "102")]
+    [string]$Channel = "102",
+    [ValidateSet("tcp", "udp")]
+    [string]$RtspTransport = "tcp",
+    [int]$RestartSeconds = 5
+)
+
+$ErrorActionPreference = "Stop"
+if ($RemoteBaseUrl -match '@') {
+    throw "Do not put a remote password in RemoteBaseUrl. Use -RemoteUsername and the runtime prompt."
+}
+$projectRoot = Split-Path -Parent $PSScriptRoot
+$ffmpeg = Join-Path (Split-Path -Parent $projectRoot) ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"
+if (-not (Test-Path -LiteralPath $ffmpeg)) {
+    $ffmpeg = Join-Path $projectRoot ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"
+}
+if (-not (Test-Path -LiteralPath $ffmpeg)) {
+    throw "FFmpeg was not found. Install imageio-ffmpeg in C:\codex1\.venv first."
+}
+
+$passwordPointers = @()
+$processes = @{}
+$remotePassword = ""
+
+function New-Url([string]$scheme, [string]$ip, [string]$username, [string]$password) {
+    $user = [Uri]::EscapeDataString($username)
+    $pass = [Uri]::EscapeDataString($password)
+    return "${scheme}://${user}:${pass}@${ip}:554/Streaming/Channels/${Channel}"
+}
+
+function Add-Credentials([string]$url, [string]$username, [string]$password) {
+    if ([string]::IsNullOrWhiteSpace($username)) { return $url }
+    $uri = [Uri]$url
+    $user = [Uri]::EscapeDataString($username)
+    $pass = [Uri]::EscapeDataString($password)
+    return "$($uri.Scheme)://${user}:${pass}@$($uri.Host):$($uri.Port)$($uri.PathAndQuery)"
+}
+
+function Start-Push([string]$name, [string]$sourceUrl, [string]$destinationUrl) {
+    $argumentLine = "-hide_banner -loglevel error -nostdin -rtsp_transport $RtspTransport -fflags nobuffer -flags low_delay -i `"$sourceUrl`" -map 0:v:0 -map 0:a? -c:v copy -c:a copy -f rtsp -rtsp_transport tcp `"$destinationUrl`""
+    $processes[$name] = Start-Process -FilePath $ffmpeg -ArgumentList $argumentLine -WindowStyle Hidden -PassThru
+    Write-Host "$name push process started (PID $($processes[$name].Id))" -ForegroundColor Green
+}
+
+$password1 = Read-Host "Password for Cam1 user '$Camera1Username'" -AsSecureString
+$password2 = Read-Host "Password for Cam2 user '$Camera2Username'" -AsSecureString
+if (-not [string]::IsNullOrWhiteSpace($RemoteUsername)) {
+    $remotePasswordSecure = Read-Host "Password for remote RTSP ingest user '$RemoteUsername'" -AsSecureString
+}
+
+try {
+    $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($password1)
+    $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($password2)
+    if ($remotePasswordSecure) {
+        $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($remotePasswordSecure)
+        $remotePassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[2])
+    }
+    $remoteCam1 = Add-Credentials (($RemoteBaseUrl.TrimEnd('/') + "/cam_1")) $RemoteUsername $remotePassword
+    $remoteCam2 = Add-Credentials (($RemoteBaseUrl.TrimEnd('/') + "/cam_2")) $RemoteUsername $remotePassword
+    $source1 = New-Url "rtsp" $Camera1Ip $Camera1Username ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[0]))
+    $source2 = New-Url "rtsp" $Camera2Ip $Camera2Username ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[1]))
+
+    Write-Host "Laboratory RTSP push gateway" -ForegroundColor Cyan
+    Write-Host "Cam1: $Camera1Ip, Cam2: $Camera2Ip, channel: $Channel, input transport: $RtspTransport"
+    Write-Host "Remote paths: /cam_1 and /cam_2"
+    Write-Host "The lab host runs FFmpeg only; no Python, AI, recording, or Flask."
+    Write-Host "All passwords are runtime-only and are not written to disk or logs."
+
+    Start-Push "Cam1" $source1 $remoteCam1
+    Start-Push "Cam2" $source2 $remoteCam2
+
+    while ($true) {
+        foreach ($name in @("Cam1", "Cam2")) {
+            $process = $processes[$name]
+            if ($process.HasExited) {
+                Write-Host "$name push exited with code $($process.ExitCode); retrying in ${RestartSeconds}s." -ForegroundColor Yellow
+                Start-Sleep -Seconds $RestartSeconds
+                if ($name -eq "Cam1") { Start-Push $name $source1 $remoteCam1 }
+                if ($name -eq "Cam2") { Start-Push $name $source2 $remoteCam2 }
+            }
+        }
+        Start-Sleep -Seconds 2
+    }
+}
+finally {
+    foreach ($process in $processes.Values) {
+        if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+    }
+    foreach ($pointer in $passwordPointers) {
+        if ($pointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
+    }
+}

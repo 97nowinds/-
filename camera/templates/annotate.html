@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>实验室空间标注</title>
+  <link rel="stylesheet" href="/static/annotate.css">
+</head>
+<body>
+  <main class="annotator">
+    <header class="page-header">
+      <div>
+        <p class="eyebrow">实验室预警装置</p>
+        <h1>摄像头与通道标注</h1>
+        <p class="lede">在真实画面上框选主通道、副通道和重叠区；需要重新标定时，再配对四个地面参考点。</p>
+      </div>
+      <a class="back-link" href="/">返回监控</a>
+    </header>
+
+    <section class="toolbar" aria-label="标注工具">
+      <label>摄像头
+        <select id="cameraSelect"></select>
+      </label>
+      <label>当前标注
+        <select id="modeSelect">
+          <option value="main_aisle">主通道（框选）</option>
+          <option value="secondary_aisle">内侧通道（框选）</option>
+          <option value="overlap">两路重叠区（框选）</option>
+          <option value="reference">地面参考点（点击）</option>
+        </select>
+      </label>
+      <button id="clearButton" type="button">清除当前标注</button>
+      <label class="check-label"><input id="activateCalibration" type="checkbox"> 四点齐全后启用新映射</label>
+      <button id="saveButton" class="primary" type="button">保存标注</button>
+    </section>
+
+    <p id="status" class="status" role="status">正在读取配置...</p>
+
+    <section class="workspace">
+      <article class="panel camera-panel">
+        <div class="panel-heading">
+          <div><h2 id="cameraTitle">摄像头画面</h2><span>拖拽框选区域，或按顺序点击四个地面点</span></div>
+          <span class="step" id="pointStep">区域标注</span>
+        </div>
+        <div class="frame-wrap" id="frameWrap">
+          <img id="cameraFrame" alt="当前摄像头实时画面">
+          <canvas id="annotationCanvas" aria-label="摄像头画面标注层"></canvas>
+        </div>
+        <div class="legend">
+          <span><i class="swatch main"></i>主通道</span>
+          <span><i class="swatch secondary"></i>内侧通道</span>
+          <span><i class="swatch overlap"></i>重叠区</span>
+          <span><i class="swatch point"></i>参考点</span>
+        </div>
+      </article>
+
+      <aside class="panel map-panel">
+        <div class="panel-heading">
+          <div><h2>实验室平面图</h2><span>参考点需与左侧画面中的点一一对应</span></div>
+          <span class="step" id="mapStep">等待标注</span>
+        </div>
+        <div class="map-wrap">
+          <svg id="mapSvg" viewBox="0 0 1200 700" role="img" aria-label="实验室俯视地图">
+            <rect class="map-background" x="0" y="0" width="1200" height="700"></rect>
+            <g id="mapFixtures"></g>
+            <g id="mapZones"></g>
+            <g id="mapCameras"></g>
+            <g id="mapPoints"></g>
+          </svg>
+        </div>
+        <div class="point-list" id="pointList">尚未设置参考点</div>
+      </aside>
+    </section>
+
+    <section class="instructions panel">
+      <h2>标注顺序</h2>
+      <ol>
+        <li>选择 cam_1 或 cam_2，分别在真实画面上框出主通道、内侧通道和两路都能看到的重叠区。</li>
+        <li>选择“地面参考点”，在画面中按 1、2、3、4 点击地面角点，再在右侧地图点击相同编号的位置。</li>
+        <li>确认两路摄像头都标注完成后点击保存；勾选启用新映射后，需要重启后端服务。</li>
+      </ol>
+    </section>
+  </main>
+  <script src="/static/annotate.js"></script>
+</body>
+</html>

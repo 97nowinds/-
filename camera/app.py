@@ -1,0 +1,2045 @@
+import atexit
+import json
+import logging
+import os
+import re
+import shutil
+import tempfile
+import threading
+import time
+from collections import Counter, deque
+from pathlib import Path
+
+import cv2
+import numpy as np
+from flask import Flask, Response, jsonify, render_template, request
+
+from camera_source import resolve_camera_source
+from dataset_recorder import DatasetRecorder, RecordingError
+from face_identity import (
+    REGISTRATION_MAX_SAMPLES,
+    REGISTRATION_MIN_SAMPLES,
+    FaceIdentityStore,
+    registration_pose_plan,
+)
+from floor_map import FloorMapProjector
+from identity_handoff import IdentityHandoff
+from motion_person_detector import MotionPersonDetector
+from person_tracking import PersonTrack
+from reid_embedder import ReIDEmbedder
+from slam_localizer import SlamLocalizer
+from yolo_person_tracker import (
+    CrossCameraTrackCoordinator,
+    TrackTrailStore,
+    YoloPersonTracker,
+)
+
+
+# Keep FFmpeg's RTSP demuxer from accumulating old frames. UDP gives the lowest
+# latency on a reliable LAN; TCP remains the safer default.
+RTSP_TRANSPORT = os.environ.get("LAB_RTSP_TRANSPORT", "tcp").strip().lower()
+if RTSP_TRANSPORT not in {"tcp", "udp"}:
+    RTSP_TRANSPORT = "tcp"
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    (
+        f"rtsp_transport;{RTSP_TRANSPORT}|stimeout;5000000|fflags;nobuffer|"
+        "flags;low_delay|max_delay;0|analyzeduration;0|probesize;32768"
+    ),
+)
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config" / "cameras.json"
+FLOOR_MAP_PATH = BASE_DIR / "config" / "floor_map.json"
+DATA_DIR = BASE_DIR / "data"
+PEOPLE_PATH = DATA_DIR / "people.json"
+KNOWN_FACES_DIR = DATA_DIR / "known_faces"
+RECORDINGS_DIR = DATA_DIR / "recordings"
+YOLO_MODEL_PATH = BASE_DIR / "models" / "yolov8n.pt"
+FACE_MODEL_PATH = BASE_DIR / "models" / "face_detection_yunet_2023mar.onnx"
+FACE_RECOGNITION_MODEL_PATH = BASE_DIR / "models" / "face_recognition_sface_2021dec.onnx"
+MODERN_FACE_MODEL_ROOT = BASE_DIR / "models" / "insightface"
+FACE_RECOGNITION_ENGINE = os.environ.get("LAB_FACE_ENGINE", "arcface").strip().lower()
+REID_MODEL_PATH = BASE_DIR.parent / "person_track" / "weights" / "reID" / "719rank1.pth"
+FRAME_WIDTH = 960
+RTSP_OPEN_TIMEOUT_MS = 5000
+RTSP_READ_TIMEOUT_MS = 3000
+RECONNECT_SECONDS = 2.0
+FRAME_STALE_SECONDS = 4.0
+# Face cascades are CPU-heavy. Recognition does not need to run on every
+# tracking frame; the current track remains valid between these attempts.
+FACE_DETECT_INTERVAL_SECONDS = 2.0
+BODY_DETECT_INTERVAL = 5
+IDENTITY_VOTES_REQUIRED = 3
+HANDOFF_UNKNOWN_LIMIT = 6
+IDENTITY_HANDOFF_TTL_SECONDS = 90.0
+BODY_CONFIDENCE_MIN = 0.65
+BODY_TRACK_IOU_MIN = 0.12
+YOLO_CONFIDENCE_MIN = 0.45
+YOLO_IMAGE_SIZE = 640
+# 每 5 帧才运行一次 YOLO；中间帧复用上一检测结果，降低 CPU/GPU 压力。
+YOLO_FRAME_STRIDE = 5
+YOLO_TRACK_HOLD_SECONDS = 0.8
+# YuNet is a small neural face detector that is substantially more tolerant of
+# small, oblique and partially lit faces than Haar cascades.
+FACE_SCORE_THRESHOLD = 0.25
+FACE_NMS_THRESHOLD = 0.30
+FACE_TOP_K = 5000
+# 地图状态允许最多约 200 ms 的显示延迟，避免每个视频帧都触发地图计算和接口刷新。
+MAP_PUBLISH_INTERVAL_SECONDS = 0.2
+# ORB feature matching is substantially more expensive than map publication.
+# Keep the last valid transform for projection between SLAM updates.
+SLAM_UPDATE_INTERVAL_SECONDS = 0.5
+ANNOTATION_LOCK = threading.RLock()
+REGISTRATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+app = Flask(__name__)
+
+
+@app.after_request
+def add_api_cors(response):
+    """Allow the separately served static frontend to call this API."""
+    origin = os.environ.get("LAB_FRONTEND_ORIGIN", "*")
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
+
+def load_cameras():
+    cameras = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    normalized = []
+    for index, camera in enumerate(cameras):
+        source_env = camera.get("source_env")
+        if camera.get("optional") and not os.environ.get(source_env or "", "").strip():
+            continue
+        normalized.append(
+            {
+                "id": camera.get("id", f"cam_{index + 1}"),
+                "name": camera.get("name", f"Camera {index + 1}"),
+                "role": camera.get("role", "tracking"),
+                "face_recognition": bool(camera.get("face_recognition", True)),
+                "face_interval_seconds": max(
+                    0.1,
+                    float(
+                        camera.get(
+                            "face_interval_seconds", FACE_DETECT_INTERVAL_SECONDS
+                        )
+                    ),
+                ),
+                **resolve_camera_source(camera, fallback_index=index),
+            }
+        )
+    return normalized
+
+
+class CameraWorker:
+    def __init__(self, camera, face_store, handoff, recorder, floor_map, coordinator):
+        self.camera = camera
+        self.face_store = face_store
+        self.handoff = handoff
+        self.recorder = recorder
+        self.floor_map = floor_map
+        self.coordinator = coordinator
+        self.face_recognition_ready = (
+            face_store.modern.available and bool(face_store.modern_features)
+            if FACE_RECOGNITION_ENGINE == "arcface"
+            else True
+        )
+        self.face_recognition_error = (
+            None
+            if self.face_recognition_ready
+            else face_store.modern.error
+            or "ArcFace gallery requires at least 5 valid features per person"
+        )
+        self.slam = SlamLocalizer(
+            camera.get("id", "camera"),
+            floor_map.config.get("slam", {}),
+        )
+        self.face_detector_lock = threading.RLock()
+        self.yunet_detector = None
+        self.face_detector_backend = "Haar fallback"
+        self.face_detector_error = None
+        if FACE_MODEL_PATH.exists() and hasattr(cv2, "FaceDetectorYN"):
+            try:
+                self.yunet_detector = cv2.FaceDetectorYN.create(
+                    str(FACE_MODEL_PATH),
+                    "",
+                    (320, 320),
+                    FACE_SCORE_THRESHOLD,
+                    FACE_NMS_THRESHOLD,
+                    FACE_TOP_K,
+                )
+                self.face_detector_backend = "YuNet"
+            except Exception as exc:
+                self.face_detector_error = str(exc)
+        self.face_detector = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
+        )
+        self.face_detector_default = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        self.profile_face_detector = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_profileface.xml"
+        )
+        if self.face_store.modern.available:
+            self.face_detector_backend = self.face_store.modern.engine
+            self.face_detector_error = None
+        self.body_detector = cv2.HOGDescriptor()
+        self.body_detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        self.motion_detector = MotionPersonDetector(warmup_frames=20)
+        self.person_track = PersonTrack(lost_seconds=2.0, evidence_seconds=5.0)
+        self.yolo_tracker = YoloPersonTracker(
+            YOLO_MODEL_PATH,
+            confidence=YOLO_CONFIDENCE_MIN,
+            image_size=YOLO_IMAGE_SIZE,
+        )
+        self.yolo_trails = TrackTrailStore(max_points=90, stale_seconds=3.0)
+        self.yolo_tracks = []
+        self.last_yolo_tracks_at = None
+        self.yolo_error = None
+        self.yolo_generation = 0
+        self.last_yolo_at = None
+        self.last_map_publish_at = 0.0
+        self.last_slam_at = 0.0
+        self.slam_state = self.slam.status_payload()
+        self.yolo_inference_ms = None
+        self.identity = None
+        self.identity_track_id = None
+        self.identity_votes = deque(maxlen=7)
+        self.handoff_unknown_count = 0
+        self.last_face_at = None
+        self.last_face_attempt_at = 0.0
+        self.last_face_box = None
+        self.last_face_result = None
+        self.last_face_box_at = 0.0
+        self.last_handoff_refresh_at = 0.0
+        self.last_handoff_attempt_at = 0.0
+        self.track_sequence = 0
+        self.local_track_id = None
+        self.pending_body_box = None
+        self.pending_body_hits = 0
+        self.pending_body_at = 0.0
+        self.pending_body_origin = None
+        self.pending_body_travel = 0.0
+        self.lock = threading.RLock()
+        self.frame = None
+        self.display_frame = None
+        self.map_observation = None
+        self.map_observations = []
+        self.status = "starting"
+        self.fps = 0.0
+        self.capture_fps = 0.0
+        self.processing_latency_ms = None
+        self.last_frame_at = None
+        self.last_capture_at = None
+        self.reconnect_count = 0
+        self.frame_counter = 0
+        self.capture_frame_counter = 0
+        self.dropped_frames = 0
+        self.running = True
+        self._fps_started = time.monotonic()
+        self._fps_frames = 0
+        self._capture_fps_started = time.monotonic()
+        self._capture_fps_frames = 0
+        self.source_fps = 20.0
+        self.capture_condition = threading.Condition()
+        self.latest_capture = None
+        self.capture_sequence = 0
+        self.capture_generation = 0
+        self.display_condition = threading.Condition(self.lock)
+        self.display_sequence = 0
+        self.jpeg_condition = threading.Condition()
+        self.jpeg_frames = {False: None, True: None}
+        self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
+        self.thread = threading.Thread(target=self.process_loop, daemon=True)
+        self.encoder_thread = threading.Thread(target=self.encode_loop, daemon=True)
+        self.capture_thread.start()
+        self.thread.start()
+        self.encoder_thread.start()
+
+    def capture_loop(self):
+        capture = None
+        while self.running:
+            if capture is None:
+                if self.camera["configuration_error"]:
+                    self.status = "configuration_error"
+                    self.publish_placeholder("RTSP environment variable is not configured")
+                    time.sleep(RECONNECT_SECONDS)
+                    continue
+                self.status = "connecting" if self.reconnect_count == 0 else "reconnecting"
+                capture = self.open_capture()
+                if capture is None:
+                    self.reconnect_count += 1
+                    self.publish_placeholder("Camera connection failed")
+                    time.sleep(RECONNECT_SECONDS)
+                    continue
+
+                source_fps = capture.get(cv2.CAP_PROP_FPS)
+                self.source_fps = source_fps if 1.0 <= source_fps <= 60.0 else 20.0
+                with self.capture_condition:
+                    self.capture_generation += 1
+                    self.latest_capture = None
+                    self.capture_condition.notify_all()
+
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                capture.release()
+                capture = None
+                self.reconnect_count += 1
+                self.status = "reconnecting"
+                with self.capture_condition:
+                    self.latest_capture = None
+                    self.capture_condition.notify_all()
+                self.publish_placeholder("Camera reconnecting")
+                time.sleep(RECONNECT_SECONDS)
+                continue
+
+            self.status = "running"
+            captured_at = time.time()
+            self.recorder.submit(
+                self.camera["id"], frame, fps=self.source_fps, captured_at=captured_at
+            )
+            self.record_capture(captured_at)
+            with self.capture_condition:
+                self.capture_sequence += 1
+                self.latest_capture = (
+                    self.capture_sequence,
+                    self.capture_generation,
+                    captured_at,
+                    frame,
+                )
+                self.capture_condition.notify_all()
+
+        if capture is not None:
+            capture.release()
+
+    def process_loop(self):
+        processed_sequence = 0
+        processed_generation = 0
+        while self.running:
+            with self.capture_condition:
+                self.capture_condition.wait_for(
+                    lambda: not self.running
+                    or (
+                        self.latest_capture is not None
+                        and self.latest_capture[0] > processed_sequence
+                    ),
+                    timeout=1.0,
+                )
+                if not self.running:
+                    return
+                capture = self.latest_capture
+            if capture is None:
+                continue
+
+            sequence, generation, captured_at, frame = capture
+            if generation != processed_generation:
+                self.reset_processing_state()
+                processed_generation = generation
+            if processed_sequence:
+                self.dropped_frames += max(0, sequence - processed_sequence - 1)
+            processed_sequence = sequence
+
+            frame = self.resize(frame)
+            self.frame_counter += 1
+            self.record_frame()
+            display = self.process(frame)
+            if generation != self.capture_generation or self.status != "running":
+                continue
+            with self.display_condition:
+                self.frame = frame
+                self.display_frame = display
+                self.processing_latency_ms = round(
+                    (time.time() - captured_at) * 1000.0, 1
+                )
+                self.display_sequence += 1
+                self.display_condition.notify_all()
+
+    def reset_processing_state(self):
+        self.motion_detector.reset()
+        self.slam.reset()
+        self.slam_state = self.slam.status_payload()
+        self.yolo_tracker.reset()
+        self.yolo_trails.clear()
+        self.last_yolo_tracks_at = None
+        self.coordinator.forget_camera(self.camera["id"])
+        self.yolo_generation += 1
+        self.last_yolo_at = None
+        self.last_map_publish_at = 0.0
+        self.yolo_inference_ms = None
+        self.end_current_track()
+
+    def encode_loop(self):
+        encoded_sequence = 0
+        while self.running:
+            with self.display_condition:
+                self.display_condition.wait_for(
+                    lambda: not self.running or self.display_sequence > encoded_sequence,
+                    timeout=1.0,
+                )
+                if not self.running:
+                    return
+                sequence = self.display_sequence
+                frame = self.display_frame.copy() if self.display_frame is not None else None
+            if frame is None:
+                continue
+
+            profiles = {}
+            for remote, quality, max_width in ((False, 82, 960), (True, 68, 640)):
+                output = frame
+                if output.shape[1] > max_width:
+                    scale = max_width / output.shape[1]
+                    output = cv2.resize(output, (max_width, int(output.shape[0] * scale)))
+                ok, encoded = cv2.imencode(
+                    ".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+                )
+                if ok:
+                    profiles[remote] = (sequence, encoded.tobytes())
+            with self.jpeg_condition:
+                self.jpeg_frames.update(profiles)
+                self.jpeg_condition.notify_all()
+            encoded_sequence = sequence
+
+    def open_capture(self):
+        source = self.camera["source"]
+        if self.camera["source_type"] == "rtsp":
+            try:
+                capture = cv2.VideoCapture(
+                    source,
+                    cv2.CAP_FFMPEG,
+                    [
+                        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
+                        RTSP_OPEN_TIMEOUT_MS,
+                        cv2.CAP_PROP_READ_TIMEOUT_MSEC,
+                        RTSP_READ_TIMEOUT_MS,
+                    ],
+                )
+            except (TypeError, cv2.error):
+                capture = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+                capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, RTSP_OPEN_TIMEOUT_MS)
+                capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, RTSP_READ_TIMEOUT_MS)
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        else:
+            capture = cv2.VideoCapture(source)
+        if capture.isOpened():
+            return capture
+        capture.release()
+        return None
+
+    @staticmethod
+    def resize(frame):
+        height, width = frame.shape[:2]
+        if width <= FRAME_WIDTH:
+            return frame
+        scale = FRAME_WIDTH / width
+        return cv2.resize(frame, (FRAME_WIDTH, int(height * scale)))
+
+    def record_frame(self):
+        self.last_frame_at = time.time()
+        self._fps_frames += 1
+        elapsed = time.monotonic() - self._fps_started
+        if elapsed >= 1.0:
+            self.fps = round(self._fps_frames / elapsed, 1)
+            self._fps_frames = 0
+            self._fps_started = time.monotonic()
+
+    def record_capture(self, captured_at):
+        self.last_capture_at = captured_at
+        self.capture_frame_counter += 1
+        self._capture_fps_frames += 1
+        elapsed = time.monotonic() - self._capture_fps_started
+        if elapsed >= 1.0:
+            self.capture_fps = round(self._capture_fps_frames / elapsed, 1)
+            self._capture_fps_frames = 0
+            self._capture_fps_started = time.monotonic()
+
+    def detect_faces(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if self.face_store.modern.available:
+            records = self.face_store.modern.detect(frame)
+            return gray, [record["box"] for record in records]
+        # YuNet works on BGR input and returns [x, y, w, h, landmarks..., score].
+        # Small person crops are enlarged before inference so a distant face
+        # still occupies enough pixels for the detector.
+        if self.yunet_detector is not None:
+            gray, records = self.detect_yunet_records(frame)
+            return gray, [record["box"] for record in records]
+
+        # Fallback for installations where the ONNX file or FaceDetectorYN is
+        # unavailable. This keeps the service usable while clearly reporting
+        # the active backend in /api/state.
+        # A fixed ceiling previously shrank already-small surveillance faces.
+        # Upscale only compact head crops so cascades see roughly 80-120 px
+        # facial structure while keeping full-frame fallback work bounded.
+        # (The legacy path below intentionally remains unchanged.)
+        # A fixed ceiling previously shrank already-small surveillance faces.
+        # Upscale only compact head crops so cascades see roughly 80-120 px
+        # facial structure while keeping full-frame fallback work bounded.
+        scale = min(2.0, max(1.0, 640.0 / max(gray.shape[1], 1)))
+        detection = (
+            gray
+            if scale == 1.0
+            else cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        )
+        equalized = cv2.equalizeHist(detection)
+        candidates = []
+        for detector, neighbors in (
+            (self.face_detector, 4),
+            (self.profile_face_detector, 4),
+        ):
+            candidates.extend(
+                detector.detectMultiScale(
+                    equalized,
+                    scaleFactor=1.12,
+                    minNeighbors=neighbors,
+                    minSize=(28, 28),
+                )
+            )
+        candidates.extend(
+            self.profile_face_detector.detectMultiScale(
+                equalized,
+                scaleFactor=1.12,
+                minNeighbors=4,
+                minSize=(28, 28),
+            )
+        )
+        flipped = cv2.flip(equalized, 1)
+        for x, y, width, height in self.profile_face_detector.detectMultiScale(
+            flipped,
+            scaleFactor=1.12,
+            minNeighbors=4,
+            minSize=(28, 28),
+        ):
+            candidates.append((equalized.shape[1] - x - width, y, width, height))
+
+        inverse = 1.0 / scale
+        faces = [
+            tuple(int(round(value * inverse)) for value in face)
+            for face in candidates
+        ]
+        plausible = []
+        for face in faces:
+            box = tuple(map(int, face))
+            if self.is_plausible_face(frame, box) and all(
+                self.box_iou(box, existing) < 0.45 for existing in plausible
+            ):
+                plausible.append(box)
+        return gray, plausible
+
+    def detect_yunet_records(self, frame):
+        """Return YuNet boxes plus landmarks for SFace alignment."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        height, width = frame.shape[:2]
+        scale = min(3.0, max(1.0, 640.0 / max(width, 1)))
+        detection = (
+            frame
+            if scale == 1.0
+            else cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        )
+        with self.face_detector_lock:
+            self.yunet_detector.setInputSize((detection.shape[1], detection.shape[0]))
+            _, detections = self.yunet_detector.detect(detection)
+        records = []
+        if detections is None:
+            return gray, records
+        for detection_row in detections:
+            x, y, box_width, box_height = detection_row[:4]
+            score = float(detection_row[-1])
+            if score < FACE_SCORE_THRESHOLD:
+                continue
+            scaled_box = [x, y, box_width, box_height]
+            box = tuple(int(round(value / scale)) for value in scaled_box)
+            if self.is_valid_face_box(frame, box) and all(
+                self.box_iou(box, existing["box"]) < 0.45 for existing in records
+            ):
+                row = np.asarray(detection_row, dtype=np.float32).copy()
+                row[:14] /= scale
+                records.append({"box": box, "detection": row, "score": score})
+        return gray, records
+
+    def _legacy_detect_faces(self, gray, frame):
+        """Retained only for readable fallback code paths."""
+        # This method is intentionally unused; fallback logic lives in
+        # detect_faces so existing installations need no extra dependency.
+        return gray, []
+
+    @staticmethod
+    def is_valid_face_box(frame, box):
+        x, y, width, height = map(int, box)
+        frame_height, frame_width = frame.shape[:2]
+        if width < 16 or height < 16 or x + width <= 0 or y + height <= 0:
+            return False
+        if x >= frame_width or y >= frame_height:
+            return False
+        aspect = width / max(height, 1)
+        return 0.45 <= aspect <= 1.8
+
+    def select_face_target(self, tracks):
+        if not tracks:
+            return None
+        return max(
+            tracks,
+            key=lambda track: (
+                float(track.get("confidence", 0.0)) * track["box"][2] * track["box"][3],
+                track["box"][2] * track["box"][3],
+            ),
+        )
+
+    def detect_face_in_person_box(self, frame, person_box):
+        x, y, width, height = person_box
+        pad_x = max(4, int(round(width * 0.10)))
+        # YOLO has already established the person track. Search only the top
+        # head-and-shoulder portion so clothing and nearby instruments cannot
+        # become face candidates.
+        face_limit = max(1, int(round(height * 0.64)))
+        left = max(0, x - pad_x * 2)
+        top = max(0, y - int(round(height * 0.04)))
+        right = min(frame.shape[1], x + width + pad_x * 2)
+        bottom = min(frame.shape[0], y + face_limit)
+        crop = frame[top:bottom, left:right]
+        if crop.size == 0:
+            return None
+        records = []
+        if self.face_store.modern.available:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            records = self.face_store.modern.detect(crop)
+            faces = [record["box"] for record in records]
+        elif self.yunet_detector is not None:
+            gray, records = self.detect_yunet_records(crop)
+            faces = [record["box"] for record in records]
+        else:
+            gray, faces = self.detect_faces(crop)
+        if not faces:
+            return None
+
+        crop_center_x = crop.shape[1] / 2.0
+        crop_center_y = crop.shape[0] * 0.30
+
+        def face_score(box):
+            fx, fy, fw, fh = box
+            face_area = fw * fh
+            center_x = fx + fw / 2.0
+            center_y = fy + fh / 2.0
+            center_penalty = abs(center_x - crop_center_x) + abs(center_y - crop_center_y)
+            return face_area - center_penalty * 2.0
+
+        face_box = max(faces, key=face_score)
+        selected_record = next(
+            (record for record in records if record["box"] == face_box),
+            None,
+        )
+        fx, fy, fw, fh = face_box
+        face = gray[fy : fy + fh, fx : fx + fw]
+        if face.size == 0:
+            return None
+        aligned_face = None
+        embedding = None
+        if selected_record is not None and hasattr(self.face_store, "align_face"):
+            aligned_face = self.face_store.align_face(crop, selected_record["detection"])
+            embedding = selected_record.get("embedding")
+        return (left + fx, top + fy, fw, fh), face, aligned_face, embedding
+
+    def confirm_face_identity(self, frame, person_box, track_id=None):
+        detection = self.detect_face_in_person_box(frame, person_box)
+        if detection is None:
+            return None
+        face_box, face, aligned_face, embedding = detection
+        appearance = self.handoff.appearance(frame, person_box)
+        result = self.face_store.predict(
+            face,
+            aligned_face=aligned_face,
+            track_key=(self.camera["id"], track_id),
+            query_embedding=embedding,
+        )
+        self.accept_face_result(result, appearance)
+        self.last_face_at = time.time()
+        return face_box, result
+
+    @staticmethod
+    def is_plausible_face(frame, box):
+        x, y, width, height = box
+        crop = frame[y : y + height, x : x + width]
+        if crop.size == 0 or width < 28 or height < 28:
+            return False
+        aspect = width / max(height, 1)
+        if not 0.72 <= aspect <= 1.38:
+            return False
+        ycrcb = cv2.cvtColor(crop, cv2.COLOR_BGR2YCrCb)
+        skin = cv2.inRange(
+            ycrcb,
+            np.array((0, 132, 76), dtype=np.uint8),
+            np.array((255, 178, 132), dtype=np.uint8),
+        )
+        skin_ratio = cv2.countNonZero(skin) / max(width * height, 1)
+        gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        texture = float(np.std(gray_crop))
+        return skin_ratio >= 0.055 and texture >= 8.0
+
+    def detect_bodies(self, frame):
+        detection = frame
+        scale = min(1.0, 640.0 / max(frame.shape[1], 1))
+        if scale < 1.0:
+            detection = cv2.resize(frame, None, fx=scale, fy=scale)
+        try:
+            boxes, weights = self.body_detector.detectMultiScale(
+                detection, winStride=(8, 8), padding=(8, 8), scale=1.05
+            )
+        except cv2.error:
+            return []
+        candidates = []
+        inverse = 1.0 / scale
+        for box, weight in zip(boxes, weights):
+            if float(weight) < BODY_CONFIDENCE_MIN:
+                continue
+            transformed = tuple(int(round(value * inverse)) for value in box)
+            candidates.append((float(weight), transformed))
+        return sorted(candidates, key=lambda item: item[0], reverse=True)
+
+    @staticmethod
+    def box_iou(first, second):
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        left, top = max(ax, bx), max(ay, by)
+        right, bottom = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+        intersection = max(0, right - left) * max(0, bottom - top)
+        union = aw * ah + bw * bh - intersection
+        return intersection / max(union, 1)
+
+    @staticmethod
+    def motion_to_person_box(box, frame_shape):
+        """Expand a moving body part into a conservative whole-person box."""
+        x, y, width, height = box
+        aspect = width / max(height, 1)
+        width_scale = 1.25 if aspect < 0.48 else 1.4
+        height_scale = 1.25 if aspect < 0.48 else 2.05
+        person_width = max(width, int(round(width * width_scale)))
+        person_height = max(
+            height,
+            int(round(height * height_scale)),
+            int(round(person_width * 2.0)),
+        )
+        person_x = int(round(x + width / 2 - person_width / 2))
+        person_y = int(round(y - height * 0.12))
+        return PersonTrack.tracker_box(
+            (person_x, person_y, person_width, person_height), frame_shape
+        )
+
+    def accept_face_result(self, result, appearance):
+        if result["known"]:
+            self.identity_votes.append(result["person_id"])
+            person_id, votes = Counter(self.identity_votes).most_common(1)[0]
+            if votes >= IDENTITY_VOTES_REQUIRED and person_id == result["person_id"]:
+                self.identity = {**result, "identity_source": "face"}
+                self.handoff_unknown_count = 0
+                self.handoff.confirm(self.camera["id"], self.identity, appearance)
+            return
+
+        self.identity_votes.append(None)
+        # A confirmed identity is owned by the active ByteTrack target. Do not
+        # clear a handoff identity merely because the person turns away or the
+        # face is temporarily too small; the target-loss check in process()
+        # clears it when the tracked person actually disappears.
+        if self.identity and self.identity.get("identity_source") == "handoff":
+            self.handoff_unknown_count += 1
+
+    def clear_identity(self):
+        self.identity = None
+        self.identity_track_id = None
+        self.identity_votes.clear()
+        self.handoff_unknown_count = 0
+
+    def begin_local_track(self):
+        if self.local_track_id is None:
+            self.track_sequence += 1
+            self.local_track_id = f"unknown:{self.camera['id']}:{self.track_sequence}"
+        return self.local_track_id
+
+    def end_current_track(self):
+        self.person_track.stop()
+        self.clear_identity()
+        self.last_face_box = None
+        self.last_face_result = None
+        self.last_face_box_at = 0.0
+        self.local_track_id = None
+        self.pending_body_box = None
+        self.pending_body_hits = 0
+        self.pending_body_at = 0.0
+        self.pending_body_origin = None
+        self.pending_body_travel = 0.0
+        self.last_handoff_refresh_at = 0.0
+        self.last_handoff_attempt_at = 0.0
+        with self.lock:
+            self.map_observation = None
+            self.map_observations = []
+            self.yolo_tracks = []
+        self.yolo_trails.clear()
+        self.coordinator.forget_camera(self.camera["id"])
+
+    def body_candidate_is_stable(self, box, frame_shape, require_displacement=False):
+        now = time.time()
+        center = (box[0] + box[2] / 2.0, box[1] + box[3] / 2.0)
+        if (
+            self.pending_body_box is not None
+            and now - self.pending_body_at <= 1.5
+            and self.box_iou(self.pending_body_box, box) >= 0.20
+        ):
+            self.pending_body_hits += 1
+        else:
+            self.pending_body_hits = 1
+            self.pending_body_origin = center
+            self.pending_body_travel = 0.0
+        if self.pending_body_origin is not None:
+            dx = center[0] - self.pending_body_origin[0]
+            dy = center[1] - self.pending_body_origin[1]
+            self.pending_body_travel = max(
+                self.pending_body_travel, (dx * dx + dy * dy) ** 0.5
+            )
+        self.pending_body_box = box
+        self.pending_body_at = now
+        minimum_travel = max(10.0, min(frame_shape[:2]) * 0.025)
+        return self.pending_body_hits >= 3 and (
+            not require_displacement or self.pending_body_travel >= minimum_travel
+        )
+
+    def refresh_handoff(self, frame, box):
+        if not self.identity or not self.identity.get("person_id"):
+            return
+        now = time.time()
+        if now - self.last_handoff_refresh_at < 0.75:
+            return
+        appearance = self.handoff.appearance(frame, box)
+        self.handoff.confirm(self.camera["id"], self.identity, appearance)
+        self.last_handoff_refresh_at = now
+
+    def body_candidate_is_walkable(self, box, frame_shape):
+        position = self.project_box(box, frame_shape)
+        return self.floor_map.is_walkable(position)
+
+    def project_box(self, box, frame_shape):
+        """Project a person's foot point, preferring the active visual SLAM pose."""
+        x, y, width, height = box
+        foot = ((x + width * 0.5), (y + height))
+        slam_position = self.slam.project_pixel(foot)
+        if slam_position is not None:
+            return self.floor_map.clamp_position(slam_position)
+        return self.floor_map.project(self.camera["id"], box, frame_shape)
+
+    @staticmethod
+    def yolo_color(track_id):
+        return (
+            70 + (track_id * 53) % 150,
+            90 + (track_id * 97) % 140,
+            80 + (track_id * 31) % 160,
+        )
+
+    def process(self, frame):
+        display = frame.copy()
+        now = time.time()
+        if now - self.last_slam_at >= SLAM_UPDATE_INTERVAL_SECONDS:
+            self.slam_state = self.slam.update(
+                frame,
+                baseline_transform=self.floor_map.pixel_transform(
+                    self.camera["id"], frame.shape
+                ),
+            )
+            self.last_slam_at = now
+        # 只在抽样帧运行 YOLO。非抽样帧使用上一批检测框绘制画面，
+        # 这样视频流仍然连续，而检测模型不再被每一帧调用。
+        should_infer = (
+            self.frame_counter == 1
+            or self.frame_counter % YOLO_FRAME_STRIDE == 0
+            or self.last_yolo_at is None
+        )
+        cached_global_ids = {}
+        if should_infer:
+            started_at = time.perf_counter()
+            try:
+                tracks = self.yolo_tracker.track(frame)
+                self.yolo_error = None
+            except Exception as error:
+                tracks = []
+                self.yolo_error = str(error)
+            self.yolo_inference_ms = round((time.perf_counter() - started_at) * 1000.0, 1)
+            self.last_yolo_at = now
+        else:
+            # 将已发布的缓存结果转换为检测器返回的字段，统一走绘制逻辑。
+            with self.lock:
+                cached_tracks = [dict(item) for item in self.yolo_tracks]
+            tracks = [
+                {
+                    "track_id": item["local_id"],
+                    "box": item["box"],
+                    "confidence": item["confidence"],
+                }
+                for item in cached_tracks
+            ]
+            cached_global_ids = {
+                item["local_id"]: item["track_id"] for item in cached_tracks
+            }
+
+        # A detector can miss a person for one inference cycle because of blur,
+        # occlusion, or RTSP jitter. Keep the last ByteTrack boxes briefly so
+        # the map trajectory remains continuous; a stale target is still
+        # removed after the hold window.
+        hold_cached_tracks = bool(
+            should_infer
+            and not tracks
+            and self.yolo_tracks
+            and self.last_yolo_tracks_at is not None
+            and now - self.last_yolo_tracks_at <= YOLO_TRACK_HOLD_SECONDS
+        )
+        if hold_cached_tracks:
+            with self.lock:
+                cached_tracks = [dict(item) for item in self.yolo_tracks]
+            cached_global_ids = {
+                item["local_id"]: item["track_id"] for item in cached_tracks
+            }
+            tracks = [
+                {
+                    "track_id": item["local_id"],
+                    "box": item["box"],
+                    "confidence": item["confidence"],
+                }
+                for item in cached_tracks
+            ]
+            cached_global_ids = {
+                item["local_id"]: item["track_id"] for item in cached_tracks
+            }
+
+        # A confirmed identity belongs to the active ByteTrack target. Keep
+        # that name while the target moves, but clear it when the ID is gone.
+        if self.identity and self.identity_track_id is not None:
+            active_local_ids = {item["track_id"] for item in tracks}
+            if self.identity_track_id not in active_local_ids:
+                self.end_current_track()
+        elif self.identity and self.identity_track_id is None and len(tracks) == 1:
+            self.identity_track_id = tracks[0]["track_id"]
+
+        observations = []
+        published_tracks = []
+        global_ids_by_local_id = {}
+        face_result = None
+        face_box = None
+        for track in tracks:
+            local_id = track["track_id"]
+            x, y, width, height = track["box"]
+            x = max(0, min(x, frame.shape[1] - 1))
+            y = max(0, min(y, frame.shape[0] - 1))
+            width = max(1, min(width, frame.shape[1] - x))
+            height = max(1, min(height, frame.shape[0] - y))
+            box = (x, y, width, height)
+            foot = (x + width // 2, y + height)
+            position = self.project_box(box, frame.shape)
+            global_id = (
+                self.coordinator.update(
+                    self.camera["id"], local_id, frame, box, position, now=now
+                )
+                    if should_infer and not hold_cached_tracks
+                    else cached_global_ids[local_id]
+                )
+            global_ids_by_local_id[local_id] = global_id
+            # A confirmed identity stored by cam_1 is adopted by cam_2 only
+            # after this target is physically inside the overlap zone.
+            if self.identity is None:
+                inherited = self.coordinator.identity_for(
+                    global_id, self.camera["id"], position, now=now
+                )
+                if inherited is not None:
+                    self.identity = inherited
+                    self.identity_track_id = local_id
+                    self.identity_votes.clear()
+                    self.handoff_unknown_count = 0
+            trail = self.yolo_trails.update(global_id, foot, now=now)
+            global_number = int(global_id.rsplit("_", 1)[-1])
+            color = self.yolo_color(global_number)
+            track_identity = (
+                self.identity
+                if self.identity_track_id is not None
+                and self.identity_track_id == local_id
+                else None
+            )
+
+            if len(trail) >= 2:
+                cv2.polylines(
+                    display,
+                    [np.asarray(trail, dtype=np.int32).reshape((-1, 1, 2))],
+                    False,
+                    color,
+                    3,
+                    cv2.LINE_AA,
+                )
+            cv2.circle(display, foot, 5, color, -1, cv2.LINE_AA)
+            cv2.rectangle(display, (x, y), (x + width, y + height), color, 3)
+            if track_identity:
+                person_number = track_identity.get("person_number")
+                display_label = (
+                    f"{person_number} {track_identity.get('name', '')}".strip()
+                    if person_number
+                    else str(track_identity.get("name", "IDENTIFIED"))
+                )
+                label_color = (80, 220, 130)
+            else:
+                display_label = f"PERSON {global_number}"
+                label_color = color
+            cv2.putText(
+                display,
+                f"{display_label} | {track['confidence']:.0%}",
+                (x, max(62, y - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                label_color,
+                2,
+                cv2.LINE_AA,
+            )
+
+            if position is not None:
+                observations.append(
+                    {
+                        "camera_id": self.camera["id"],
+                        "track_id": global_id,
+                        "local_id": local_id,
+                        "position": position,
+                        "in_overlap": self.coordinator.is_overlap_position(
+                            position, self.camera["id"]
+                        ),
+                        "person_id": track_identity.get("person_id") if track_identity else None,
+                        "person_number": track_identity.get("person_number") if track_identity else None,
+                        "name": track_identity.get("name") if track_identity else None,
+                        "identity_source": track_identity.get("identity_source", "face") if track_identity else "yolo_handoff",
+                        "confidence": track["confidence"],
+                        "observed_at": now,
+                    }
+                )
+            published_tracks.append(
+                {
+                    "track_id": global_id,
+                    "local_id": local_id,
+                    "box": box,
+                    "confidence": track["confidence"],
+                }
+            )
+
+        should_check_face = bool(
+            self.camera["face_recognition"]
+            and self.face_recognition_ready
+            and tracks
+            and now - self.last_face_attempt_at
+            >= self.camera["face_interval_seconds"]
+        )
+        if should_check_face:
+            self.last_face_attempt_at = now
+            target_track = self.select_face_target(tracks)
+            if target_track is not None:
+                candidate = self.confirm_face_identity(
+                    frame, target_track["box"], target_track.get("track_id")
+                )
+                if candidate is not None:
+                    face_box, face_result = candidate
+                    if face_result.get("known"):
+                        self.identity_track_id = target_track["track_id"]
+                    self.last_face_box = face_box
+                    self.last_face_result = face_result
+                    self.last_face_box_at = now
+
+        # Identity is intentionally rendered on the single large person box.
+        # The former separate face rectangle made one person look duplicated.
+        if self.identity and self.identity_track_id is not None:
+            for observation in observations:
+                if observation.get("local_id") != self.identity_track_id:
+                    continue
+                observation.update(
+                    {
+                        "person_id": self.identity.get("person_id"),
+                        "person_number": self.identity.get("person_number"),
+                        "name": self.identity.get("name"),
+                        "identity_source": self.identity.get("identity_source", "face"),
+                    }
+                )
+
+            bound_track = next(
+                (item for item in tracks if item["track_id"] == self.identity_track_id),
+                None,
+            )
+            if bound_track is not None:
+                self.refresh_handoff(frame, bound_track["box"])
+                current_global_id = global_ids_by_local_id.get(self.identity_track_id)
+                current_position = self.project_box(
+                    bound_track["box"], frame.shape
+                )
+                self.coordinator.set_identity(
+                    current_global_id,
+                    self.identity,
+                    self.camera["id"],
+                    current_position,
+                    now=now,
+                )
+
+        self.yolo_trails.prune(now=now)
+        if not should_infer or hold_cached_tracks:
+            # 非检测帧沿用上一检测结果，不重新生成目标 ID，避免轨迹抖动。
+            published_tracks = cached_tracks
+        should_publish_map = (
+            should_infer
+            or now - self.last_map_publish_at >= MAP_PUBLISH_INTERVAL_SECONDS
+        )
+        with self.lock:
+            self.yolo_tracks = published_tracks
+            if should_infer and not hold_cached_tracks and published_tracks:
+                self.last_yolo_tracks_at = now
+            elif not published_tracks and self.last_yolo_tracks_at is not None and now - self.last_yolo_tracks_at > YOLO_TRACK_HOLD_SECONDS:
+                self.last_yolo_tracks_at = None
+            if should_publish_map:
+                self.map_observations = observations
+                self.map_observation = observations[0] if observations else None
+                self.last_map_publish_at = now
+
+        cv2.rectangle(display, (0, 0), (display.shape[1], 40), (20, 23, 27), -1)
+        status = "ERROR" if self.yolo_error else f"{len(published_tracks)} PEOPLE"
+        header = f"{self.camera['id']} | YOLOv8 + ByteTrack | {status}"
+        cv2.putText(
+            display,
+            header,
+            (12, 27),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (235, 238, 242) if not self.yolo_error else (80, 120, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return display
+
+    def process_legacy(self, frame):
+        display = frame.copy()
+        face_boxes = []
+        gray = None
+        if (self.frame_counter - 1) % FACE_DETECT_INTERVAL == 0:
+            gray, face_boxes = self.detect_faces(frame)
+
+        # Motion is only a scene-change hint. It must never create a person
+        # track by itself because screens, reflections and moving instruments
+        # are common in a laboratory.
+        self.motion_detector.detect(frame)
+        body_candidates = []
+        if self.frame_counter % BODY_DETECT_INTERVAL == 0:
+            body_candidates = [
+                candidate
+                for candidate in self.detect_bodies(frame)
+                if self.body_candidate_is_walkable(candidate[1], frame.shape)
+            ]
+
+        track_box = self.person_track.update(frame)
+        if (
+            track_box is None
+            and self.person_track.last_seen_at is not None
+            and time.time() - self.person_track.last_seen_at > self.person_track.lost_seconds
+        ):
+            self.end_current_track()
+        face_result = None
+        if face_boxes:
+            face_box = max(face_boxes, key=lambda box: box[2] * box[3])
+            person_box = PersonTrack.face_to_person(face_box, frame.shape)
+            if self.person_track.observation_is_distinct(person_box):
+                self.end_current_track()
+            track_id = self.begin_local_track()
+            track_box = self.person_track.observe(
+                frame,
+                person_box,
+                self.identity["person_id"] if self.identity else track_id,
+            )
+            self.pending_body_box = None
+            self.pending_body_hits = 0
+            self.pending_body_origin = None
+            self.pending_body_travel = 0.0
+            x, y, width, height = face_box
+            face = gray[y : y + height, x : x + width]
+            if face.size:
+                appearance = self.handoff.appearance(frame, track_box)
+                face_result = self.face_store.predict(face)
+                self.accept_face_result(face_result, appearance)
+                self.last_face_at = time.time()
+                cv2.rectangle(display, (x, y), (x + width, y + height), (255, 190, 70), 2)
+
+        # A detector confirmation anchors CamShift to a real person and prevents
+        # a color track from slowly walking onto a wall or piece of furniture.
+        if track_box is not None and body_candidates:
+            _, matched_body = max(
+                body_candidates,
+                key=lambda item: self.box_iou(track_box, item[1]),
+            )
+            if self.box_iou(track_box, matched_body) >= BODY_TRACK_IOU_MIN:
+                self.person_track.mark_evidence()
+
+        # A local visual tracker can follow any textured object indefinitely.
+        # Require periodic face/body confirmation so instruments cannot remain
+        # published as people after an initial false proposal.
+        if self.person_track.evidence_expired():
+            self.end_current_track()
+            track_box = None
+
+        # Only a verified body detector result may start a body-only track.
+        if track_box is None and not face_boxes and body_candidates:
+            _, body_box = body_candidates[0]
+            stable = self.body_candidate_is_stable(
+                body_box,
+                frame.shape,
+                require_displacement=False,
+            )
+            if stable:
+                appearance = self.handoff.appearance(frame, body_box)
+                inherited = self.handoff.inherit(self.camera["id"], appearance)
+                if inherited:
+                    self.identity = inherited
+                    self.handoff_unknown_count = 0
+                    self.begin_local_track()
+                    track_box = self.person_track.seed(
+                        frame, body_box, inherited["person_id"], validated=True
+                    )
+                else:
+                    track_id = self.begin_local_track()
+                    track_box = self.person_track.seed(
+                        frame, body_box, track_id, validated=True
+                    )
+                self.pending_body_box = None
+                self.pending_body_hits = 0
+                self.pending_body_origin = None
+                self.pending_body_travel = 0.0
+
+        if track_box is not None:
+            self.refresh_handoff(frame, track_box)
+
+        self.update_map_observation(track_box, frame.shape)
+        self.draw_overlay(display, track_box, face_result)
+        return display
+
+    def update_map_observation(self, box, frame_shape):
+        position = self.project_box(box, frame_shape)
+        if position is None:
+            with self.lock:
+                self.map_observation = None
+            return
+
+        identity = self.identity or {}
+        observation = {
+            "camera_id": self.camera["id"],
+            "track_id": self.local_track_id,
+            "position": position,
+            "person_id": identity.get("person_id"),
+            "person_number": identity.get("person_number"),
+            "name": identity.get("name"),
+            "identity_source": identity.get("identity_source"),
+            "observed_at": time.time(),
+        }
+        with self.lock:
+            self.map_observation = observation
+
+    def draw_overlay(self, frame, box, face_result):
+        cv2.rectangle(frame, (0, 0), (frame.shape[1], 40), (20, 23, 27), -1)
+        if box is not None:
+            x, y, width, height = box
+            if self.identity:
+                source = self.identity.get("identity_source", "face")
+                color = (70, 225, 120) if source == "face" else (60, 220, 245)
+                number = self.identity.get("person_number")
+                identity_label = f"{number} {self.identity['name']}" if number else self.identity["name"]
+                mode = "FACE+TRACK" if source == "face" else "HANDOFF+TRACK"
+                label = f"{identity_label} | {mode}"
+            else:
+                color = (80, 160, 255)
+                label = face_result["name"] if face_result else "SEARCHING IDENTITY"
+            cv2.rectangle(frame, (x, y), (x + width, y + height), color, 3)
+            cv2.putText(
+                frame,
+                label,
+                (x, max(62, y - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+        header = f"{self.camera['id']} | {self.status.upper()}"
+        cv2.putText(frame, header, (12, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (235, 238, 242), 2)
+
+    def get_frame(self):
+        with self.lock:
+            if self.display_frame is not None:
+                return self.display_frame.copy()
+        return self.placeholder("Waiting for camera")
+
+    def wait_for_jpeg(self, remote, after_sequence, timeout=1.0):
+        with self.jpeg_condition:
+            self.jpeg_condition.wait_for(
+                lambda: not self.running
+                or (
+                    self.jpeg_frames[remote] is not None
+                    and self.jpeg_frames[remote][0] > after_sequence
+                ),
+                timeout=timeout,
+            )
+            return self.jpeg_frames[remote]
+
+    def registration_face(self):
+        """Return one quality-checkable face constrained by the current YOLO person box."""
+        with self.lock:
+            frame = self.frame.copy() if self.frame is not None else None
+            tracks = [dict(item) for item in self.yolo_tracks]
+        if frame is None or self.status != "running":
+            return None, "camera_not_ready"
+        if not tracks:
+            return None, "no_person"
+        if len(tracks) > 1:
+            return None, "multiple_people"
+        detection = self.detect_face_in_person_box(frame, tracks[0]["box"])
+        if detection is None:
+            return None, "face_not_found"
+        face_box, face, _, embedding = detection
+        return {
+            "face": face,
+            "embedding": embedding,
+            "face_box": [int(value) for value in face_box],
+            "person_box": [int(value) for value in tracks[0]["box"]],
+            "captured_at": time.time(),
+        }, None
+
+    def status_payload(self):
+        age = time.time() - self.last_frame_at if self.last_frame_at else None
+        capture_age = time.time() - self.last_capture_at if self.last_capture_at else None
+        status = "stale" if self.status == "running" and age > FRAME_STALE_SECONDS else self.status
+        identity = None
+        if self.identity:
+            identity = {
+                key: self.identity.get(key)
+                for key in (
+                    "person_id",
+                    "person_number",
+                    "name",
+                    "identity_source",
+                    "handoff_from_camera",
+                    "appearance_score",
+                )
+            }
+        with self.lock:
+            map_observation = dict(self.map_observation) if self.map_observation else None
+            map_observations = [dict(item) for item in self.map_observations]
+            yolo_tracks = [dict(item) for item in self.yolo_tracks]
+        tracking = bool(yolo_tracks)
+        confidence = max(
+            (track["confidence"] for track in yolo_tracks), default=0.0
+        )
+        return {
+            "id": self.camera["id"],
+            "name": self.camera["name"],
+            "source": self.camera["source_display"],
+            "source_type": self.camera["source_type"],
+            "role": self.camera["role"],
+            "face_recognition_enabled": self.camera["face_recognition"],
+            "face_recognition_ready": self.face_recognition_ready,
+            "face_recognition_error": self.face_recognition_error,
+            "status": status,
+            "fps": self.fps,
+            "capture_fps": self.capture_fps,
+            "frame_age_seconds": round(age, 2) if age is not None else None,
+            "capture_age_seconds": round(capture_age, 2) if capture_age is not None else None,
+            "processing_latency_ms": self.processing_latency_ms,
+            "dropped_frames": self.dropped_frames,
+            "pipeline_mode": "latest_frame",
+            "rtsp_transport": RTSP_TRANSPORT if self.camera["source_type"] == "rtsp" else None,
+            "reconnect_count": self.reconnect_count,
+            "identity": identity,
+            "tracking": tracking,
+            "tracked_people": len(yolo_tracks),
+            "tracker_engine": "YOLOv8n + ByteTrack",
+            "face_detector": self.face_detector_backend,
+            "face_detector_error": self.face_detector_error,
+            "track_status": "error" if self.yolo_error else "tracking" if tracking else "searching",
+            "track_confidence": round(confidence, 4),
+            "track_failures": 1 if self.yolo_error else 0,
+            "tracker_error": self.yolo_error,
+            "inference_frame_stride": YOLO_FRAME_STRIDE,
+            "last_inference_age_seconds": (
+                round(time.time() - self.last_yolo_at, 2)
+                if self.last_yolo_at is not None
+                else None
+            ),
+            "inference_ms": self.yolo_inference_ms,
+            "map_publish_interval_ms": int(MAP_PUBLISH_INTERVAL_SECONDS * 1000),
+            "map_observation": map_observation,
+            "map_observations": map_observations,
+            "slam": dict(self.slam_state),
+        }
+
+    def publish_placeholder(self, message):
+        frame = self.placeholder(message)
+        with self.display_condition:
+            self.frame = frame.copy()
+            self.display_frame = frame
+            self.display_sequence += 1
+            self.display_condition.notify_all()
+
+    def stop(self):
+        self.running = False
+        for condition in (
+            self.capture_condition,
+            self.display_condition,
+            self.jpeg_condition,
+        ):
+            with condition:
+                condition.notify_all()
+
+    def placeholder(self, message):
+        frame = np.zeros((540, 960, 3), dtype=np.uint8)
+        cv2.putText(frame, self.camera["name"], (28, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (220, 225, 230), 2)
+        cv2.putText(frame, message, (28, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 170, 255), 2)
+        return frame
+
+
+class CameraManager:
+    def __init__(self, cameras, face_store):
+        self.face_store = face_store
+        self.floor_map = FloorMapProjector.from_path(FLOOR_MAP_PATH)
+        self.reid_embedder = ReIDEmbedder(REID_MODEL_PATH)
+        self.handoff = IdentityHandoff(
+            self.reid_embedder,
+            ttl_seconds=IDENTITY_HANDOFF_TTL_SECONDS,
+            similarity_threshold=0.72,
+            match_margin=0.05,
+        )
+        self.coordinator = CrossCameraTrackCoordinator(
+            self.reid_embedder,
+            self.floor_map,
+            similarity_threshold=0.72,
+            match_margin=0.05,
+        )
+        camera_ids = [camera["id"] for camera in cameras]
+        self.recorder = DatasetRecorder(RECORDINGS_DIR, camera_ids)
+        self.workers = {
+            camera["id"]: CameraWorker(
+                camera,
+                face_store,
+                self.handoff,
+                self.recorder,
+                self.floor_map,
+                self.coordinator,
+            )
+            for camera in cameras
+        }
+
+    def stop(self):
+        for worker in self.workers.values():
+            worker.stop()
+        self.recorder.stop_if_active()
+
+    def state(self):
+        cameras = [worker.status_payload() for worker in self.workers.values()]
+        # Keep the map label synchronized with the large tracked-person box.
+        # During the face detector interval a camera may publish a fresh
+        # position before the next identity check; for a single active target
+        # it is safe to carry the camera's confirmed identity onto that map
+        # observation instead of briefly showing it as unregistered.
+        for camera in cameras:
+            identity = camera.get("identity")
+            if not identity:
+                continue
+            observations = camera.get("map_observations") or []
+            if len(observations) != 1:
+                continue
+            observation = observations[0]
+            if observation.get("person_id"):
+                continue
+            observation.update(
+                {
+                    "person_id": identity.get("person_id"),
+                    "person_number": identity.get("person_number"),
+                    "name": identity.get("name"),
+                    "identity_source": identity.get("identity_source", "face"),
+                }
+            )
+        observations = [
+            observation
+            for camera in cameras
+            for observation in camera.get("map_observations", [])
+        ]
+        return {
+            "cameras": cameras,
+            "people": list(face_store.people.values()),
+            "recording": self.recorder.status(),
+            "processing": {
+                "inference_frame_stride": YOLO_FRAME_STRIDE,
+                "map_publish_interval_ms": int(MAP_PUBLISH_INTERVAL_SECONDS * 1000),
+                "frontend_poll_interval_ms": 200,
+                "face_recognition_engine": (
+                    self.face_store.modern.engine
+                    if self.face_store.modern.available
+                    else f"ArcFace unavailable: {self.face_store.modern.error}"
+                ),
+                "face_quality_gate": "brightness + contrast + sharpness + open-set margin",
+                "face_feature_fusion_frames": 5,
+                "arcface_gallery_people": len(self.face_store.modern_features),
+                "arcface_gallery_missing_ids": sorted(
+                    set(self.face_store.people) - set(self.face_store.modern_features)
+                ),
+                "reid_engine": "ResNet50-IBN",
+                "reid_feature_dimensions": 2048,
+                "reid_similarity_threshold": 0.72,
+                "reid_match_margin": 0.05,
+                "reid_feature_refresh_ms": 1000,
+                "identity_handoff_ttl_seconds": IDENTITY_HANDOFF_TTL_SECONDS,
+                "identity_handoff_path": "entrance ArcFace -> directed Re-ID transition -> indoor tracks",
+                "slam_engine": "ArUco anchors + ORB monocular SLAM",
+                "slam_marker_reacquire": "automatic",
+                "track_hold_ms": int(YOLO_TRACK_HOLD_SECONDS * 1000),
+            },
+            "floor_map": self.floor_map.state(observations),
+        }
+
+    def start_recording(self, subject_id, notes=""):
+        unavailable = [
+            worker.camera["id"]
+            for worker in self.workers.values()
+            if worker.status_payload()["status"] != "running"
+        ]
+        if unavailable:
+            raise RecordingError(f"摄像头未就绪：{', '.join(unavailable)}")
+        return self.recorder.start(subject_id, notes)
+
+
+class FaceRegistrationManager:
+    def __init__(self, store, cameras):
+        self.store = store
+        self.cameras = cameras
+        self.lock = threading.RLock()
+        self.session = None
+        self.camera_id = None
+        self.pose_plan = []
+        self.pose_index = 0
+        self.pose_counts = {}
+        self.last_sample_at = 0.0
+        self.last_normalized = None
+        self.last_result = None
+        self.last_preview_at = 0.0
+        self.last_preview_payload = None
+        self.replace_existing = True
+
+    @staticmethod
+    def guidance(reason):
+        return {
+            "camera_not_ready": "摄像头未就绪，请等待画面恢复",
+            "no_person": "画面中未检测到人，请站到摄像头正前方",
+            "multiple_people": "画面中只能保留一名采集人员",
+            "face_not_found": "未捕捉到正脸，请按当前姿态调整并露出完整面部",
+            "face_too_small": "脸部过小，请靠近摄像头",
+            "face_too_dark": "脸部过暗，请面向光源或增加正面照明",
+            "face_too_bright": "脸部过亮，请避开强光或降低正面照明",
+            "face_low_contrast": "脸部对比度不足，请调整位置并露出完整五官",
+            "face_blurry": "人脸模糊，请保持头部稳定并等待画面清晰",
+            "duplicate_frame": "与上一张过于相似，请轻微转动头部或改变表情",
+            "capture_too_fast": "正在控制采样间隔，请保持当前姿态",
+            "sample_limit_reached": "样本数量已达到设定值，可以完成注册",
+        }.get(reason, "本帧未计入，请按引导重新采集")
+
+    def _payload(self):
+        if self.session is None:
+            return {
+                "active": False,
+                "cameras": [worker.status_payload() for worker in self.cameras.values()],
+            }
+        pose = self.pose_plan[min(self.pose_index, len(self.pose_plan) - 1)]
+        return {
+            "active": True,
+            **self.session.summary(),
+            "camera_id": self.camera_id,
+            "pose": pose,
+            "pose_index": self.pose_index,
+            "pose_total": len(self.pose_plan),
+            "pose_count": self.pose_counts.get(pose["id"], 0),
+            "pose_plan": [
+                {**item, "count": self.pose_counts.get(item["id"], 0)}
+                for item in self.pose_plan
+            ],
+            "last_result": self.last_result,
+            "ready": self.session.samples >= self.session.target_samples,
+            "cameras": [worker.status_payload() for worker in self.cameras.values()],
+        }
+
+    def status(self):
+        with self.lock:
+            return self._payload()
+
+    def start(self, payload):
+        person_id = str(payload.get("person_id", "")).strip()
+        name = str(payload.get("name", "")).strip()
+        camera_id = str(payload.get("camera_id", "")).strip()
+        try:
+            label = int(payload.get("label"))
+            target_samples = int(payload.get("target_samples", 60))
+        except (TypeError, ValueError) as error:
+            raise ValueError("人员序号和样本数量必须是整数") from error
+        if not REGISTRATION_ID_PATTERN.fullmatch(person_id):
+            raise ValueError("人员ID仅允许字母、数字、下划线和短横线")
+        if not name:
+            raise ValueError("请输入人员姓名")
+        if label <= 0:
+            raise ValueError("人员序号必须大于 0")
+        if camera_id not in self.cameras:
+            raise ValueError("请选择可用摄像头")
+        if not REGISTRATION_MIN_SAMPLES <= target_samples <= REGISTRATION_MAX_SAMPLES:
+            raise ValueError("正式注册需要采集 50～80 张有效样本")
+        for existing_id, person in self.store.people.items():
+            if existing_id != person_id and int(person.get("label", 0)) == label:
+                raise ValueError(f"人员序号 {label} 已被 {person.get('name', existing_id)} 使用")
+        with self.lock:
+            if self.session is not None:
+                raise RuntimeError("已有正在进行的人脸采集会话")
+            self.session = self.store.start_registration(
+                person_id,
+                name,
+                label,
+                target_samples=target_samples,
+                min_samples=target_samples,
+                max_samples=target_samples,
+            )
+            self.camera_id = camera_id
+            self.pose_plan = registration_pose_plan(target_samples)
+            self.pose_index = 0
+            self.pose_counts = {item["id"]: 0 for item in self.pose_plan}
+            self.last_sample_at = 0.0
+            self.last_normalized = None
+            self.last_result = None
+            self.last_preview_at = 0.0
+            self.last_preview_payload = None
+            self.replace_existing = bool(payload.get("replace_existing", True))
+            return self._payload()
+
+    def capture(self):
+        with self.lock:
+            if self.session is None:
+                raise RuntimeError("请先开始人脸采集")
+            now = time.time()
+            if now - self.last_sample_at < 0.35:
+                reason = "capture_too_fast"
+                self.last_result = {"accepted": False, "reason": reason, "message": self.guidance(reason)}
+                return self._payload()
+            worker = self.cameras[self.camera_id]
+            captured, error = worker.registration_face()
+            if error:
+                self.last_result = {"accepted": False, "reason": error, "message": self.guidance(error)}
+                return self._payload()
+            normalized = self.store.normalize(captured["face"])
+            if self.last_normalized is not None:
+                difference = float(cv2.absdiff(normalized, self.last_normalized).mean())
+                if difference < 1.4:
+                    reason = "duplicate_frame"
+                    self.last_result = {
+                        "accepted": False,
+                        "reason": reason,
+                        "difference": round(difference, 2),
+                        "message": self.guidance(reason),
+                    }
+                    self.last_sample_at = now
+                    return self._payload()
+            pose = self.pose_plan[self.pose_index]
+            result = self.session.add_sample(
+                captured["face"],
+                metadata={"pose": pose["id"], "face_box": captured["face_box"]},
+                embedding=captured.get("embedding"),
+            )
+            self.last_sample_at = now
+            if not result["accepted"]:
+                result["message"] = self.guidance(result["reason"])
+                self.last_result = result
+                return self._payload()
+            self.last_normalized = normalized
+            self.pose_counts[pose["id"]] += 1
+            if self.pose_counts[pose["id"]] >= pose["target"] and self.pose_index < len(self.pose_plan) - 1:
+                self.pose_index += 1
+            result["message"] = "样本有效，已计入当前姿态"
+            self.last_result = result
+            return self._payload()
+
+    def preview(self, camera_id=None):
+        """Inspect the latest frame without writing or advancing registration."""
+        with self.lock:
+            selected_camera = self.camera_id if self.session is not None else camera_id
+            now = time.time()
+            # The browser polls frequently for responsive guidance, but face
+            # cascades are expensive. Reuse the last inspection briefly instead
+            # of running a new detector for every poll.
+            if (
+                self.last_preview_payload is not None
+                and now - self.last_preview_at < 2.0
+                and (self.session is not None or not self.last_preview_payload.get("active"))
+            ):
+                cached = dict(self.last_preview_payload)
+                cached["sample_count"] = self.session.samples if self.session is not None else 0
+                return cached
+            if not selected_camera:
+                result = {"active": False, "ready": False, "reason": "session_not_started", "message": "请选择海康摄像头并填写资料后开始采集"}
+                self.last_preview_payload = result
+                self.last_preview_at = now
+                return result
+            if selected_camera in self.cameras:
+                worker = self.cameras[selected_camera]
+            else:
+                result = {"active": False, "ready": False, "reason": "camera_not_found", "message": "采集摄像头不可用"}
+                self.last_preview_payload = result
+                self.last_preview_at = now
+                return result
+            captured, error = worker.registration_face()
+            if error:
+                result = {
+                    "active": self.session is not None,
+                    "ready": False,
+                    "reason": error,
+                    "message": self.guidance(error),
+                    "sample_count": self.session.samples if self.session is not None else 0,
+                }
+                self.last_preview_payload = result
+                self.last_preview_at = now
+                return result
+            quality = self.store.capture_policy.assess(captured["face"])
+            if not quality["accepted"]:
+                result = {
+                    "active": self.session is not None,
+                    "ready": False,
+                    "reason": quality["reason"],
+                    "message": self.guidance(quality["reason"]),
+                    "quality": quality,
+                    "face_box": captured["face_box"],
+                    "sample_count": self.session.samples if self.session is not None else 0,
+                }
+                self.last_preview_payload = result
+                self.last_preview_at = now
+                return result
+            result = {
+                "active": self.session is not None,
+                "ready": True,
+                "reason": None,
+                "message": "人脸质量合格，可以采集",
+                "quality": quality,
+                "face_box": captured["face_box"],
+                "sample_count": self.session.samples if self.session is not None else 0,
+            }
+            self.last_preview_payload = result
+            self.last_preview_at = now
+            return result
+
+    def finalize(self):
+        with self.lock:
+            if self.session is None:
+                raise RuntimeError("没有正在进行的人脸采集")
+            if self.session.samples < self.session.target_samples:
+                raise ValueError(f"还需采集 {self.session.target_samples - self.session.samples} 张有效样本")
+            result = self.session.finalize(replace_existing=self.replace_existing)
+            self.session = None
+            self.last_result = None
+            self.last_preview_payload = None
+            return result
+
+    def cancel(self):
+        with self.lock:
+            if self.session is not None:
+                shutil.rmtree(self.session.directory, ignore_errors=True)
+            self.session = None
+            self.last_result = None
+            self.last_preview_payload = None
+            return {"ok": True}
+
+
+def mjpeg_stream(worker, remote=False):
+    sequence = -1
+    while worker.running:
+        result = worker.wait_for_jpeg(remote, sequence)
+        if result is None or result[0] <= sequence:
+            continue
+        sequence, encoded = result
+        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + encoded + b"\r\n"
+
+
+def _validate_annotation_point(point, name, *, normalized=False):
+    if not isinstance(point, (list, tuple)) or len(point) != 2:
+        raise ValueError(f"{name} must contain two coordinates")
+    try:
+        values = [float(point[0]), float(point[1])]
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} contains invalid coordinates") from error
+    if not np.isfinite(values).all():
+        raise ValueError(f"{name} contains invalid coordinates")
+    if normalized and not all(0.0 <= value <= 1.0 for value in values):
+        raise ValueError(f"{name} must be normalized to 0..1")
+    return values
+
+
+def _validate_annotation_payload(payload, config):
+    camera_id = payload.get("camera_id")
+    cameras = config.get("cameras", {})
+    if camera_id not in cameras:
+        raise ValueError("unknown camera_id")
+
+    regions = payload.get("regions") or {}
+    if not isinstance(regions, dict):
+        raise ValueError("regions must be an object")
+    allowed_types = {"main_aisle", "secondary_aisle", "overlap"}
+    clean_regions = {}
+    for region_type, region in regions.items():
+        if region_type not in allowed_types:
+            raise ValueError(f"unsupported region type: {region_type}")
+        if not isinstance(region, dict):
+            raise ValueError(f"{region_type} must be an object")
+        values = {}
+        for key in ("x", "y", "width", "height"):
+            try:
+                values[key] = float(region[key])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"{region_type}.{key} is invalid") from error
+        if not np.isfinite(list(values.values())).all():
+            raise ValueError(f"{region_type} contains invalid coordinates")
+        if not (0.0 <= values["x"] < 1.0 and 0.0 <= values["y"] < 1.0):
+            raise ValueError(f"{region_type} origin must be normalized to 0..1")
+        if values["width"] <= 0.0 or values["height"] <= 0.0:
+            raise ValueError(f"{region_type} size must be positive")
+        if values["x"] + values["width"] > 1.0 or values["y"] + values["height"] > 1.0:
+            raise ValueError(f"{region_type} must stay inside the image")
+        clean_regions[region_type] = values
+
+    image_points = payload.get("image_points") or []
+    map_points = payload.get("map_points") or []
+    if image_points or map_points:
+        if len(image_points) != 4 or len(map_points) != 4:
+            raise ValueError("image_points and map_points must both contain four points")
+        clean_image_points = [
+            _validate_annotation_point(point, "image_points", normalized=True)
+            for point in image_points
+        ]
+        clean_map_points = [
+            _validate_annotation_point(point, "map_points") for point in map_points
+        ]
+        width_m = float(config.get("width_m", 0.0))
+        height_m = float(config.get("height_m", 0.0))
+        if any(
+            point[0] < 0.0
+            or point[1] < 0.0
+            or point[0] > width_m
+            or point[1] > height_m
+            for point in clean_map_points
+        ):
+            raise ValueError("map_points exceed the configured map size")
+    else:
+        clean_image_points = []
+        clean_map_points = []
+
+    return {
+        "camera_id": camera_id,
+        "regions": clean_regions,
+        "image_points": clean_image_points,
+        "map_points": clean_map_points,
+        "activate_calibration": bool(payload.get("activate_calibration", False)),
+    }
+
+
+def _save_floor_map_config(config):
+    FLOOR_MAP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=FLOOR_MAP_PATH.parent,
+            prefix=f"{FLOOR_MAP_PATH.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            json.dump(config, temporary, ensure_ascii=False, indent=2)
+            temporary.write("\n")
+            temporary_name = temporary.name
+        os.replace(temporary_name, FLOOR_MAP_PATH)
+    finally:
+        if temporary_name and os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+face_store = FaceIdentityStore(
+    PEOPLE_PATH,
+    KNOWN_FACES_DIR,
+    recognition_model_path=FACE_RECOGNITION_MODEL_PATH,
+    modern_model_root=MODERN_FACE_MODEL_ROOT,
+    required_engine=FACE_RECOGNITION_ENGINE,
+)
+camera_manager = CameraManager(load_cameras(), face_store)
+face_registration = FaceRegistrationManager(face_store, camera_manager.workers)
+atexit.register(camera_manager.stop)
+
+
+@app.route("/")
+def index():
+    if os.environ.get("LAB_API_ONLY") == "1":
+        return jsonify({"service": "lab-api", "frontend": "http://127.0.0.1:5173/"})
+    return render_template("index.html")
+
+
+@app.route("/faces")
+def faces():
+    if os.environ.get("LAB_API_ONLY") == "1":
+        return jsonify({"service": "lab-api", "frontend": "http://127.0.0.1:5173/faces"})
+    return render_template("faces.html")
+
+
+@app.route("/api/health")
+def api_health():
+    return jsonify({"status": "ok", "service": "lab-api"})
+
+
+@app.route("/video/<camera_id>")
+def video(camera_id):
+    worker = camera_manager.workers.get(camera_id)
+    if worker is None:
+        return "camera not found", 404
+    remote = request.args.get("remote") == "1"
+    response = Response(
+        mjpeg_stream(worker, remote=remote),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
+@app.route("/api/state")
+def api_state():
+    return jsonify(camera_manager.state())
+
+
+@app.route("/api/annotation/config")
+def api_annotation_config():
+    with ANNOTATION_LOCK:
+        config = json.loads(FLOOR_MAP_PATH.read_text(encoding="utf-8"))
+    return jsonify(
+        {
+            "name": config.get("name", "实验室平面图"),
+            "width_m": float(config.get("width_m", 0.0)),
+            "height_m": float(config.get("height_m", 0.0)),
+            "calibrated": bool(config.get("calibrated", False)),
+            "zones": config.get("zones", []),
+            "fixtures": config.get("fixtures", []),
+            "cameras": config.get("cameras", {}),
+            "annotations": config.get("annotations", {}),
+        }
+    )
+
+
+@app.route("/api/annotation/save", methods=["POST"])
+def api_annotation_save():
+    payload = request.get_json(silent=True) or {}
+    try:
+        with ANNOTATION_LOCK:
+            config = json.loads(FLOOR_MAP_PATH.read_text(encoding="utf-8"))
+            annotation = _validate_annotation_payload(payload, config)
+            camera_id = annotation["camera_id"]
+            config.setdefault("annotations", {})[camera_id] = {
+                "regions": annotation["regions"],
+                "image_points": annotation["image_points"],
+                "map_points": annotation["map_points"],
+            }
+            if annotation["image_points"] and annotation["map_points"]:
+                config["cameras"][camera_id]["image_points"] = annotation["image_points"]
+                config["cameras"][camera_id]["map_points"] = annotation["map_points"]
+            if annotation["activate_calibration"]:
+                all_calibrated = all(
+                    len(camera.get("image_points", [])) == 4
+                    and len(camera.get("map_points", [])) == 4
+                    for camera in config.get("cameras", {}).values()
+                )
+                if not all_calibrated:
+                    raise ValueError("请先为每路摄像头完成四点标定")
+                config["calibrated"] = True
+            _save_floor_map_config(config)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    return jsonify(
+        {
+            "ok": True,
+            "camera_id": camera_id,
+            "requires_restart": True,
+            "calibrated": bool(config.get("calibrated", False)),
+            "message": "标注已保存；重启后端后新的四点映射才会应用",
+        }
+    )
+
+
+@app.route("/api/people")
+def api_people():
+    return jsonify(list(face_store.people.values()))
+
+
+@app.route("/api/face-registration", methods=["GET"])
+def api_face_registration():
+    return jsonify(face_registration.status())
+
+
+@app.route("/api/face-registration/start", methods=["POST"])
+def api_face_registration_start():
+    try:
+        return jsonify(face_registration.start(request.get_json(silent=True) or {})), 201
+    except (ValueError, RuntimeError) as error:
+        return jsonify({"error": str(error)}), 409
+
+
+@app.route("/api/face-registration/capture", methods=["POST"])
+def api_face_registration_capture():
+    try:
+        return jsonify(face_registration.capture())
+    except (ValueError, RuntimeError) as error:
+        return jsonify({"error": str(error)}), 409
+
+
+@app.route("/api/face-registration/preview", methods=["GET"])
+def api_face_registration_preview():
+    return jsonify(face_registration.preview(request.args.get("camera_id")))
+
+
+@app.route("/api/face-registration/finalize", methods=["POST"])
+def api_face_registration_finalize():
+    try:
+        return jsonify(face_registration.finalize())
+    except (ValueError, RuntimeError) as error:
+        return jsonify({"error": str(error)}), 409
+
+
+@app.route("/api/face-registration/cancel", methods=["POST"])
+def api_face_registration_cancel():
+    return jsonify(face_registration.cancel())
+
+
+@app.route("/api/recording", methods=["GET"])
+def api_recording():
+    return jsonify(camera_manager.recorder.status())
+
+
+@app.route("/api/recording/start", methods=["POST"])
+def api_recording_start():
+    payload = request.get_json(silent=True) or {}
+    try:
+        recording = camera_manager.start_recording(
+            payload.get("subject_id"), payload.get("notes", "")
+        )
+        return jsonify(recording), 201
+    except RecordingError as error:
+        return jsonify({"error": str(error)}), 409
+
+
+@app.route("/api/recording/stop", methods=["POST"])
+def api_recording_stop():
+    try:
+        return jsonify(camera_manager.recorder.stop("operator"))
+    except RecordingError as error:
+        return jsonify({"error": str(error)}), 409
+
+
+if __name__ == "__main__":
+    app.run(
+        host=os.environ.get("LAB_APP_HOST", "0.0.0.0"),
+        port=int(os.environ.get("LAB_APP_PORT", "5000")),
+        threaded=True,
+    )

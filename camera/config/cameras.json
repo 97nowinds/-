@@ -1,0 +1,25 @@
+[
+  {
+    "id": "cam_1",
+    "name": "Hikvision Camera 1",
+    "role": "tracking",
+    "face_recognition": false,
+    "source_env": "LAB_CAM_1_RTSP"
+  },
+  {
+    "id": "cam_2",
+    "name": "Hikvision Camera 2",
+    "role": "tracking",
+    "face_recognition": false,
+    "source_env": "LAB_CAM_2_RTSP"
+  },
+  {
+    "id": "cam_entrance",
+    "name": "Entrance ArcFace Camera",
+    "role": "entrance_identity",
+    "face_recognition": true,
+    "face_interval_seconds": 0.25,
+    "optional": true,
+    "source_env": "LAB_CAM_ENTRANCE_RTSP"
+  }
+]

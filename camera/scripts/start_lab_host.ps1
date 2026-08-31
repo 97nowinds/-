@@ -1,0 +1,117 @@
+param(
+    [string]$Camera1Ip = "192.168.1.64",
+    [string]$Camera2Ip = "192.168.1.65",
+    [string]$EntranceCameraIp = "",
+    [string]$Camera1Username = "admin",
+    [string]$Camera2Username = "admin",
+    [string]$EntranceCameraUsername = "admin",
+    [ValidateSet("101", "102")]
+    [string]$Channel = "102",
+    [ValidateSet("tcp", "udp")]
+    [string]$RtspTransport = "udp",
+    [string]$ListenAddress = "0.0.0.0",
+    [int]$Port = 5000,
+    [string]$FrontendOrigin = "*"
+)
+
+$ErrorActionPreference = "Stop"
+$projectRoot = Split-Path -Parent $PSScriptRoot
+$venvRoot = Join-Path $projectRoot ".venv"
+if (-not (Test-Path -LiteralPath $venvRoot)) {
+    $venvRoot = Join-Path (Split-Path -Parent $projectRoot) ".venv"
+}
+$python = Join-Path $venvRoot "Scripts\python.exe"
+$probe = Join-Path $PSScriptRoot "probe_rtsp.py"
+$app = Join-Path $projectRoot "app.py"
+$nvidiaBinDirs = Get-ChildItem -LiteralPath (Join-Path $venvRoot "Lib\site-packages\nvidia") -Recurse -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq "bin" } |
+    Select-Object -ExpandProperty FullName
+foreach ($nvidiaBinDir in $nvidiaBinDirs) {
+    $env:Path = "$nvidiaBinDir;$env:Path"
+}
+$arcfaceRoot = Join-Path $projectRoot "models\insightface\models\buffalo_l"
+$requiredModels = @("det_10g.onnx", "w600k_r50.onnx")
+$passwordPointers = @()
+
+foreach ($model in $requiredModels) {
+    if (-not (Test-Path (Join-Path $arcfaceRoot $model))) {
+        throw "ArcFace model '$model' is missing. Run scripts\install_arcface_models.py first."
+    }
+}
+
+Write-Host "Laboratory compute host: ArcFace tracking" -ForegroundColor Cyan
+Write-Host "Indoor cameras: $Camera1Ip, $Camera2Ip"
+if ($EntranceCameraIp) {
+    Write-Host "Entrance ArcFace camera: $EntranceCameraIp"
+} else {
+    Write-Host "Entrance ArcFace camera: not enabled; using two indoor cameras" -ForegroundColor Yellow
+}
+Write-Host "API: http://${ListenAddress}:$Port, RTSP transport: $RtspTransport"
+Write-Host "Passwords stay in this process and are never written to disk."
+
+$password1 = Read-Host "Password for Cam1 user '$Camera1Username'" -AsSecureString
+$password2 = Read-Host "Password for Cam2 user '$Camera2Username'" -AsSecureString
+$entrancePassword = $null
+if ($EntranceCameraIp) {
+    $entrancePassword = Read-Host "Password for entrance camera user '$EntranceCameraUsername'" -AsSecureString
+}
+
+try {
+    foreach ($securePassword in @($password1, $password2)) {
+        $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
+    }
+    if ($EntranceCameraIp) {
+        $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($entrancePassword)
+    }
+    $user1 = [Uri]::EscapeDataString($Camera1Username)
+    $user2 = [Uri]::EscapeDataString($Camera2Username)
+    $pass1 = [Uri]::EscapeDataString([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[0]))
+    $pass2 = [Uri]::EscapeDataString([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[1]))
+    $env:LAB_CAM_1_RTSP = "rtsp://${user1}:${pass1}@${Camera1Ip}:554/Streaming/Channels/${Channel}"
+    $env:LAB_CAM_2_RTSP = "rtsp://${user2}:${pass2}@${Camera2Ip}:554/Streaming/Channels/${Channel}"
+    if ($EntranceCameraIp) {
+        $entranceUser = [Uri]::EscapeDataString($EntranceCameraUsername)
+        $entrancePass = [Uri]::EscapeDataString([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[2]))
+        $env:LAB_CAM_ENTRANCE_RTSP = "rtsp://${entranceUser}:${entrancePass}@${EntranceCameraIp}:554/Streaming/Channels/${Channel}"
+        $entrancePass = $null
+    }
+    $pass1 = $null
+    $pass2 = $null
+    $env:LAB_RTSP_TRANSPORT = $RtspTransport
+    $env:OPENCV_FFMPEG_CAPTURE_OPTIONS = "rtsp_transport;$RtspTransport|stimeout;5000000|fflags;nobuffer|flags;low_delay|max_delay;0|analyzeduration;0|probesize;32768"
+    $env:LAB_FACE_ENGINE = "arcface"
+    $env:LAB_API_ONLY = "1"
+    $env:LAB_APP_HOST = $ListenAddress
+    $env:LAB_APP_PORT = [string]$Port
+    $env:LAB_FRONTEND_ORIGIN = $FrontendOrigin
+
+    Set-Location $projectRoot
+    $cameraEnvironments = @("LAB_CAM_1_RTSP", "LAB_CAM_2_RTSP")
+    if ($EntranceCameraIp) {
+        $cameraEnvironments += "LAB_CAM_ENTRANCE_RTSP"
+    }
+    foreach ($cameraEnvironment in $cameraEnvironments) {
+        Write-Host "Testing $cameraEnvironment..." -ForegroundColor Yellow
+        & $python $probe --url-env $cameraEnvironment
+        if ($LASTEXITCODE -ne 0) {
+            throw "$cameraEnvironment RTSP test failed."
+        }
+    }
+    & $python -c "import onnxruntime as ort; print('ONNX providers:', ort.get_available_providers())"
+    Write-Host "Starting laboratory compute API on port $Port" -ForegroundColor Green
+    & $python $app
+}
+finally {
+    foreach ($pointer in $passwordPointers) {
+        if ($pointer -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+        }
+    }
+    foreach ($name in @(
+        "LAB_CAM_1_RTSP", "LAB_CAM_2_RTSP", "LAB_CAM_ENTRANCE_RTSP",
+        "LAB_RTSP_TRANSPORT", "OPENCV_FFMPEG_CAPTURE_OPTIONS", "LAB_FACE_ENGINE",
+        "LAB_API_ONLY", "LAB_APP_HOST", "LAB_APP_PORT", "LAB_FRONTEND_ORIGIN"
+    )) {
+        Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+    }
+}

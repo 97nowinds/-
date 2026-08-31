@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>双海康人脸识别追踪</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>双海康人脸识别追踪</h1>
+          <p>人脸确认 · 侧脸/背身持续跟踪 · 跨摄像头身份继承</p>
+        </div>
+        <div class="topbar-actions">
+          <a id="faceCaptureLink" class="tool-link" href="/faces">人脸采集</a>
+          <span id="serviceState" class="service-state">连接中</span>
+        </div>
+      </header>
+
+      <section class="summary-grid">
+        <article>
+          <span>摄像头状态</span>
+          <strong id="cameraSummary">检查中</strong>
+        </article>
+        <article>
+          <span>当前注册身份</span>
+          <strong id="identitySummary">尚未确认</strong>
+        </article>
+        <article>
+          <span>跨镜头状态</span>
+          <strong id="handoffSummary">等待目标</strong>
+        </article>
+      </section>
+
+      <section class="monitoring-layout">
+        <section class="video-grid" id="videoGrid"></section>
+        <aside class="floor-map-panel">
+          <header>
+            <div>
+              <h2>实验室实时位置</h2>
+              <span id="floorMapMode">示意映射</span>
+            </div>
+            <strong id="floorMapCount">0 人</strong>
+          </header>
+          <div class="floor-map-viewport">
+            <svg id="floorMapSvg" viewBox="0 0 1200 700" role="img" aria-label="实验室人员实时位置俯视图">
+              <g id="floorMapStatic"></g>
+              <g id="floorMapTrails"></g>
+              <g id="floorMapPeople"></g>
+            </svg>
+          </div>
+          <div class="floor-map-legend" aria-label="地图图例">
+            <span><i class="legend-person identified"></i>已确认</span>
+            <span><i class="legend-person unknown"></i>未注册</span>
+            <span><i class="legend-overlap"></i>重叠区</span>
+          </div>
+          <div id="floorMapPeopleList" class="floor-map-people-list">
+            <span class="empty">当前没有活动目标</span>
+          </div>
+        </aside>
+      </section>
+
+      <section class="people-panel">
+        <header>
+          <h2>已注册人员</h2>
+          <span>使用原有样本库</span>
+        </header>
+        <div id="peopleList" class="people-list"></div>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

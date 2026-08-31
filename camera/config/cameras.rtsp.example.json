@@ -1,0 +1,12 @@
+[
+  {
+    "id": "cam_1",
+    "name": "实验台入口网络摄像头",
+    "source_env": "LAB_CAM_1_RTSP"
+  },
+  {
+    "id": "cam_2",
+    "name": "实验台操作区网络摄像头",
+    "source_env": "LAB_CAM_2_RTSP"
+  }
+]

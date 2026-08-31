@@ -1,0 +1,29 @@
+# Python and local runtimes
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Camera recordings, face samples, and local runtime data
+data/
+tmp/
+camera_probe/
+models/*.pt
+models/insightface/
+runs/
+
+# Runtime logs and local secrets
+*.log
+.env
+.env.*
+!.env.example
+
+# Generated office artifacts
+*.docx
+*.pdf
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
