@@ -248,6 +248,57 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         self.assertNotEqual(reverse, first)
         self.assertNotEqual(expired, entrance)
 
+    def test_locked_global_identity_cannot_be_overwritten(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        first = coordinator._new_global(1, "cam_entrance", None, None)
+
+        accepted = coordinator.set_identity(
+            first, {"known": True, "person_id": "p1", "name": "yxq"},
+            "cam_entrance", now=1,
+        )
+        rejected = coordinator.set_identity(
+            first, {"known": True, "person_id": "p2", "name": "other"},
+            "cam_entrance", now=2,
+        )
+
+        self.assertEqual(accepted["identity_lock_status"], "locked")
+        self.assertIsNone(rejected)
+        self.assertEqual(
+            coordinator.global_identities[first]["identity"]["person_id"], "p1"
+        )
+
+    def test_registered_person_cannot_own_two_active_global_tracks(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        first = coordinator._new_global(1, "cam_entrance", None, None)
+        second = coordinator._new_global(1, "cam_1", None, None)
+        identity = {"known": True, "person_id": "p1", "name": "yxq"}
+
+        coordinator.set_identity(first, identity, "cam_entrance", now=1)
+        rejected = coordinator.set_identity(second, identity, "cam_1", now=2)
+
+        self.assertIsNone(rejected)
+        self.assertEqual(coordinator.person_locks["p1"], first)
+        self.assertNotIn(second, coordinator.global_identities)
+
+    def test_different_registered_people_are_never_merged(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        first = coordinator._new_global(1, "cam_1", None, None)
+        second = coordinator._new_global(1, "cam_2", None, None)
+        coordinator.set_identity(
+            first, {"known": True, "person_id": "p1", "name": "yxq"},
+            "cam_1", now=1,
+        )
+        coordinator.set_identity(
+            second, {"known": True, "person_id": "p2", "name": "other"},
+            "cam_2", now=1,
+        )
+
+        merged = coordinator._merge(first, second)
+
+        self.assertIsNone(merged)
+        self.assertIn(first, coordinator.global_tracks)
+        self.assertIn(second, coordinator.global_tracks)
+
 
 if __name__ == "__main__":
     unittest.main()

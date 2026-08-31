@@ -50,7 +50,17 @@ class FloorMapProjector:
 
     def project(self, camera_id, box, frame_shape):
         transform = self.transforms.get(camera_id)
-        if transform is None or box is None:
+        if box is None:
+            return None
+        if transform is None:
+            camera = self.config.get("cameras", {}).get(camera_id, {})
+            anchor = camera.get("tracking_anchor")
+            if (
+                isinstance(anchor, list)
+                and len(anchor) == 2
+                and np.isfinite(np.asarray(anchor, dtype=np.float64)).all()
+            ):
+                return self.clamp_position({"x": anchor[0], "y": anchor[1]})
             return None
         frame_height, frame_width = frame_shape[:2]
         if frame_width <= 0 or frame_height <= 0:
@@ -239,14 +249,27 @@ class FloorMapProjector:
             position = self._smooth_position(key, {"x": x, "y": y}, now)
             best_index = max(range(len(matches)), key=lambda index: weights[index])
             best = matches[best_index]
+            global_track_ids = sorted(
+                {
+                    str(match.get("global_track_id") or match.get("track_id"))
+                    for match in matches
+                    if match.get("global_track_id") or match.get("track_id")
+                }
+            )
             people.append(
                 {
                     "track_id": key,
+                    "global_track_id": best.get("global_track_id") or best.get("track_id"),
+                    "global_track_ids": global_track_ids,
                     "person_id": best.get("person_id"),
                     "person_number": best.get("person_number"),
                     "name": best.get("name") or "未注册",
                     "identified": bool(best.get("person_id")),
                     "identity_source": best.get("identity_source") or "visual",
+                    "identity_lock_status": (
+                        best.get("identity_lock_status")
+                        or ("locked" if best.get("person_id") else "visual")
+                    ),
                     "x": position["x"],
                     "y": position["y"],
                     "zone": self.zone_for(position["x"], position["y"]),

@@ -123,10 +123,11 @@ h2 { font-size: 16px; }
 .legend-overlap { width: 13px; height: 9px; border: 1px dashed #3eaa76; background: rgba(54, 171, 112, 0.13); }
 .floor-map-people-list { min-height: 42px; padding: 7px 12px; }
 .floor-person-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 7px; padding: 5px 0; }
-.floor-person-indicator { grid-row: 1 / span 2; align-self: center; width: 8px; height: 8px; border-radius: 50%; background: #58d492; }
+.floor-person-indicator { grid-row: 1 / span 3; align-self: center; width: 8px; height: 8px; border-radius: 50%; background: #58d492; }
 .floor-person-indicator.unknown { background: #f0a25a; }
 .floor-person-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
-.floor-person-row > span:last-child { overflow: hidden; color: #84909c; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.floor-person-location, .floor-person-lock { overflow: hidden; color: #84909c; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.floor-person-lock.locked { color: #58d492; }
 
 .people-panel { margin-top: 14px; padding: 14px; border: 1px solid #2d343c; border-radius: 7px; background: #171b20; }
 .people-panel header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }

@@ -145,6 +145,7 @@ class CrossCameraTrackCoordinator:
             [self.ttl_seconds]
             + [float(item.get("max_gap_seconds", 0.0)) for item in self.transitions]
         )
+        self.identity_retention_seconds = max(self.ttl_seconds, 90.0)
         self.lock = __import__("threading").RLock()
         self.next_id = 1
         self.local_bindings = {}
@@ -153,6 +154,9 @@ class CrossCameraTrackCoordinator:
         # A global identity survives the short ByteTrack TTL so it can be
         # handed from cam_1 to cam_2 after the target leaves the overlap.
         self.global_identities = {}
+        # One registered person may own only one active global track. This
+        # prevents a weak Re-ID match from showing the same identity twice.
+        self.person_locks = {}
 
     @staticmethod
     def similarity(first, second):
@@ -263,6 +267,9 @@ class CrossCameraTrackCoordinator:
             return []
         eligible = []
         for global_id, record in self.global_identities.items():
+            person_id = record.get("identity", {}).get("person_id")
+            if person_id and self.person_locks.get(person_id) != global_id:
+                continue
             if record.get("camera_id") == camera_id:
                 continue
             if not self._handoff_allowed(
@@ -286,16 +293,44 @@ class CrossCameraTrackCoordinator:
             self.local_features[binding_key] = (appearance, now)
         return appearance
 
+    def _release_identity(self, global_id):
+        record = self.global_identities.pop(global_id, None)
+        person_id = (record or {}).get("identity", {}).get("person_id")
+        if person_id and self.person_locks.get(person_id) == global_id:
+            self.person_locks.pop(person_id, None)
+        target = self.global_tracks.get(global_id)
+        if target is not None:
+            target.pop("identity", None)
+        return record
+
+    def _identity_is_active(self, record, now):
+        return bool(
+            record
+            and now - record.get("updated_at", 0.0)
+            <= self.identity_retention_seconds
+        )
+
     def _merge(self, first_id, second_id):
         keep_id, remove_id = sorted((first_id, second_id), key=self._number)
         if keep_id == remove_id:
             return keep_id
+        keep_identity = self.global_identities.get(keep_id)
+        remove_identity = self.global_identities.get(remove_id)
+        keep_person = (keep_identity or {}).get("identity", {}).get("person_id")
+        remove_person = (remove_identity or {}).get("identity", {}).get("person_id")
+        if keep_person and remove_person and keep_person != remove_person:
+            return None
         removed = self.global_tracks.pop(remove_id, None)
         if removed and keep_id not in self.global_tracks:
             self.global_tracks[keep_id] = removed
         removed_identity = self.global_identities.pop(remove_id, None)
-        if removed_identity and keep_id not in self.global_identities:
-            self.global_identities[keep_id] = removed_identity
+        if removed_identity:
+            current = self.global_identities.get(keep_id)
+            if current is None or removed_identity["updated_at"] > current["updated_at"]:
+                self.global_identities[keep_id] = removed_identity
+            person_id = removed_identity.get("identity", {}).get("person_id")
+            if person_id and self.person_locks.get(person_id) == remove_id:
+                self.person_locks[person_id] = keep_id
         for key, bound_id in list(self.local_bindings.items()):
             if bound_id == remove_id:
                 self.local_bindings[key] = keep_id
@@ -310,17 +345,43 @@ class CrossCameraTrackCoordinator:
             keep_id = min(global_ids, key=self._number)
             for global_id in global_ids:
                 if global_id != keep_id:
-                    keep_id = self._merge(keep_id, global_id)
+                    merged_id = self._merge(keep_id, global_id)
+                    if merged_id is not None:
+                        keep_id = merged_id
             return keep_id
 
     def set_identity(self, global_id, identity, camera_id, position=None, now=None):
         """Attach a confirmed face identity to a cross-camera global target."""
         if not global_id or not identity or not identity.get("known"):
-            return
+            return None
+        person_id = identity.get("person_id")
+        if not person_id:
+            return None
         now = time.time() if now is None else float(now)
         with self.lock:
+            existing = self.global_identities.get(global_id)
+            existing_person = (existing or {}).get("identity", {}).get("person_id")
+            if existing_person and existing_person != person_id:
+                if self._identity_is_active(existing, now):
+                    return None
+                self._release_identity(global_id)
+
+            lock_owner = self.person_locks.get(person_id)
+            if lock_owner and lock_owner != global_id:
+                owner_record = self.global_identities.get(lock_owner)
+                if self._identity_is_active(owner_record, now):
+                    return None
+                self._release_identity(lock_owner)
+
+            locked_identity = dict(identity)
+            locked_identity.update(
+                {
+                    "identity_lock_status": "locked",
+                    "global_track_id": global_id,
+                }
+            )
             record = {
-                "identity": dict(identity),
+                "identity": locked_identity,
                 "camera_id": camera_id,
                 "position": dict(position) if position else None,
                 "appearance": (
@@ -329,9 +390,11 @@ class CrossCameraTrackCoordinator:
                 "updated_at": now,
             }
             self.global_identities[global_id] = record
+            self.person_locks[person_id] = global_id
             target = self.global_tracks.get(global_id)
             if target is not None:
-                target["identity"] = dict(identity)
+                target["identity"] = dict(locked_identity)
+            return dict(locked_identity)
 
     def identity_for(self, global_id, camera_id, position=None, now=None):
         """Return identity after a spatial overlap or configured transition."""
@@ -342,8 +405,11 @@ class CrossCameraTrackCoordinator:
             record = self.global_identities.get(global_id)
             if record is None:
                 return None
-            if now - record["updated_at"] > max(self.ttl_seconds, 90.0):
-                self.global_identities.pop(global_id, None)
+            if not self._identity_is_active(record, now):
+                self._release_identity(global_id)
+                return None
+            person_id = record.get("identity", {}).get("person_id")
+            if person_id and self.person_locks.get(person_id) != global_id:
                 return None
             if record.get("camera_id") == camera_id:
                 return None
@@ -377,8 +443,8 @@ class CrossCameraTrackCoordinator:
                 if now - target["last_seen"] > self.retention_seconds:
                     self.global_tracks.pop(global_id, None)
             for global_id, record in list(self.global_identities.items()):
-                if now - record["updated_at"] > max(self.ttl_seconds, 90.0):
-                    self.global_identities.pop(global_id, None)
+                if not self._identity_is_active(record, now):
+                    self._release_identity(global_id)
             global_id = self.local_bindings.get(binding_key)
             if global_id not in self.global_tracks:
                 global_id = None
@@ -420,8 +486,10 @@ class CrossCameraTrackCoordinator:
                 exclude=global_id,
             )
             if self._has_unique_best_match(candidates):
-                global_id = self._merge(global_id, candidates[0][1])
-                self.local_bindings[binding_key] = global_id
+                merged_id = self._merge(global_id, candidates[0][1])
+                if merged_id is not None:
+                    global_id = merged_id
+                    self.local_bindings[binding_key] = global_id
 
             target = self.global_tracks[global_id]
             if appearance is not None:

@@ -1044,38 +1044,44 @@ class CameraWorker:
                     self.last_face_result = face_result
                     self.last_face_box_at = now
 
-        # Identity is intentionally rendered on the single large person box.
-        # The former separate face rectangle made one person look duplicated.
+        # Publish a name only after the coordinator grants the single-owner
+        # identity lock. Conflicts remain anonymous instead of being mislabelled.
         if self.identity and self.identity_track_id is not None:
-            for observation in observations:
-                if observation.get("local_id") != self.identity_track_id:
-                    continue
-                observation.update(
-                    {
-                        "person_id": self.identity.get("person_id"),
-                        "person_number": self.identity.get("person_number"),
-                        "name": self.identity.get("name"),
-                        "identity_source": self.identity.get("identity_source", "face"),
-                    }
-                )
-
             bound_track = next(
                 (item for item in tracks if item["track_id"] == self.identity_track_id),
                 None,
             )
             if bound_track is not None:
-                self.refresh_handoff(frame, bound_track["box"])
                 current_global_id = global_ids_by_local_id.get(self.identity_track_id)
                 current_position = self.project_box(
                     bound_track["box"], frame.shape
                 )
-                self.coordinator.set_identity(
+                locked_identity = self.coordinator.set_identity(
                     current_global_id,
                     self.identity,
                     self.camera["id"],
                     current_position,
                     now=now,
                 )
+                if locked_identity is None:
+                    self.clear_identity()
+                else:
+                    self.identity = locked_identity
+                    for observation in observations:
+                        if observation.get("local_id") != self.identity_track_id:
+                            continue
+                        observation.update(
+                            {
+                                "person_id": self.identity.get("person_id"),
+                                "person_number": self.identity.get("person_number"),
+                                "name": self.identity.get("name"),
+                                "identity_source": self.identity.get("identity_source", "face"),
+                                "identity_lock_status": self.identity.get("identity_lock_status"),
+                                "global_track_id": self.identity.get("global_track_id"),
+                                "handoff_from_camera": self.identity.get("handoff_from_camera"),
+                            }
+                        )
+                    self.refresh_handoff(frame, bound_track["box"])
 
         self.yolo_trails.prune(now=now)
         if not should_infer or hold_cached_tracks:
@@ -1319,6 +1325,8 @@ class CameraWorker:
                     "identity_source",
                     "handoff_from_camera",
                     "appearance_score",
+                    "identity_lock_status",
+                    "global_track_id",
                 )
             }
         with self.lock:
@@ -1455,6 +1463,8 @@ class CameraManager:
                     "person_number": identity.get("person_number"),
                     "name": identity.get("name"),
                     "identity_source": identity.get("identity_source", "face"),
+                    "identity_lock_status": identity.get("identity_lock_status"),
+                    "global_track_id": identity.get("global_track_id"),
                 }
             )
         observations = [
@@ -1488,6 +1498,7 @@ class CameraManager:
                 "reid_feature_refresh_ms": 1000,
                 "identity_handoff_ttl_seconds": IDENTITY_HANDOFF_TTL_SECONDS,
                 "identity_handoff_path": "entrance ArcFace -> directed Re-ID transition -> indoor tracks",
+                "identity_lock_policy": "single active global track per registered person; conflicts stay anonymous",
                 "slam_engine": "ArUco anchors + ORB monocular SLAM",
                 "slam_marker_reacquire": "automatic",
                 "track_hold_ms": int(YOLO_TRACK_HOLD_SECONDS * 1000),

@@ -195,7 +195,8 @@ function renderFloorMap(floorMap) {
       <div class="floor-person-row">
         <span class="floor-person-indicator ${person.identified ? "identified" : "unknown"}"></span>
         <strong>${escapeHtml(personLabel(person))}</strong>
-        <span>${escapeHtml(person.zone)} · ${escapeHtml(person.cameras.join(" + "))}</span>
+        <span class="floor-person-location">${escapeHtml(person.zone)} · ${escapeHtml(person.cameras.join(" + "))}</span>
+        <span class="floor-person-lock ${person.identity_lock_status === "locked" ? "locked" : "visual"}">${person.identity_lock_status === "locked" ? "已锁定" : "视觉追踪"} · ${escapeHtml(person.global_track_id || person.track_id)}</span>
       </div>
     `).join("")
     : `<span class="empty">当前没有活动目标</span>`;

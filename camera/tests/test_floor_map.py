@@ -71,6 +71,22 @@ class FloorMapProjectorTests(unittest.TestCase):
             projector.project("cam_entrance", (20, 10, 30, 70), (100, 100, 3))
         )
 
+    def test_entrance_tracking_anchor_marks_person_at_door(self):
+        floor_config = config()
+        floor_config["cameras"]["cam_entrance"] = {
+            "label": "Entrance",
+            "position": [10, 5],
+            "fov": [[10, 5], [8, 4], [10, 4]],
+            "tracking_anchor": [9.6, 4.8],
+        }
+        projector = FloorMapProjector(floor_config)
+
+        position = projector.project(
+            "cam_entrance", (20, 10, 30, 70), (100, 100, 3)
+        )
+
+        self.assertEqual(position, {"x": 9.6, "y": 4.8})
+
     def test_same_registered_person_from_two_cameras_is_merged(self):
         observations = [
             {
@@ -101,6 +117,7 @@ class FloorMapProjectorTests(unittest.TestCase):
         self.assertEqual(person["cameras"], ["cam_1", "cam_2"])
         self.assertEqual(person["zone"], "Overlap")
         self.assertTrue(person["identified"])
+        self.assertEqual(person["identity_lock_status"], "locked")
 
     def test_unidentified_tracks_prefer_stable_observation_track_ids(self):
         observations = [
