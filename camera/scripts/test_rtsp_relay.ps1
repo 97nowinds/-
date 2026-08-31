@@ -10,7 +10,7 @@ if (-not $listener) {
     throw "MediaMTX is not listening on TCP $RelayPort. Start start_rtsp_gateway.ps1 first."
 }
 
-foreach ($camera in @("cam_1", "cam_2")) {
+foreach ($camera in @("cam_1", "cam_2", "cam_entrance")) {
     $url = "rtsp://127.0.0.1:${RelayPort}/${camera}"
     $arguments = @(
         "-hide_banner", "-loglevel", "warning", "-nostdin",

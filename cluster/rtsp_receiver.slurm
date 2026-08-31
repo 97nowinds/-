@@ -41,12 +41,14 @@ paths:
     source: publisher
   cam_2:
     source: publisher
+  cam_entrance:
+    source: publisher
 YAML
 
 cleanup() { rm -rf "$WORK_ROOT"; }
 trap cleanup EXIT
 
 echo "node=$(hostname) job=${SLURM_JOB_ID}"
-echo "RTSP receiver: rtsp://127.0.0.1:8554/cam_1 and /cam_2"
+echo "RTSP receiver: rtsp://127.0.0.1:8554/cam_1, /cam_2, and /cam_entrance"
 cd "$WORK_ROOT"
 exec ./mediamtx mediamtx.yml

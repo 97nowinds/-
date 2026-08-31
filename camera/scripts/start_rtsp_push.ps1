@@ -4,8 +4,10 @@ param(
     [string]$RemoteBaseUrl,
     [string]$Camera1Ip = "192.168.1.64",
     [string]$Camera2Ip = "192.168.1.65",
+    [string]$EntranceCameraIp = "192.168.1.66",
     [string]$Camera1Username = "admin",
     [string]$Camera2Username = "admin",
+    [string]$EntranceCameraUsername = "admin",
     [string]$RemoteUsername = "",
     [ValidateSet("101", "102")]
     [string]$Channel = "102",
@@ -31,10 +33,16 @@ $passwordPointers = @()
 $processes = @{}
 $remotePassword = ""
 
-function New-Url([string]$scheme, [string]$ip, [string]$username, [string]$password) {
+function New-HikvisionUrl([string]$ip, [string]$username, [string]$password) {
     $user = [Uri]::EscapeDataString($username)
     $pass = [Uri]::EscapeDataString($password)
-    return "${scheme}://${user}:${pass}@${ip}:554/Streaming/Channels/${Channel}"
+    return "rtsp://${user}:${pass}@${ip}:554/Streaming/Channels/${Channel}"
+}
+
+function New-TplinkUrl([string]$ip, [string]$username, [string]$password) {
+    $user = [Uri]::EscapeDataString($username)
+    $pass = [Uri]::EscapeDataString($password)
+    return "rtsp://${user}:${pass}@${ip}:554/stream1"
 }
 
 function Add-Credentials([string]$url, [string]$username, [string]$password) {
@@ -53,6 +61,10 @@ function Start-Push([string]$name, [string]$sourceUrl, [string]$destinationUrl) 
 
 $password1 = Read-Host "Password for Cam1 user '$Camera1Username'" -AsSecureString
 $password2 = Read-Host "Password for Cam2 user '$Camera2Username'" -AsSecureString
+$entrancePassword = $null
+if (-not [string]::IsNullOrWhiteSpace($EntranceCameraIp)) {
+    $entrancePassword = Read-Host "Password for TP-LINK entrance camera user '$EntranceCameraUsername'" -AsSecureString
+}
 if (-not [string]::IsNullOrWhiteSpace($RemoteUsername)) {
     $remotePasswordSecure = Read-Host "Password for remote RTSP ingest user '$RemoteUsername'" -AsSecureString
 }
@@ -60,32 +72,46 @@ if (-not [string]::IsNullOrWhiteSpace($RemoteUsername)) {
 try {
     $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($password1)
     $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($password2)
+    $entrancePointerIndex = -1
+    if ($entrancePassword) {
+        $entrancePointerIndex = $passwordPointers.Count
+        $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($entrancePassword)
+    }
     if ($remotePasswordSecure) {
+        $remotePointerIndex = $passwordPointers.Count
         $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($remotePasswordSecure)
-        $remotePassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[2])
+        $remotePassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[$remotePointerIndex])
     }
     $remoteCam1 = Add-Credentials (($RemoteBaseUrl.TrimEnd('/') + "/cam_1")) $RemoteUsername $remotePassword
     $remoteCam2 = Add-Credentials (($RemoteBaseUrl.TrimEnd('/') + "/cam_2")) $RemoteUsername $remotePassword
-    $source1 = New-Url "rtsp" $Camera1Ip $Camera1Username ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[0]))
-    $source2 = New-Url "rtsp" $Camera2Ip $Camera2Username ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[1]))
+    $source1 = New-HikvisionUrl $Camera1Ip $Camera1Username ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[0]))
+    $source2 = New-HikvisionUrl $Camera2Ip $Camera2Username ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[1]))
+    if ($entrancePointerIndex -ge 0) {
+        $remoteEntrance = Add-Credentials (($RemoteBaseUrl.TrimEnd('/') + "/cam_entrance")) $RemoteUsername $remotePassword
+        $sourceEntrance = New-TplinkUrl $EntranceCameraIp $EntranceCameraUsername ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[$entrancePointerIndex]))
+    }
 
     Write-Host "Laboratory RTSP push gateway" -ForegroundColor Cyan
-    Write-Host "Cam1: $Camera1Ip, Cam2: $Camera2Ip, channel: $Channel, input transport: $RtspTransport"
-    Write-Host "Remote paths: /cam_1 and /cam_2"
+    Write-Host "Cam1: $Camera1Ip, Cam2: $Camera2Ip, entrance: $EntranceCameraIp, input transport: $RtspTransport"
+    Write-Host "Remote paths: /cam_1, /cam_2, and /cam_entrance"
     Write-Host "The lab host runs FFmpeg only; no Python, AI, recording, or Flask."
     Write-Host "All passwords are runtime-only and are not written to disk or logs."
 
     Start-Push "Cam1" $source1 $remoteCam1
     Start-Push "Cam2" $source2 $remoteCam2
+    if ($entrancePointerIndex -ge 0) {
+        Start-Push "Entrance" $sourceEntrance $remoteEntrance
+    }
 
     while ($true) {
-        foreach ($name in @("Cam1", "Cam2")) {
+        foreach ($name in @($processes.Keys)) {
             $process = $processes[$name]
             if ($process.HasExited) {
                 Write-Host "$name push exited with code $($process.ExitCode); retrying in ${RestartSeconds}s." -ForegroundColor Yellow
                 Start-Sleep -Seconds $RestartSeconds
                 if ($name -eq "Cam1") { Start-Push $name $source1 $remoteCam1 }
                 if ($name -eq "Cam2") { Start-Push $name $source2 $remoteCam2 }
+                if ($name -eq "Entrance") { Start-Push $name $sourceEntrance $remoteEntrance }
             }
         }
         Start-Sleep -Seconds 2

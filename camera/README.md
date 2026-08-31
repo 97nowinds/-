@@ -5,7 +5,7 @@
 当前部署采用“实验室主机主动推送 + lnx GPU 集群计算”：
 
 ```text
-海康 192.168.1.64/65
+海康 192.168.1.64/65 + TP-LINK 192.168.1.66
         │ 实验室内网 RTSP
 实验室主机 100.126.39.4
         │ MediaMTX + FFmpeg -c:v copy，TCP 8554，仅 Tailscale
@@ -15,9 +15,9 @@ lnx GPU 节点：YOLOv8n、ByteTrack、ArcFace、Re-ID、地图、录像、告�
 笔记本：SSH 隧道 + 浏览器，不连接摄像头，不运行模型
 ```
 
-实验室主机只运行两个 FFmpeg 推送进程。它不运行 MediaMTX、Python、YOLO、ArcFace、Re-ID、地图算法、录像或 Flask。ln01 只用于 SSH 登录、文件上传和提交 Slurm 作业，不能作为计算节点或视频中转节点。
+实验室主机只运行三个 FFmpeg 推送进程。它不运行 MediaMTX、Python、YOLO、ArcFace、Re-ID、地图算法、录像或 Flask。ln01 只用于 SSH 登录、文件上传和提交 Slurm 作业，不能作为计算节点或视频中转节点。
 
-当前阶段只配置和测试两路 RTSP 转发，不启动任何 AI 或 GPU 作业。只有当 lnx 成功读到两路转发流后，才执行下一阶段的 `camera_service.slurm`。
+三路 RTSP 转发已经配置：两台海康使用 `/Streaming/Channels/102`，入口 TP-LINK 使用 `/stream1`。入口流先只转发和验证，启用 `LAB_CAM_ENTRANCE_RTSP` 后才由 GPU 作业执行人脸识别。
 
 ## 主机主动推送
 
@@ -32,11 +32,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start_rtsp_push.ps1 `
   -RemoteUsername "<INGEST_USER>"
 ```
 
-如果接收端不需要认证，省略 `-RemoteUsername`。启动时输入两台海康密码和（如需要）接收端密码。密码只在当前进程内存中使用，不写入代码、配置或日志。FFmpeg 从两台内网摄像头拉流，再主动推送为：
+如果接收端不需要认证，省略 `-RemoteUsername`。启动时输入两台海康和入口 TP-LINK 的密码，以及（如需要）接收端密码。密码只在当前进程内存中使用，不写入代码、配置或日志。FFmpeg 从三台内网摄像头拉流，再主动推送为：
 
 ```text
 rtsp://<INGEST_HOST>:<INGEST_PORT>/lab/cam_1
 rtsp://<INGEST_HOST>:<INGEST_PORT>/lab/cam_2
+rtsp://<INGEST_HOST>:<INGEST_PORT>/lab/cam_entrance
 ```
 
 输出侧固定为 TCP；输入侧默认 TCP，可用 `-RtspTransport udp` 切换海康输入协议。推送使用 `-c:v copy -c:a copy`，不解码、不重新编码。FFmpeg 任一进程退出后，启动器自动重启该路。
@@ -74,6 +75,7 @@ cat lab-camera-check-<作业号>.out
 ```text
 cam_1_frame=ok
 cam_2_frame=ok
+cam_entrance_frame=ok
 RTSP relay read test passed from lnx.
 ```
 
@@ -127,9 +129,10 @@ bash cluster/submit_camera_service.sh --start-service
 ```text
 LAB_CAM_1_RTSP=rtsp://100.126.39.4:8554/cam_1
 LAB_CAM_2_RTSP=rtsp://100.126.39.4:8554/cam_2
+LAB_CAM_ENTRANCE_RTSP=rtsp://127.0.0.1:8554/cam_entrance
 ```
 
-第三台入口摄像头以后只需在 `sbatch` 时增加 `LAB_CAM_ENTRANCE_RTSP=rtsp://100.126.39.4:8554/cam_entrance`；不设置时，双摄模式不会因缺少入口摄像头而失败。摄像头密码不进入集群环境变量，因为集群只读取实验室主机已经发布的无密码转发地址。
+入口摄像头通过 `LAB_CAM_ENTRANCE_RTSP=rtsp://127.0.0.1:8554/cam_entrance` 启用；不设置时，双摄模式仍可独立运行。摄像头密码不进入集群环境变量，因为集群只读取实验室主机已经发布的无密码转发地址。
 
 ## 笔记本观察
 

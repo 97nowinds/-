@@ -1,0 +1,53 @@
+param(
+    [string]$CameraIp = "192.168.1.66",
+    [string]$Username = "admin",
+    [ValidateSet("tcp", "udp")]
+    [string]$RtspTransport = "tcp"
+)
+
+$ErrorActionPreference = "Stop"
+$projectRoot = Split-Path -Parent $PSScriptRoot
+$ffmpeg = Join-Path (Split-Path -Parent $projectRoot) ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"
+if (-not (Test-Path -LiteralPath $ffmpeg)) {
+    $ffmpeg = Join-Path $projectRoot ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"
+}
+if (-not (Test-Path -LiteralPath $ffmpeg)) {
+    throw "FFmpeg was not found. Install imageio-ffmpeg in C:\codex1\.venv first."
+}
+
+if (-not (Test-Connection -ComputerName $CameraIp -Count 1 -Quiet)) {
+    throw "Camera $CameraIp is not reachable."
+}
+
+$passwordSecure = Read-Host "Password for TP-LINK camera user '$Username'" -AsSecureString
+$passwordPointer = [IntPtr]::Zero
+
+try {
+    $passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($passwordSecure)
+    $password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointer)
+    $user = [Uri]::EscapeDataString($Username)
+    $pass = [Uri]::EscapeDataString($password)
+
+    foreach ($stream in @("stream1", "stream2")) {
+        $url = "rtsp://${user}:${pass}@${CameraIp}:554/${stream}"
+        $arguments = @(
+            "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-rtsp_transport", $RtspTransport,
+            "-fflags", "+discardcorrupt", "-i", $url,
+            "-map", "0:v:0", "-frames:v", "1", "-f", "null", "-"
+        )
+        $null = @(& $ffmpeg @arguments 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "TP-LINK RTSP frame check failed for /$stream. Verify the camera password and codec settings."
+        }
+        Write-Host "tplink_${stream}=ok" -ForegroundColor Green
+    }
+
+    Write-Host "TP-LINK RTSP main and sub streams passed." -ForegroundColor Green
+}
+finally {
+    $password = $null
+    if ($passwordPointer -ne [IntPtr]::Zero) {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)
+    }
+}

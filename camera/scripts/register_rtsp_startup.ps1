@@ -43,9 +43,9 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Principal $principal `
     -Settings $settings `
-    -Description "Prompt for camera passwords and start the two FFmpeg RTSP pushes." `
+    -Description "Prompt for camera passwords and start the three FFmpeg RTSP pushes." `
     -Force | Out-Null
 
 Write-Host "Registered: Lab Safety RTSP Tunnel" -ForegroundColor Green
 Write-Host "Registered: Lab Safety RTSP Push" -ForegroundColor Green
-Write-Host "The push task prompts for camera passwords after each Windows login."
+Write-Host "The push task prompts for all three camera passwords after each Windows login."
