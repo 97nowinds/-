@@ -17,12 +17,18 @@
     {
       "from": "cam_entrance",
       "to": "cam_1",
-      "max_gap_seconds": 20
+      "max_gap_seconds": 20,
+      "spatial_handoff_max_age_seconds": 3,
+      "spatial_handoff_max_distance_m": 2.5,
+      "spatial_handoff_similarity_threshold": 0.35
     },
     {
       "from": "cam_entrance",
       "to": "cam_2",
-      "max_gap_seconds": 20
+      "max_gap_seconds": 20,
+      "spatial_handoff_max_age_seconds": 3,
+      "spatial_handoff_max_distance_m": 2.5,
+      "spatial_handoff_similarity_threshold": 0.35
     },
     {
       "from": "cam_1",

@@ -1325,6 +1325,7 @@ class CameraWorker:
                     "identity_source",
                     "handoff_from_camera",
                     "appearance_score",
+                    "handoff_match_source",
                     "identity_lock_status",
                     "global_track_id",
                 )
@@ -1499,6 +1500,7 @@ class CameraManager:
                 "identity_handoff_ttl_seconds": IDENTITY_HANDOFF_TTL_SECONDS,
                 "identity_handoff_path": "entrance ArcFace -> directed Re-ID transition -> indoor tracks",
                 "identity_lock_policy": "single active global track per registered person; conflicts stay anonymous",
+                "late_identity_sync_policy": "directed entrance transition + <=3s + <=2.5m + single target + Re-ID >=0.35",
                 "slam_engine": "ArUco anchors + ORB monocular SLAM",
                 "slam_marker_reacquire": "automatic",
                 "track_hold_ms": int(YOLO_TRACK_HOLD_SECONDS * 1000),

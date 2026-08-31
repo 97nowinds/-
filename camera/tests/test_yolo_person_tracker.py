@@ -103,6 +103,22 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
             ],
         }
 
+    class SpatialTransitionFloorMap:
+        config = {
+            "calibrated": True,
+            "zones": [],
+            "camera_transitions": [
+                {
+                    "from": "cam_entrance",
+                    "to": "cam_1",
+                    "max_gap_seconds": 20,
+                    "spatial_handoff_max_age_seconds": 3,
+                    "spatial_handoff_max_distance_m": 2.5,
+                    "spatial_handoff_similarity_threshold": 0.35,
+                }
+            ],
+        }
+
     def coordinator(self, floor_map, **kwargs):
         return CrossCameraTrackCoordinator(FakeFeatureExtractor(), floor_map, **kwargs)
 
@@ -298,6 +314,75 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         self.assertIsNone(merged)
         self.assertIn(first, coordinator.global_tracks)
         self.assertIn(second, coordinator.global_tracks)
+
+    def test_existing_indoor_track_syncs_after_late_entrance_confirmation(self):
+        coordinator = self.coordinator(
+            self.SpatialTransitionFloorMap(), similarity_threshold=0.72
+        )
+        indoor = np.zeros((100, 100, 3), dtype=np.uint8)
+        indoor[20:80, 30:70] = (50, 87, 0)
+        entrance = np.zeros((100, 100, 3), dtype=np.uint8)
+        entrance[20:80, 30:70] = (100, 0, 0)
+
+        indoor_id = coordinator.update(
+            "cam_1", 7, indoor, (30, 20, 40, 60), {"x": 9.7, "y": 4.3}, now=1
+        )
+        entrance_id = coordinator.update(
+            "cam_entrance", 8, entrance, (30, 20, 40, 60),
+            {"x": 11.0, "y": 5.35}, now=2,
+        )
+        coordinator.set_identity(
+            entrance_id,
+            {"known": True, "person_id": "p1", "name": "yxq"},
+            "cam_entrance", {"x": 11.0, "y": 5.35}, now=2,
+        )
+
+        synced_id = coordinator.update(
+            "cam_1", 7, indoor, (30, 20, 40, 60), {"x": 9.7, "y": 4.3}, now=2.2
+        )
+        identity = coordinator.identity_for(
+            synced_id, "cam_1", {"x": 9.7, "y": 4.3}, now=2.2
+        )
+
+        self.assertEqual(synced_id, indoor_id)
+        self.assertEqual(identity["person_id"], "p1")
+        self.assertEqual(identity["handoff_match_source"], "directed_spatial_reid")
+        self.assertGreaterEqual(identity["appearance_score"], 0.35)
+
+    def test_late_identity_sync_rejects_ambiguous_indoor_crowd(self):
+        coordinator = self.coordinator(
+            self.SpatialTransitionFloorMap(), similarity_threshold=0.72
+        )
+        indoor = np.zeros((100, 100, 3), dtype=np.uint8)
+        indoor[20:80, 30:70] = (50, 87, 0)
+        entrance = np.zeros((100, 100, 3), dtype=np.uint8)
+        entrance[20:80, 30:70] = (100, 0, 0)
+        first = coordinator.update(
+            "cam_1", 7, indoor, (30, 20, 40, 60), {"x": 9.7, "y": 4.3}, now=1
+        )
+        coordinator.update(
+            "cam_1", 9, indoor, (30, 20, 40, 60), {"x": 9.5, "y": 4.4}, now=1
+        )
+        entrance_id = coordinator.update(
+            "cam_entrance", 8, entrance, (30, 20, 40, 60),
+            {"x": 11.0, "y": 5.35}, now=2,
+        )
+        coordinator.set_identity(
+            entrance_id,
+            {"known": True, "person_id": "p1", "name": "yxq"},
+            "cam_entrance", {"x": 11.0, "y": 5.35}, now=2,
+        )
+
+        unchanged = coordinator.update(
+            "cam_1", 7, indoor, (30, 20, 40, 60), {"x": 9.7, "y": 4.3}, now=2.2
+        )
+
+        self.assertEqual(unchanged, first)
+        self.assertIsNone(
+            coordinator.identity_for(
+                unchanged, "cam_1", {"x": 9.7, "y": 4.3}, now=2.2
+            )
+        )
 
 
 if __name__ == "__main__":

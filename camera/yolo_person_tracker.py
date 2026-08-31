@@ -261,12 +261,27 @@ class CrossCameraTrackCoordinator:
             or candidates[0][0] - candidates[1][0] >= self.match_margin
         )
 
-    def _identity_candidates(self, camera_id, appearance, position, now):
+    def _identity_candidates(
+        self,
+        camera_id,
+        appearance,
+        position,
+        now,
+        minimum_similarity=None,
+        exclude=None,
+    ):
         """Find identities allowed by overlap or a directed camera transition."""
         if appearance is None:
             return []
+        threshold = (
+            self.similarity_threshold
+            if minimum_similarity is None
+            else float(minimum_similarity)
+        )
         eligible = []
         for global_id, record in self.global_identities.items():
+            if global_id == exclude:
+                continue
             person_id = record.get("identity", {}).get("person_id")
             if person_id and self.person_locks.get(person_id) != global_id:
                 continue
@@ -280,7 +295,65 @@ class CrossCameraTrackCoordinator:
             ):
                 continue
             score = self.similarity(record.get("appearance"), appearance)
-            if score >= self.similarity_threshold:
+            if score >= threshold:
+                eligible.append((score, global_id))
+        return sorted(eligible, reverse=True)
+
+    def _directed_spatial_identity_candidates(
+        self, camera_id, appearance, position, now, exclude=None
+    ):
+        """Recover a late indoor track from one recent entrance confirmation."""
+        if appearance is None or position is None:
+            return []
+        active_here = {
+            global_id
+            for global_id, target in self.global_tracks.items()
+            if target.get("camera_id") == camera_id
+            and now - target.get("last_seen", 0.0) <= self.ttl_seconds
+        }
+        if len(active_here) != 1:
+            return []
+
+        eligible = []
+        for global_id, record in self.global_identities.items():
+            if global_id == exclude or record.get("camera_id") != "cam_entrance":
+                continue
+            transition = next(
+                (
+                    item
+                    for item in self.transitions
+                    if item.get("from") == "cam_entrance"
+                    and item.get("to") == camera_id
+                ),
+                None,
+            )
+            if transition is None:
+                continue
+            age = now - record.get("updated_at", 0.0)
+            maximum_age = min(
+                float(transition.get("max_gap_seconds", 0.0)),
+                float(transition.get("spatial_handoff_max_age_seconds", 3.0)),
+            )
+            if age < 0.0 or age > maximum_age:
+                continue
+            source_position = record.get("position")
+            if source_position is None:
+                continue
+            distance = math.hypot(
+                position["x"] - source_position["x"],
+                position["y"] - source_position["y"],
+            )
+            if distance > float(
+                transition.get("spatial_handoff_max_distance_m", 2.5)
+            ):
+                continue
+            person_id = record.get("identity", {}).get("person_id")
+            if person_id and self.person_locks.get(person_id) != global_id:
+                continue
+            score = self.similarity(record.get("appearance"), appearance)
+            if score >= float(
+                transition.get("spatial_handoff_similarity_threshold", 0.35)
+            ):
                 eligible.append((score, global_id))
         return sorted(eligible, reverse=True)
 
@@ -328,6 +401,9 @@ class CrossCameraTrackCoordinator:
             current = self.global_identities.get(keep_id)
             if current is None or removed_identity["updated_at"] > current["updated_at"]:
                 self.global_identities[keep_id] = removed_identity
+            kept_identity = self.global_identities.get(keep_id)
+            if kept_identity is not None:
+                kept_identity["identity"]["global_track_id"] = keep_id
             person_id = removed_identity.get("identity", {}).get("person_id")
             if person_id and self.person_locks.get(person_id) == remove_id:
                 self.person_locks[person_id] = keep_id
@@ -430,6 +506,8 @@ class CrossCameraTrackCoordinator:
                         "overlap_handoff" if in_overlap else "transition_handoff"
                     ),
                     "handoff_from_camera": record.get("camera_id"),
+                    "appearance_score": record.get("last_match_score"),
+                    "handoff_match_source": record.get("last_match_source"),
                 }
             )
             return result
@@ -490,6 +568,29 @@ class CrossCameraTrackCoordinator:
                 if merged_id is not None:
                     global_id = merged_id
                     self.local_bindings[binding_key] = global_id
+            else:
+                # ByteTrack can establish the indoor ID before ArcFace reaches
+                # its entrance vote threshold. Re-evaluate that existing ID
+                # using direction, time, distance, crowd and weak Re-ID gates.
+                late_candidates = self._directed_spatial_identity_candidates(
+                    camera_id,
+                    appearance,
+                    position,
+                    now,
+                    exclude=global_id,
+                )
+                if self._has_unique_best_match(late_candidates):
+                    score, identity_global_id = late_candidates[0]
+                    merged_id = self._merge(global_id, identity_global_id)
+                    if merged_id is not None:
+                        global_id = merged_id
+                        self.local_bindings[binding_key] = global_id
+                        identity_record = self.global_identities.get(global_id)
+                        if identity_record is not None:
+                            identity_record["last_match_score"] = score
+                            identity_record["last_match_source"] = (
+                                "directed_spatial_reid"
+                            )
 
             target = self.global_tracks[global_id]
             if appearance is not None:
