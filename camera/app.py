@@ -53,8 +53,9 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config" / "cameras.json"
 FLOOR_MAP_PATH = BASE_DIR / "config" / "floor_map.json"
 DATA_DIR = BASE_DIR / "data"
-PEOPLE_PATH = DATA_DIR / "people.json"
-KNOWN_FACES_DIR = DATA_DIR / "known_faces"
+FACE_DATA_DIR = Path(os.environ.get("LAB_FACE_DATA_DIR", DATA_DIR)).expanduser().resolve()
+PEOPLE_PATH = FACE_DATA_DIR / "people.json"
+KNOWN_FACES_DIR = FACE_DATA_DIR / "known_faces"
 RECORDINGS_DIR = DATA_DIR / "recordings"
 YOLO_MODEL_PATH = BASE_DIR / "models" / "yolov8n.pt"
 FACE_MODEL_PATH = BASE_DIR / "models" / "face_detection_yunet_2023mar.onnx"
@@ -1675,7 +1676,7 @@ class FaceRegistrationManager:
                 cached["sample_count"] = self.session.samples if self.session is not None else 0
                 return cached
             if not selected_camera:
-                result = {"active": False, "ready": False, "reason": "session_not_started", "message": "请选择海康摄像头并填写资料后开始采集"}
+                result = {"active": False, "ready": False, "reason": "session_not_started", "message": "请选择入口摄像头并填写资料后开始采集"}
                 self.last_preview_payload = result
                 self.last_preview_at = now
                 return result

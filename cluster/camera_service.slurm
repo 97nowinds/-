@@ -73,6 +73,8 @@ fi
 export LAB_RTSP_TRANSPORT="${LAB_RTSP_TRANSPORT:-tcp}"
 export OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;${LAB_RTSP_TRANSPORT}|stimeout;5000000|fflags;nobuffer|flags;low_delay|max_delay;0|analyzeduration;0|probesize;32768"
 export LAB_FACE_ENGINE="arcface"
+export LAB_FACE_DATA_DIR="${LAB_FACE_DATA_DIR:-$PROJECT_ROOT/camera/data}"
+mkdir -p "$LAB_FACE_DATA_DIR/known_faces"
 export LAB_APP_HOST="0.0.0.0"
 export LAB_APP_PORT="${LAB_APP_PORT:-5000}"
 export LAB_API_ONLY="${LAB_API_ONLY:-0}"

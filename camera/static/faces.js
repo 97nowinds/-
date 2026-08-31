@@ -35,7 +35,7 @@ function updateSession(payload) {
     sessionState.textContent = "尚未开始";
     captureCount.textContent = `0 / ${targetSamples.value}`;
     poseLabel.textContent = "等待开始";
-    poseInstruction.textContent = "填写资料并选择海康摄像头，然后点击“开始采集会话”";
+    poseInstruction.textContent = "填写资料并选择入口摄像头，然后点击“开始采集会话”";
     poseProgress.textContent = "当前姿态 0 / 0";
     setPreviewStream(cameraId.value);
     previewMessage.hidden = false;

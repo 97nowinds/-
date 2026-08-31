@@ -24,7 +24,7 @@
             <label>人员 ID<input id="personId" required maxlength="40" placeholder="person_001"></label>
             <label>显示姓名<input id="personName" required maxlength="40" placeholder="张三"></label>
             <label>注册序号<input id="personLabel" required type="number" min="1" step="1" placeholder="1"></label>
-            <label>采集摄像头<select id="cameraId" required></select><small>正式注册默认使用海康 Camera 1；Camera 2 可作为备用采集视角。</small></label>
+            <label>采集摄像头<select id="cameraId" required></select><small>正式注册默认使用入口摄像头；两台室内摄像头可作为备用采集视角。</small></label>
             <label>有效样本数量
               <input id="targetSamples" type="number" min="50" max="80" value="60">
               <small>建议 60 张；允许范围 50～80 张</small>
@@ -42,12 +42,12 @@
           </div>
           <div class="capture-preview">
             <img id="captureStream" alt="采集摄像头画面">
-            <div id="previewMessage" class="preview-message">海康摄像头连接后显示实时画面</div>
+            <div id="previewMessage" class="preview-message">入口摄像头连接后显示实时画面</div>
             <div id="liveGuidance" class="live-guidance idle">等待实时检测</div>
           </div>
           <div class="pose-guidance">
             <span id="poseLabel" class="pose-label">等待开始</span>
-            <strong id="poseInstruction">填写资料并选择海康摄像头，然后点击“开始采集会话”</strong>
+            <strong id="poseInstruction">填写资料并选择入口摄像头，然后点击“开始采集会话”</strong>
             <span id="poseProgress">当前姿态 0 / 0</span>
           </div>
           <div class="capture-actions">
@@ -69,7 +69,7 @@
       </section>
       <section class="face-steps">
         <span class="step active">1 填写人员资料</span>
-        <span class="step">2 选择海康摄像头</span>
+        <span class="step">2 选择入口摄像头</span>
         <span class="step">3 点击开始采集会话</span>
         <span class="step">4 按姿态提示点击采集一张</span>
         <span class="step">5 达到样本数后完成注册</span>

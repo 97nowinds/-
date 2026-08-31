@@ -14,6 +14,7 @@ set -Eeuo pipefail
 
 CAM1_RTSP="${LAB_CAM_1_RTSP:?LAB_CAM_1_RTSP is required}"
 CAM2_RTSP="${LAB_CAM_2_RTSP:?LAB_CAM_2_RTSP is required}"
+ENTRANCE_RTSP="${LAB_CAM_ENTRANCE_RTSP:-}"
 
 echo "node=$(hostname) job=${SLURM_JOB_ID}"
 echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-unset}"
@@ -22,15 +23,23 @@ nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv,nohea
 command -v python3 >/dev/null
 python3 --version
 
-for value in "$CAM1_RTSP" "$CAM2_RTSP"; do
+RTSP_VALUES=("$CAM1_RTSP" "$CAM2_RTSP")
+if [[ -n "$ENTRANCE_RTSP" ]]; then
+    RTSP_VALUES+=("$ENTRANCE_RTSP")
+fi
+for value in "${RTSP_VALUES[@]}"; do
     case "$value" in
-        rtsp://127.0.0.1:8554/cam_1|rtsp://127.0.0.1:8554/cam_2) ;;
+        rtsp://127.0.0.1:8554/cam_1|rtsp://127.0.0.1:8554/cam_2|rtsp://127.0.0.1:8554/cam_entrance) ;;
         *) echo "Unexpected local RTSP endpoint: $value" >&2; exit 2 ;;
     esac
 done
 
 # MediaMTX creates the HLS manifest only after a publisher has supplied frames.
-for camera in cam_1 cam_2; do
+CAMERAS=(cam_1 cam_2)
+if [[ -n "$ENTRANCE_RTSP" ]]; then
+    CAMERAS+=(cam_entrance)
+fi
+for camera in "${CAMERAS[@]}"; do
     manifest="$(curl -fsSL --max-time 10 "http://127.0.0.1:8888/${camera}/index.m3u8")"
     grep -q '^#EXTM3U' <<<"$manifest"
     echo "${camera}_hls=ok"
