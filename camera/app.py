@@ -1899,6 +1899,13 @@ def faces():
     return render_template("faces.html")
 
 
+@app.route("/annotate")
+def annotate():
+    if os.environ.get("LAB_API_ONLY") == "1":
+        return jsonify({"service": "lab-api", "frontend": "http://127.0.0.1:5173/annotate"})
+    return render_template("annotate.html")
+
+
 @app.route("/api/health")
 def api_health():
     return jsonify({"status": "ok", "service": "lab-api"})

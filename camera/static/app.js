@@ -18,6 +18,8 @@ const API_BASE = (
 ).replace(/\/$/, "");
 const faceCaptureLink = document.querySelector("#faceCaptureLink");
 if (faceCaptureLink) faceCaptureLink.href = `/faces?api=${encodeURIComponent(API_BASE)}`;
+const calibrationLink = document.querySelector("#calibrationLink");
+if (calibrationLink) calibrationLink.href = `/annotate?api=${encodeURIComponent(API_BASE)}`;
 const remoteStream = location.hostname.startsWith("100.") ||
   new URLSearchParams(location.search).get("remote") === "1";
 const SVG_NS = "http://www.w3.org/2000/svg";

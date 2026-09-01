@@ -36,6 +36,14 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn("${API_BASE}/api/state", source)
         self.assertIn("${API_BASE}/video/", source)
 
+    def test_monitoring_page_exposes_fixed_calibration_entry(self):
+        template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        app_source = (ROOT / "app.py").read_text(encoding="utf-8")
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('id="calibrationLink"', template)
+        self.assertIn('@app.route("/annotate")', app_source)
+        self.assertIn("calibrationLink.href", script)
+
 
 if __name__ == "__main__":
     unittest.main()
