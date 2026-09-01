@@ -113,7 +113,7 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
                     "to": "cam_1",
                     "max_gap_seconds": 20,
                     "spatial_handoff_max_age_seconds": 3,
-                    "spatial_handoff_max_distance_m": 2.5,
+                    "spatial_handoff_max_distance_m": 12.0,
                     "spatial_handoff_similarity_threshold": 0.35,
                 }
             ],
@@ -325,7 +325,7 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         entrance[20:80, 30:70] = (100, 0, 0)
 
         indoor_id = coordinator.update(
-            "cam_1", 7, indoor, (30, 20, 40, 60), {"x": 9.7, "y": 4.3}, now=1
+            "cam_1", 7, indoor, (30, 20, 40, 60), {"x": 3.0, "y": 2.0}, now=1
         )
         entrance_id = coordinator.update(
             "cam_entrance", 8, entrance, (30, 20, 40, 60),
@@ -338,10 +338,10 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         )
 
         synced_id = coordinator.update(
-            "cam_1", 7, indoor, (30, 20, 40, 60), {"x": 9.7, "y": 4.3}, now=2.2
+            "cam_1", 7, indoor, (30, 20, 40, 60), {"x": 3.0, "y": 2.0}, now=2.2
         )
         identity = coordinator.identity_for(
-            synced_id, "cam_1", {"x": 9.7, "y": 4.3}, now=2.2
+            synced_id, "cam_1", {"x": 3.0, "y": 2.0}, now=2.2
         )
 
         self.assertEqual(synced_id, indoor_id)

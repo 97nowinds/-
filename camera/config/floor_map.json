@@ -19,7 +19,7 @@
       "to": "cam_1",
       "max_gap_seconds": 20,
       "spatial_handoff_max_age_seconds": 3,
-      "spatial_handoff_max_distance_m": 2.5,
+      "spatial_handoff_max_distance_m": 12.0,
       "spatial_handoff_similarity_threshold": 0.35
     },
     {
