@@ -1,5 +1,5 @@
 param(
-    [string]$CameraIp = "192.168.1.66",
+    [string]$CameraIp = "192.168.31.192",
     [string]$Username = "admin",
     [ValidateSet("tcp", "udp")]
     [string]$RtspTransport = "tcp"
@@ -19,7 +19,39 @@ if (-not (Test-Connection -ComputerName $CameraIp -Count 1 -Quiet)) {
     throw "Camera $CameraIp is not reachable."
 }
 
-$passwordSecure = Read-Host "Password for TP-LINK camera user '$Username'" -AsSecureString
+function Read-SecureStringInWindow([string]$Prompt) {
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $escapedPrompt = $Prompt.Replace("'", "''")
+        $command = @"
+`$secure = Read-Host -Prompt '$escapedPrompt' -AsSecureString
+if (-not `$secure) { exit 1 }
+`$secure | ConvertFrom-SecureString | Set-Content -LiteralPath '$tempFile' -NoNewline
+"@
+        $process = Start-Process powershell.exe -ArgumentList @(
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            $command
+        ) -WindowStyle Normal -PassThru
+        Wait-Process -Id $process.Id
+        if (-not (Test-Path -LiteralPath $tempFile)) {
+            throw "Password prompt window was closed before a password was submitted."
+        }
+        $cipher = Get-Content -LiteralPath $tempFile -Raw
+        if ([string]::IsNullOrWhiteSpace($cipher)) {
+            throw "Password prompt returned an empty value."
+        }
+        return ConvertTo-SecureString $cipher
+    }
+    finally {
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$passwordSecure = Read-SecureStringInWindow "Password for TP-LINK camera user '$Username'"
 $passwordPointer = [IntPtr]::Zero
 
 try {

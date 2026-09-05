@@ -1,10 +1,11 @@
 param(
-    [string]$Camera1Ip = "192.168.1.64",
-    [string]$Camera2Ip = "192.168.1.65",
-    [string]$EntranceCameraIp = "",
+    [string]$Camera1Ip = "",
+    [string]$Camera2Ip = "192.168.31.190",
+    [string]$EntranceCameraIp = "192.168.31.192",
     [string]$Camera1Username = "admin",
     [string]$Camera2Username = "admin",
     [string]$EntranceCameraUsername = "admin",
+    [string]$EntranceStream = "stream1",
     [ValidateSet("101", "102")]
     [string]$Channel = "102",
     [ValidateSet("tcp", "udp")]
@@ -33,6 +34,38 @@ $arcfaceRoot = Join-Path $projectRoot "models\insightface\models\buffalo_l"
 $requiredModels = @("det_10g.onnx", "w600k_r50.onnx")
 $passwordPointers = @()
 
+function Read-SecureStringInWindow([string]$Prompt) {
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $escapedPrompt = $Prompt.Replace("'", "''")
+        $command = @"
+`$secure = Read-Host -Prompt '$escapedPrompt' -AsSecureString
+if (-not `$secure) { exit 1 }
+`$secure | ConvertFrom-SecureString | Set-Content -LiteralPath '$tempFile' -NoNewline
+"@
+        $process = Start-Process powershell.exe -ArgumentList @(
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            $command
+        ) -WindowStyle Normal -PassThru
+        Wait-Process -Id $process.Id
+        if (-not (Test-Path -LiteralPath $tempFile)) {
+            throw "Password prompt window was closed before a password was submitted."
+        }
+        $cipher = Get-Content -LiteralPath $tempFile -Raw
+        if ([string]::IsNullOrWhiteSpace($cipher)) {
+            throw "Password prompt returned an empty value."
+        }
+        return ConvertTo-SecureString $cipher
+    }
+    finally {
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 foreach ($model in $requiredModels) {
     if (-not (Test-Path (Join-Path $arcfaceRoot $model))) {
         throw "ArcFace model '$model' is missing. Run scripts\install_arcface_models.py first."
@@ -40,7 +73,12 @@ foreach ($model in $requiredModels) {
 }
 
 Write-Host "Laboratory compute host: ArcFace tracking" -ForegroundColor Cyan
-Write-Host "Indoor cameras: $Camera1Ip, $Camera2Ip"
+if ($Camera1Ip) {
+    Write-Host "Indoor camera 1: $Camera1Ip"
+} else {
+    Write-Host "Indoor camera 1: skipped" -ForegroundColor Yellow
+}
+Write-Host "Indoor camera 2: $Camera2Ip"
 if ($EntranceCameraIp) {
     Write-Host "Entrance ArcFace camera: $EntranceCameraIp"
 } else {
@@ -49,30 +87,39 @@ if ($EntranceCameraIp) {
 Write-Host "API: http://${ListenAddress}:$Port, RTSP transport: $RtspTransport"
 Write-Host "Passwords stay in this process and are never written to disk."
 
-$password1 = Read-Host "Password for Cam1 user '$Camera1Username'" -AsSecureString
-$password2 = Read-Host "Password for Cam2 user '$Camera2Username'" -AsSecureString
+$password1 = $null
+$camera1Enabled = -not [string]::IsNullOrWhiteSpace($Camera1Ip)
+if ($camera1Enabled) {
+    $password1 = Read-SecureStringInWindow "Password for Cam1 user '$Camera1Username'"
+}
+$password2 = Read-SecureStringInWindow "Password for Cam2 user '$Camera2Username'"
 $entrancePassword = $null
 if ($EntranceCameraIp) {
-    $entrancePassword = Read-Host "Password for entrance camera user '$EntranceCameraUsername'" -AsSecureString
+    $entrancePassword = Read-SecureStringInWindow "Password for entrance camera user '$EntranceCameraUsername'"
 }
 
 try {
-    foreach ($securePassword in @($password1, $password2)) {
-        $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
+    if ($camera1Enabled) {
+        $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($password1)
     }
+    $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($password2)
     if ($EntranceCameraIp) {
         $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($entrancePassword)
     }
-    $user1 = [Uri]::EscapeDataString($Camera1Username)
     $user2 = [Uri]::EscapeDataString($Camera2Username)
-    $pass1 = [Uri]::EscapeDataString([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[0]))
-    $pass2 = [Uri]::EscapeDataString([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[1]))
-    $env:LAB_CAM_1_RTSP = "rtsp://${user1}:${pass1}@${Camera1Ip}:554/Streaming/Channels/${Channel}"
+    $passwordIndex = 0
+    if ($camera1Enabled) {
+        $user1 = [Uri]::EscapeDataString($Camera1Username)
+        $pass1 = [Uri]::EscapeDataString([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[$passwordIndex]))
+        $env:LAB_CAM_1_RTSP = "rtsp://${user1}:${pass1}@${Camera1Ip}:554/Streaming/Channels/${Channel}"
+        $passwordIndex++
+    }
+    $pass2 = [Uri]::EscapeDataString([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[$passwordIndex]))
     $env:LAB_CAM_2_RTSP = "rtsp://${user2}:${pass2}@${Camera2Ip}:554/Streaming/Channels/${Channel}"
     if ($EntranceCameraIp) {
         $entranceUser = [Uri]::EscapeDataString($EntranceCameraUsername)
-        $entrancePass = [Uri]::EscapeDataString([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[2]))
-        $env:LAB_CAM_ENTRANCE_RTSP = "rtsp://${entranceUser}:${entrancePass}@${EntranceCameraIp}:554/Streaming/Channels/${Channel}"
+        $entrancePass = [Uri]::EscapeDataString([Runtime.InteropServices.Marshal]::PtrToStringBSTR($passwordPointers[$passwordPointers.Count - 1]))
+        $env:LAB_CAM_ENTRANCE_RTSP = "rtsp://${entranceUser}:${entrancePass}@${EntranceCameraIp}:554/${EntranceStream}"
         $entrancePass = $null
     }
     $pass1 = $null
@@ -86,7 +133,11 @@ try {
     $env:LAB_FRONTEND_ORIGIN = $FrontendOrigin
 
     Set-Location $projectRoot
-    $cameraEnvironments = @("LAB_CAM_1_RTSP", "LAB_CAM_2_RTSP")
+    $cameraEnvironments = @()
+    if ($camera1Enabled) {
+        $cameraEnvironments += "LAB_CAM_1_RTSP"
+    }
+    $cameraEnvironments += "LAB_CAM_2_RTSP"
     if ($EntranceCameraIp) {
         $cameraEnvironments += "LAB_CAM_ENTRANCE_RTSP"
     }

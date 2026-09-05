@@ -4,7 +4,7 @@ param(
     [string]$RemoteBaseUrl,
     [string]$Camera1Ip = "192.168.1.64",
     [string]$Camera2Ip = "192.168.1.65",
-    [string]$EntranceCameraIp = "192.168.1.66",
+    [string]$EntranceCameraIp = "192.168.31.192",
     [string]$Camera1Username = "admin",
     [string]$Camera2Username = "admin",
     [string]$EntranceCameraUsername = "admin",
@@ -21,17 +21,54 @@ if ($RemoteBaseUrl -match '@') {
     throw "Do not put a remote password in RemoteBaseUrl. Use -RemoteUsername and the runtime prompt."
 }
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$ffmpeg = Join-Path (Split-Path -Parent $projectRoot) ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"
-if (-not (Test-Path -LiteralPath $ffmpeg)) {
-    $ffmpeg = Join-Path $projectRoot ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"
+function Find-FfmpegPath {
+    $candidates = @(
+        (Join-Path "C:\codex1" ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"),
+        (Join-Path $projectRoot ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"),
+        (Join-Path (Split-Path -Parent $projectRoot) ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe")
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    throw "FFmpeg was not found. Install imageio-ffmpeg in C:\codex1\.venv or camera\.venv first."
 }
-if (-not (Test-Path -LiteralPath $ffmpeg)) {
-    throw "FFmpeg was not found. Install imageio-ffmpeg in C:\codex1\.venv first."
-}
+$ffmpeg = Find-FfmpegPath
 
 $passwordPointers = @()
 $processes = @{}
 $remotePassword = ""
+
+function Read-SecureStringInWindow([string]$Prompt) {
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $escapedPrompt = $Prompt.Replace("'", "''")
+        $command = @"
+`$secure = Read-Host -Prompt '$escapedPrompt' -AsSecureString
+if (-not `$secure) { exit 1 }
+`$secure | ConvertFrom-SecureString | Set-Content -LiteralPath '$tempFile' -NoNewline
+"@
+        $process = Start-Process powershell.exe -ArgumentList @(
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            $command
+        ) -WindowStyle Normal -PassThru
+        Wait-Process -Id $process.Id
+        if (-not (Test-Path -LiteralPath $tempFile)) {
+            throw "Password prompt window was closed before a password was submitted."
+        }
+        $cipher = Get-Content -LiteralPath $tempFile -Raw
+        if ([string]::IsNullOrWhiteSpace($cipher)) {
+            throw "Password prompt returned an empty value."
+        }
+        return ConvertTo-SecureString $cipher
+    }
+    finally {
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    }
+}
 
 function New-HikvisionUrl([string]$ip, [string]$username, [string]$password) {
     $user = [Uri]::EscapeDataString($username)
@@ -59,14 +96,14 @@ function Start-Push([string]$name, [string]$sourceUrl, [string]$destinationUrl) 
     Write-Host "$name push process started (PID $($processes[$name].Id))" -ForegroundColor Green
 }
 
-$password1 = Read-Host "Password for Cam1 user '$Camera1Username'" -AsSecureString
-$password2 = Read-Host "Password for Cam2 user '$Camera2Username'" -AsSecureString
+$password1 = Read-SecureStringInWindow "Password for Cam1 user '$Camera1Username'"
+$password2 = Read-SecureStringInWindow "Password for Cam2 user '$Camera2Username'"
 $entrancePassword = $null
 if (-not [string]::IsNullOrWhiteSpace($EntranceCameraIp)) {
-    $entrancePassword = Read-Host "Password for TP-LINK entrance camera user '$EntranceCameraUsername'" -AsSecureString
+    $entrancePassword = Read-SecureStringInWindow "Password for TP-LINK entrance camera user '$EntranceCameraUsername'"
 }
 if (-not [string]::IsNullOrWhiteSpace($RemoteUsername)) {
-    $remotePasswordSecure = Read-Host "Password for remote RTSP ingest user '$RemoteUsername'" -AsSecureString
+    $remotePasswordSecure = Read-SecureStringInWindow "Password for remote RTSP ingest user '$RemoteUsername'"
 }
 
 try {
