@@ -13,12 +13,45 @@ $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $probe = Join-Path $PSScriptRoot "probe_rtsp.py"
 $app = Join-Path $projectRoot "app.py"
 
+function Read-SecureStringInWindow([string]$Prompt) {
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $escapedPrompt = $Prompt.Replace("'", "''")
+        $command = @"
+`$secure = Read-Host -Prompt '$escapedPrompt' -AsSecureString
+if (-not `$secure) { exit 1 }
+`$secure | ConvertFrom-SecureString | Set-Content -LiteralPath '$tempFile' -NoNewline
+"@
+        $process = Start-Process powershell.exe -ArgumentList @(
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            $command
+        ) -WindowStyle Normal -PassThru
+        Wait-Process -Id $process.Id
+        if (-not (Test-Path -LiteralPath $tempFile)) {
+            throw "Password prompt window was closed before a password was submitted."
+        }
+        $cipher = Get-Content -LiteralPath $tempFile -Raw
+        if ([string]::IsNullOrWhiteSpace($cipher)) {
+            throw "Password prompt returned an empty value."
+        }
+        return ConvertTo-SecureString $cipher
+    }
+    finally {
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Write-Host "Hikvision cam_2 secure launcher" -ForegroundColor Cyan
+Write-Host "Python: $python" -ForegroundColor DarkGray
 Write-Host "Camera: $CameraIp, channel: $Channel"
 Write-Host "RTSP transport: $RtspTransport (use -RtspTransport udp for the lowest LAN latency)"
 Write-Host "The password is used only in this process and is not written to disk."
 
-$securePassword = Read-Host "Enter the password for camera user '$Username'" -AsSecureString
+$securePassword = Read-SecureStringInWindow "Enter the password for camera user '$Username'"
 $passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
 
 try {

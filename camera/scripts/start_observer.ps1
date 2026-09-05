@@ -17,6 +17,7 @@ $observerUrl = "http://127.0.0.1:${FrontendPort}/?api=$([Uri]::EscapeDataString(
 
 Set-Location $projectRoot
 Write-Host "Observer-only laptop mode" -ForegroundColor Cyan
+Write-Host "Python: $python" -ForegroundColor DarkGray
 Write-Host "All camera and AI computation runs at $backendUrl" -ForegroundColor Yellow
 Write-Host "Open: $observerUrl" -ForegroundColor Green
 & $python $server --host 127.0.0.1 --port $FrontendPort --api $backendUrl

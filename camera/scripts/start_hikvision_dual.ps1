@@ -28,13 +28,45 @@ foreach ($nvidiaBinDir in $nvidiaBinDirs) {
 $passwordPointer1 = [IntPtr]::Zero
 $passwordPointer2 = [IntPtr]::Zero
 
+function Read-SecureStringInWindow([string]$Prompt) {
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $escapedPrompt = $Prompt.Replace("'", "''")
+        $command = @"
+`$secure = Read-Host -Prompt '$escapedPrompt' -AsSecureString
+if (-not `$secure) { exit 1 }
+`$secure | ConvertFrom-SecureString | Set-Content -LiteralPath '$tempFile' -NoNewline
+"@
+        $process = Start-Process powershell.exe -ArgumentList @(
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            $command
+        ) -WindowStyle Normal -PassThru
+        Wait-Process -Id $process.Id
+        if (-not (Test-Path -LiteralPath $tempFile)) {
+            throw "Password prompt window was closed before a password was submitted."
+        }
+        $cipher = Get-Content -LiteralPath $tempFile -Raw
+        if ([string]::IsNullOrWhiteSpace($cipher)) {
+            throw "Password prompt returned an empty value."
+        }
+        return ConvertTo-SecureString $cipher
+    }
+    finally {
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Write-Host "Dual Hikvision secure launcher" -ForegroundColor Cyan
 Write-Host "Cam1: $Camera1Ip, Cam2: $Camera2Ip, channel: $Channel"
 Write-Host "RTSP transport: $RtspTransport (use -RtspTransport udp for the lowest LAN latency)"
 Write-Host "Passwords are used only by this process and are not written to disk."
 
-$securePassword1 = Read-Host "Enter password for Cam1 user '$Camera1Username'" -AsSecureString
-$securePassword2 = Read-Host "Enter password for Cam2 user '$Camera2Username'" -AsSecureString
+$securePassword1 = Read-SecureStringInWindow "Enter password for Cam1 user '$Camera1Username'"
+$securePassword2 = Read-SecureStringInWindow "Enter password for Cam2 user '$Camera2Username'"
 
 try {
     $passwordPointer1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword1)

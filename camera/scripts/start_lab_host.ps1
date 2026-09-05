@@ -33,6 +33,38 @@ $arcfaceRoot = Join-Path $projectRoot "models\insightface\models\buffalo_l"
 $requiredModels = @("det_10g.onnx", "w600k_r50.onnx")
 $passwordPointers = @()
 
+function Read-SecureStringInWindow([string]$Prompt) {
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $escapedPrompt = $Prompt.Replace("'", "''")
+        $command = @"
+`$secure = Read-Host -Prompt '$escapedPrompt' -AsSecureString
+if (-not `$secure) { exit 1 }
+`$secure | ConvertFrom-SecureString | Set-Content -LiteralPath '$tempFile' -NoNewline
+"@
+        $process = Start-Process powershell.exe -ArgumentList @(
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            $command
+        ) -WindowStyle Normal -PassThru
+        Wait-Process -Id $process.Id
+        if (-not (Test-Path -LiteralPath $tempFile)) {
+            throw "Password prompt window was closed before a password was submitted."
+        }
+        $cipher = Get-Content -LiteralPath $tempFile -Raw
+        if ([string]::IsNullOrWhiteSpace($cipher)) {
+            throw "Password prompt returned an empty value."
+        }
+        return ConvertTo-SecureString $cipher
+    }
+    finally {
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 foreach ($model in $requiredModels) {
     if (-not (Test-Path (Join-Path $arcfaceRoot $model))) {
         throw "ArcFace model '$model' is missing. Run scripts\install_arcface_models.py first."
@@ -49,11 +81,11 @@ if ($EntranceCameraIp) {
 Write-Host "API: http://${ListenAddress}:$Port, RTSP transport: $RtspTransport"
 Write-Host "Passwords stay in this process and are never written to disk."
 
-$password1 = Read-Host "Password for Cam1 user '$Camera1Username'" -AsSecureString
-$password2 = Read-Host "Password for Cam2 user '$Camera2Username'" -AsSecureString
+$password1 = Read-SecureStringInWindow "Password for Cam1 user '$Camera1Username'"
+$password2 = Read-SecureStringInWindow "Password for Cam2 user '$Camera2Username'"
 $entrancePassword = $null
 if ($EntranceCameraIp) {
-    $entrancePassword = Read-Host "Password for entrance camera user '$EntranceCameraUsername'" -AsSecureString
+    $entrancePassword = Read-SecureStringInWindow "Password for entrance camera user '$EntranceCameraUsername'"
 }
 
 try {

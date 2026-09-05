@@ -10,29 +10,37 @@ import time
 from collections import Counter, deque
 from pathlib import Path
 
-import cv2
-import numpy as np
-from flask import Flask, Response, jsonify, render_template, request
+try:
+    import cv2
+    import numpy as np
+    from flask import Flask, Response, jsonify, render_template, request
 
-from camera_source import resolve_camera_source
-from dataset_recorder import DatasetRecorder, RecordingError
-from face_identity import (
-    REGISTRATION_MAX_SAMPLES,
-    REGISTRATION_MIN_SAMPLES,
-    FaceIdentityStore,
-    registration_pose_plan,
-)
-from floor_map import FloorMapProjector
-from identity_handoff import IdentityHandoff
-from motion_person_detector import MotionPersonDetector
-from person_tracking import PersonTrack
-from reid_embedder import ReIDEmbedder
-from slam_localizer import SlamLocalizer
-from yolo_person_tracker import (
-    CrossCameraTrackCoordinator,
-    TrackTrailStore,
-    YoloPersonTracker,
-)
+    from camera_source import resolve_camera_source
+    from dataset_recorder import DatasetRecorder, RecordingError
+    from face_identity import (
+        REGISTRATION_MAX_SAMPLES,
+        REGISTRATION_MIN_SAMPLES,
+        FaceIdentityStore,
+        registration_pose_plan,
+    )
+    from floor_map import FloorMapProjector
+    from identity_handoff import IdentityHandoff
+    from motion_person_detector import MotionPersonDetector
+    from person_tracking import PersonTrack
+    from reid_embedder import ReIDEmbedder
+    from slam_localizer import SlamLocalizer
+    from yolo_person_tracker import (
+        CrossCameraTrackCoordinator,
+        TrackTrailStore,
+        YoloPersonTracker,
+    )
+except ModuleNotFoundError as exc:
+    missing = exc.name or "unknown"
+    raise RuntimeError(
+        "Missing Python dependency '%s'. Use camera\\.venv\\Scripts\\python.exe "
+        "or run scripts\\start_*.ps1 from the camera directory, then install "
+        "requirements with 'python -m pip install -r requirements.txt'." % missing
+    ) from exc
 
 
 # Keep FFmpeg's RTSP demuxer from accumulating old frames. UDP gives the lowest

@@ -12,16 +12,39 @@ param(
 
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$installRoot = Join-Path (Split-Path -Parent $projectRoot) "tools\mediamtx"
-$mediaMtx = Join-Path $installRoot "mediamtx.exe"
-$configPath = Join-Path $installRoot "mediamtx.yml"
-$ffmpeg = Join-Path (Split-Path -Parent $projectRoot) ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"
-if (-not (Test-Path -LiteralPath $ffmpeg)) {
-    $ffmpeg = Join-Path $projectRoot ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"
+$installCandidates = @(
+    (Join-Path "C:\codex1" "tools\mediamtx"),
+    (Join-Path (Split-Path -Parent $projectRoot) "tools\mediamtx"),
+    (Join-Path $projectRoot "tools\mediamtx")
+)
+$installRoot = $installCandidates[0]
+$mediaMtx = $null
+$configPath = $null
+foreach ($candidateRoot in $installCandidates) {
+    $candidateExe = Join-Path $candidateRoot "mediamtx.exe"
+    if (Test-Path -LiteralPath $candidateExe) {
+        $installRoot = $candidateRoot
+        $mediaMtx = $candidateExe
+        $configPath = Join-Path $candidateRoot "mediamtx.yml"
+        break
+    }
 }
-if (-not (Test-Path -LiteralPath $ffmpeg)) {
-    throw "FFmpeg was not found. Install imageio-ffmpeg in C:\codex1\.venv first."
+if (-not $mediaMtx) {
+    $mediaMtx = Join-Path $installRoot "mediamtx.exe"
+    $configPath = Join-Path $installRoot "mediamtx.yml"
 }
+function Find-FfmpegPath {
+    $candidates = @(
+        (Join-Path "C:\codex1" ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"),
+        (Join-Path $projectRoot ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"),
+        (Join-Path (Split-Path -Parent $projectRoot) ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe")
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    throw "FFmpeg was not found. Install imageio-ffmpeg in C:\codex1\.venv or camera\.venv first."
+}
+$ffmpeg = Find-FfmpegPath
 if (-not (Test-Path -LiteralPath $mediaMtx)) {
     & (Join-Path $PSScriptRoot "install_mediamtx.ps1") -InstallDir $installRoot
     if (-not (Test-Path -LiteralPath $mediaMtx)) { throw "MediaMTX installation failed." }
@@ -30,6 +53,38 @@ if (-not (Test-Path -LiteralPath $mediaMtx)) {
 $passwordPointers = @()
 $mediaMtxProcess = $null
 $relayProcesses = @{}
+
+function Read-SecureStringInWindow([string]$Prompt) {
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $escapedPrompt = $Prompt.Replace("'", "''")
+        $command = @"
+`$secure = Read-Host -Prompt '$escapedPrompt' -AsSecureString
+if (-not `$secure) { exit 1 }
+`$secure | ConvertFrom-SecureString | Set-Content -LiteralPath '$tempFile' -NoNewline
+"@
+        $process = Start-Process powershell.exe -ArgumentList @(
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            $command
+        ) -WindowStyle Normal -PassThru
+        Wait-Process -Id $process.Id
+        if (-not (Test-Path -LiteralPath $tempFile)) {
+            throw "Password prompt window was closed before a password was submitted."
+        }
+        $cipher = Get-Content -LiteralPath $tempFile -Raw
+        if ([string]::IsNullOrWhiteSpace($cipher)) {
+            throw "Password prompt returned an empty value."
+        }
+        return ConvertTo-SecureString $cipher
+    }
+    finally {
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    }
+}
 
 function New-HikvisionUrl([string]$ip, [string]$username, [string]$password) {
     $escapedUser = [Uri]::EscapeDataString($username)
@@ -52,8 +107,8 @@ Write-Host "Published streams: rtsp://100.126.39.4:${RelayPort}/cam_1 and /cam_2
 Write-Host "The lab host runs MediaMTX and FFmpeg only. No Python or AI process is started."
 Write-Host "Passwords are requested at runtime and are not written to disk or logs."
 
-$password1 = Read-Host "Password for Cam1 user '$Camera1Username'" -AsSecureString
-$password2 = Read-Host "Password for Cam2 user '$Camera2Username'" -AsSecureString
+$password1 = Read-SecureStringInWindow "Password for Cam1 user '$Camera1Username'"
+$password2 = Read-SecureStringInWindow "Password for Cam2 user '$Camera2Username'"
 
 try {
     $passwordPointers += [Runtime.InteropServices.Marshal]::SecureStringToBSTR($password1)
