@@ -350,6 +350,7 @@ class FaceIdentityStore:
         self.sface_features = {}
         self.modern = ModernFaceEngine(modern_model_root)
         self.modern_features = {}
+        self.modern_feature_counts = {}
         self.query_features = defaultdict(lambda: deque(maxlen=5))
         if recognition_model_path and Path(recognition_model_path).exists() and hasattr(cv2, "FaceRecognizerSF"):
             try:
@@ -374,6 +375,7 @@ class FaceIdentityStore:
             self.models = {}
             self.sface_features = {}
             self.modern_features = {}
+            self.modern_feature_counts = {}
             for person_id, person in self.people.items():
                 images = []
                 modern_features = []
@@ -406,6 +408,7 @@ class FaceIdentityStore:
                                     sface_features.append(sface_feature)
                 if not images:
                     continue
+                self.modern_feature_counts[person_id] = len(modern_features)
                 model = cv2.face.LBPHFaceRecognizer_create()
                 model.train(images, np.zeros(len(images), dtype=np.int32))
                 self.models[person_id] = (dict(person), model)

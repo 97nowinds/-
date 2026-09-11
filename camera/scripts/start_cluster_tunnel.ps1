@@ -5,6 +5,7 @@ param(
     [int]$RemotePort = 8554,
     [int]$ApiLocalPort = 5000,
     [int]$ApiRemotePort = 5000,
+    [switch]$DisableApiForward,
     [int]$RestartSeconds = 5,
     [string]$IdentityFile = "$env:USERPROFILE\.ssh\lab_rtsp_ed25519"
 )
@@ -28,10 +29,12 @@ while ($true) {
         "-o", "ExitOnForwardFailure=yes",
         "-o", "ServerAliveInterval=30",
         "-o", "ServerAliveCountMax=3",
-        "-L", $forward,
-        "-L", "${ApiLocalPort}:${RemoteHost}:${ApiRemotePort}",
-        $JumpHost
+        "-L", $forward
     )
+    if (-not $DisableApiForward) {
+        $arguments += @("-L", "${ApiLocalPort}:${RemoteHost}:${ApiRemotePort}")
+    }
+    $arguments += $JumpHost
 
     Write-Host "Opening RTSP tunnel to $JumpHost with the local SSH key." -ForegroundColor Cyan
     & $ssh @arguments

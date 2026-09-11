@@ -1,0 +1,14 @@
+{
+  "package_name": "实验室人员-仪器交互识别模块",
+  "interface_version": "1.1",
+  "plugin_version": "0.2.0",
+  "stream_schema_version": "1.0",
+  "release_date": "2026-09-03",
+  "python": "3.11.9",
+  "torch": "2.11.0+cu128",
+  "transformers": "5.16.1",
+  "model": "MiniCPM-V 4.6",
+  "recommended_entry": "lab_instrument_interaction.InstrumentInteractionModule",
+  "recommended_realtime_api": "create_stream() + process_frame()"
+}
+

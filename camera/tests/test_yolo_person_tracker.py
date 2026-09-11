@@ -65,6 +65,17 @@ class YoloPersonTrackerTests(unittest.TestCase):
 
         self.assertIsNone(tracker.model.predictor)
 
+    def test_deduplicates_highly_overlapping_tracker_boxes(self):
+        tracks = [
+            {"track_id": 7, "box": (10, 20, 40, 100), "confidence": 0.91},
+            {"track_id": 8, "box": (11, 21, 40, 100), "confidence": 0.84},
+            {"track_id": 9, "box": (120, 20, 40, 100), "confidence": 0.88},
+        ]
+
+        deduplicated = YoloPersonTracker.deduplicate_tracks(tracks)
+
+        self.assertEqual([track["track_id"] for track in deduplicated], [7, 9])
+
 
 class TrackTrailStoreTests(unittest.TestCase):
     def test_adds_only_meaningful_movement(self):
@@ -159,6 +170,40 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         self.assertEqual(merged, "person_1")
         self.assertEqual(coordinator.local_bindings[("cam_1", 1)], merged)
         self.assertEqual(coordinator.local_bindings[("cam_2", 7)], merged)
+
+    def test_same_camera_id_switch_reuses_recent_global_id(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        frame[20:80, 30:70] = (20, 80, 180)
+
+        first = coordinator.update(
+            "cam_entrance", 1, frame, (30, 20, 40, 60), None,
+            active_local_ids={1}, now=1,
+        )
+        second = coordinator.update(
+            "cam_entrance", 2, frame, (31, 20, 40, 60), None,
+            active_local_ids={2}, now=1.4,
+        )
+
+        self.assertEqual(second, first)
+        self.assertEqual(coordinator.local_bindings[("cam_entrance", 2)], first)
+
+    def test_same_camera_simultaneous_tracks_do_not_merge(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.zeros((100, 160, 3), dtype=np.uint8)
+        frame[20:80, 20:60] = (20, 80, 180)
+        frame[20:80, 100:140] = (20, 80, 180)
+
+        first = coordinator.update(
+            "cam_entrance", 1, frame, (20, 20, 40, 60), None,
+            active_local_ids={1, 2}, now=1,
+        )
+        second = coordinator.update(
+            "cam_entrance", 2, frame, (100, 20, 40, 60), None,
+            active_local_ids={1, 2}, now=1,
+        )
+
+        self.assertNotEqual(second, first)
 
     def test_overlap_rehydrates_identity_after_global_track_expires(self):
         coordinator = self.coordinator(self.FloorMap(), ttl_seconds=2.0, similarity_threshold=0.70)
@@ -295,6 +340,28 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         self.assertIsNone(rejected)
         self.assertEqual(coordinator.person_locks["p1"], first)
         self.assertNotIn(second, coordinator.global_identities)
+
+    def test_entrance_face_confirmation_merges_existing_person_lock(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        indoor = coordinator._new_global(1, "cam_1", None, {"x": 9.5, "y": 4.5})
+        entrance = coordinator._new_global(
+            2, "cam_entrance", None, {"x": 11.0, "y": 5.35}
+        )
+        identity = {"known": True, "person_id": "p1", "name": "yxq"}
+        coordinator.set_identity(indoor, identity, "cam_1", now=1)
+
+        confirmed = coordinator.set_identity(
+            entrance,
+            identity,
+            "cam_entrance",
+            {"x": 11.0, "y": 5.35},
+            now=2,
+        )
+
+        self.assertIsNotNone(confirmed)
+        self.assertEqual(confirmed["global_track_id"], indoor)
+        self.assertEqual(coordinator.person_locks["p1"], indoor)
+        self.assertNotIn(entrance, coordinator.global_tracks)
 
     def test_different_registered_people_are_never_merged(self):
         coordinator = self.coordinator(self.UncalibratedFloorMap())

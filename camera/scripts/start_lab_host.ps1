@@ -1,5 +1,5 @@
 param(
-    [string]$Camera1Ip = "",
+    [string]$Camera1Ip = "192.168.31.191",
     [string]$Camera2Ip = "192.168.31.190",
     [string]$EntranceCameraIp = "192.168.31.192",
     [string]$Camera1Username = "admin",
@@ -12,7 +12,10 @@ param(
     [string]$RtspTransport = "udp",
     [string]$ListenAddress = "0.0.0.0",
     [int]$Port = 5000,
-    [string]$FrontendOrigin = "*"
+    [string]$FrontendOrigin = "*",
+    [switch]$PromptInConsole,
+    [switch]$DisableInstrumentInteraction,
+    [string]$InteractionServerUrl = $env:LAB_INTERACTION_SERVER_URL
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,6 +23,9 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $venvRoot = Join-Path $projectRoot ".venv"
 if (-not (Test-Path -LiteralPath $venvRoot)) {
     $venvRoot = Join-Path (Split-Path -Parent $projectRoot) ".venv"
+}
+if (-not $DisableInstrumentInteraction -and [string]::IsNullOrWhiteSpace($InteractionServerUrl)) {
+    throw "Remote interaction server is not configured. Pass -InteractionServerUrl http://SERVER_IP:6000 or use -DisableInstrumentInteraction."
 }
 $python = Join-Path $venvRoot "Scripts\python.exe"
 $probe = Join-Path $PSScriptRoot "probe_rtsp.py"
@@ -35,6 +41,14 @@ $requiredModels = @("det_10g.onnx", "w600k_r50.onnx")
 $passwordPointers = @()
 
 function Read-SecureStringInWindow([string]$Prompt) {
+    if ($PromptInConsole) {
+        $secure = Read-Host -Prompt $Prompt -AsSecureString
+        if (-not $secure) {
+            throw "Password prompt returned an empty value."
+        }
+        return $secure
+    }
+
     $tempFile = [System.IO.Path]::GetTempFileName()
     try {
         $escapedPrompt = $Prompt.Replace("'", "''")
@@ -85,6 +99,7 @@ if ($EntranceCameraIp) {
     Write-Host "Entrance ArcFace camera: not enabled; using two indoor cameras" -ForegroundColor Yellow
 }
 Write-Host "API: http://${ListenAddress}:$Port, RTSP transport: $RtspTransport"
+Write-Host ("Instrument interaction: " + $(if ($DisableInstrumentInteraction) { "disabled" } else { "remote -> $InteractionServerUrl, cam_2 -> lab_camera_view_2" }))
 Write-Host "Passwords stay in this process and are never written to disk."
 
 $password1 = $null
@@ -131,6 +146,14 @@ try {
     $env:LAB_APP_HOST = $ListenAddress
     $env:LAB_APP_PORT = [string]$Port
     $env:LAB_FRONTEND_ORIGIN = $FrontendOrigin
+    if ($DisableInstrumentInteraction) {
+        $env:LAB_INTERACTION_ENABLED = "0"
+        Remove-Item Env:LAB_INTERACTION_SERVER_URL -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:LAB_INTERACTION_ENABLED = "1"
+        $env:LAB_INTERACTION_SERVER_URL = $InteractionServerUrl.TrimEnd('/')
+    }
 
     Set-Location $projectRoot
     $cameraEnvironments = @()
@@ -161,7 +184,8 @@ finally {
     foreach ($name in @(
         "LAB_CAM_1_RTSP", "LAB_CAM_2_RTSP", "LAB_CAM_ENTRANCE_RTSP",
         "LAB_RTSP_TRANSPORT", "OPENCV_FFMPEG_CAPTURE_OPTIONS", "LAB_FACE_ENGINE",
-        "LAB_API_ONLY", "LAB_APP_HOST", "LAB_APP_PORT", "LAB_FRONTEND_ORIGIN"
+        "LAB_API_ONLY", "LAB_APP_HOST", "LAB_APP_PORT", "LAB_FRONTEND_ORIGIN",
+        "LAB_INTERACTION_ENABLED", "LAB_INTERACTION_SERVER_URL"
     )) {
         Remove-Item "Env:$name" -ErrorAction SilentlyContinue
     }

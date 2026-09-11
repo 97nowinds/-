@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import threading
 import time
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 try:
@@ -18,6 +18,7 @@ try:
     from camera_source import resolve_camera_source
     from dataset_recorder import DatasetRecorder, RecordingError
     from face_identity import (
+        ARCFACE_MIN_GALLERY_FEATURES,
         REGISTRATION_MAX_SAMPLES,
         REGISTRATION_MIN_SAMPLES,
         FaceIdentityStore,
@@ -25,6 +26,7 @@ try:
     )
     from floor_map import FloorMapProjector
     from identity_handoff import IdentityHandoff
+    from instrument_interaction import InstrumentInteractionManager
     from motion_person_detector import MotionPersonDetector
     from person_tracking import PersonTrack
     from reid_embedder import ReIDEmbedder
@@ -128,6 +130,7 @@ def load_cameras():
                 "id": camera.get("id", f"cam_{index + 1}"),
                 "name": camera.get("name", f"Camera {index + 1}"),
                 "role": camera.get("role", "tracking"),
+                "interaction_camera_id": camera.get("interaction_camera_id"),
                 "face_recognition": bool(camera.get("face_recognition", True)),
                 "face_interval_seconds": max(
                     0.1,
@@ -137,6 +140,20 @@ def load_cameras():
                         )
                     ),
                 ),
+                "yolo_confidence": min(
+                    0.95,
+                    max(0.05, float(camera.get("yolo_confidence", YOLO_CONFIDENCE_MIN))),
+                ),
+                "yolo_image_size": max(
+                    320, int(camera.get("yolo_image_size", YOLO_IMAGE_SIZE))
+                ),
+                "yolo_frame_stride": max(
+                    1, int(camera.get("yolo_frame_stride", YOLO_FRAME_STRIDE))
+                ),
+                "track_hold_seconds": max(
+                    0.1,
+                    float(camera.get("track_hold_seconds", YOLO_TRACK_HOLD_SECONDS)),
+                ),
                 **resolve_camera_source(camera, fallback_index=index),
             }
         )
@@ -144,13 +161,23 @@ def load_cameras():
 
 
 class CameraWorker:
-    def __init__(self, camera, face_store, handoff, recorder, floor_map, coordinator):
+    def __init__(
+        self,
+        camera,
+        face_store,
+        handoff,
+        recorder,
+        floor_map,
+        coordinator,
+        interaction_manager,
+    ):
         self.camera = camera
         self.face_store = face_store
         self.handoff = handoff
         self.recorder = recorder
         self.floor_map = floor_map
         self.coordinator = coordinator
+        self.interaction_manager = interaction_manager
         self.face_recognition_ready = (
             face_store.modern.available and bool(face_store.modern_features)
             if FACE_RECOGNITION_ENGINE == "arcface"
@@ -201,8 +228,8 @@ class CameraWorker:
         self.person_track = PersonTrack(lost_seconds=2.0, evidence_seconds=5.0)
         self.yolo_tracker = YoloPersonTracker(
             YOLO_MODEL_PATH,
-            confidence=YOLO_CONFIDENCE_MIN,
-            image_size=YOLO_IMAGE_SIZE,
+            confidence=self.camera["yolo_confidence"],
+            image_size=self.camera["yolo_image_size"],
         )
         self.yolo_trails = TrackTrailStore(max_points=90, stale_seconds=3.0)
         self.yolo_tracks = []
@@ -217,6 +244,8 @@ class CameraWorker:
         self.identity = None
         self.identity_track_id = None
         self.identity_votes = deque(maxlen=7)
+        self.track_identities = {}
+        self.identity_votes_by_track = defaultdict(lambda: deque(maxlen=7))
         self.handoff_unknown_count = 0
         self.last_face_at = None
         self.last_face_attempt_at = 0.0
@@ -355,6 +384,11 @@ class CameraWorker:
             self.frame_counter += 1
             self.record_frame()
             display = self.process(frame)
+            self.interaction_manager.submit(
+                self.camera,
+                frame,
+                self.interaction_people(),
+            )
             if generation != self.capture_generation or self.status != "running":
                 continue
             with self.display_condition:
@@ -588,8 +622,13 @@ class CameraWorker:
     def select_face_target(self, tracks):
         if not tracks:
             return None
+        unidentified = [
+            track
+            for track in tracks
+            if int(track["track_id"]) not in self.track_identities
+        ]
         return max(
-            tracks,
+            unidentified or tracks,
             key=lambda track: (
                 float(track.get("confidence", 0.0)) * track["box"][2] * track["box"][3],
                 track["box"][2] * track["box"][3],
@@ -662,7 +701,7 @@ class CameraWorker:
             track_key=(self.camera["id"], track_id),
             query_embedding=embedding,
         )
-        self.accept_face_result(result, appearance)
+        self.accept_face_result(result, appearance, track_id=track_id)
         self.last_face_at = time.time()
         return face_box, result
 
@@ -735,7 +774,24 @@ class CameraWorker:
             (person_x, person_y, person_width, person_height), frame_shape
         )
 
-    def accept_face_result(self, result, appearance):
+    def accept_face_result(self, result, appearance, track_id=None):
+        if track_id is not None:
+            track_id = int(track_id)
+            votes_for_track = self.identity_votes_by_track[track_id]
+            if result["known"]:
+                votes_for_track.append(result["person_id"])
+                person_id, votes = Counter(votes_for_track).most_common(1)[0]
+                if votes >= IDENTITY_VOTES_REQUIRED and person_id == result["person_id"]:
+                    identity = {**result, "identity_source": "face"}
+                    self.track_identities[track_id] = identity
+                    self.identity = identity
+                    self.identity_track_id = track_id
+                    self.handoff_unknown_count = 0
+                    self.handoff.confirm(self.camera["id"], identity, appearance)
+                    return identity
+            else:
+                votes_for_track.append(None)
+            return None
         if result["known"]:
             self.identity_votes.append(result["person_id"])
             person_id, votes = Counter(self.identity_votes).most_common(1)[0]
@@ -752,8 +808,30 @@ class CameraWorker:
         # clears it when the tracked person actually disappears.
         if self.identity and self.identity.get("identity_source") == "handoff":
             self.handoff_unknown_count += 1
+        return None
 
-    def clear_identity(self):
+    def _sync_primary_identity(self):
+        if self.identity_track_id in self.track_identities:
+            self.identity = self.track_identities[self.identity_track_id]
+            return
+        if self.track_identities:
+            self.identity_track_id = sorted(self.track_identities)[0]
+            self.identity = self.track_identities[self.identity_track_id]
+            return
+        self.identity = None
+        self.identity_track_id = None
+
+    def clear_identity(self, track_id=None):
+        if track_id is not None:
+            track_id = int(track_id)
+            self.track_identities.pop(track_id, None)
+            self.identity_votes_by_track.pop(track_id, None)
+            if self.identity_track_id == track_id:
+                self.identity_track_id = None
+            self._sync_primary_identity()
+            return
+        self.track_identities.clear()
+        self.identity_votes_by_track.clear()
         self.identity = None
         self.identity_track_id = None
         self.identity_votes.clear()
@@ -812,14 +890,15 @@ class CameraWorker:
             not require_displacement or self.pending_body_travel >= minimum_travel
         )
 
-    def refresh_handoff(self, frame, box):
-        if not self.identity or not self.identity.get("person_id"):
+    def refresh_handoff(self, frame, box, identity=None):
+        identity = identity or self.identity
+        if not identity or not identity.get("person_id"):
             return
         now = time.time()
         if now - self.last_handoff_refresh_at < 0.75:
             return
         appearance = self.handoff.appearance(frame, box)
-        self.handoff.confirm(self.camera["id"], self.identity, appearance)
+        self.handoff.confirm(self.camera["id"], identity, appearance)
         self.last_handoff_refresh_at = now
 
     def body_candidate_is_walkable(self, box, frame_shape):
@@ -854,11 +933,11 @@ class CameraWorker:
                 ),
             )
             self.last_slam_at = now
-        # 只在抽样帧运行 YOLO。非抽样帧使用上一批检测框绘制画面，
+        # 只在每路摄像头配置的抽样帧运行 YOLO。非抽样帧使用上一批检测框绘制画面，
         # 这样视频流仍然连续，而检测模型不再被每一帧调用。
         should_infer = (
             self.frame_counter == 1
-            or self.frame_counter % YOLO_FRAME_STRIDE == 0
+            or self.frame_counter % self.camera["yolo_frame_stride"] == 0
             or self.last_yolo_at is None
         )
         cached_global_ids = {}
@@ -897,7 +976,7 @@ class CameraWorker:
             and not tracks
             and self.yolo_tracks
             and self.last_yolo_tracks_at is not None
-            and now - self.last_yolo_tracks_at <= YOLO_TRACK_HOLD_SECONDS
+            and now - self.last_yolo_tracks_at <= self.camera["track_hold_seconds"]
         )
         if hold_cached_tracks:
             with self.lock:
@@ -919,12 +998,10 @@ class CameraWorker:
 
         # A confirmed identity belongs to the active ByteTrack target. Keep
         # that name while the target moves, but clear it when the ID is gone.
-        if self.identity and self.identity_track_id is not None:
-            active_local_ids = {item["track_id"] for item in tracks}
-            if self.identity_track_id not in active_local_ids:
-                self.end_current_track()
-        elif self.identity and self.identity_track_id is None and len(tracks) == 1:
-            self.identity_track_id = tracks[0]["track_id"]
+        active_local_ids = {int(item["track_id"]) for item in tracks}
+        for missing_local_id in set(self.track_identities) - active_local_ids:
+            self.clear_identity(missing_local_id)
+            self.coordinator.forget_local(self.camera["id"], missing_local_id)
 
         observations = []
         published_tracks = []
@@ -943,7 +1020,13 @@ class CameraWorker:
             position = self.project_box(box, frame.shape)
             global_id = (
                 self.coordinator.update(
-                    self.camera["id"], local_id, frame, box, position, now=now
+                    self.camera["id"],
+                    local_id,
+                    frame,
+                    box,
+                    position,
+                    active_local_ids=active_local_ids,
+                    now=now,
                 )
                     if should_infer and not hold_cached_tracks
                     else cached_global_ids[local_id]
@@ -951,23 +1034,21 @@ class CameraWorker:
             global_ids_by_local_id[local_id] = global_id
             # A confirmed identity stored by cam_1 is adopted by cam_2 only
             # after this target is physically inside the overlap zone.
-            if self.identity is None:
+            if local_id not in self.track_identities:
                 inherited = self.coordinator.identity_for(
                     global_id, self.camera["id"], position, now=now
                 )
                 if inherited is not None:
+                    self.track_identities[local_id] = inherited
+                    self.identity_votes_by_track[local_id].clear()
                     self.identity = inherited
                     self.identity_track_id = local_id
-                    self.identity_votes.clear()
                     self.handoff_unknown_count = 0
             trail = self.yolo_trails.update(global_id, foot, now=now)
             global_number = int(global_id.rsplit("_", 1)[-1])
             color = self.yolo_color(global_number)
             track_identity = (
-                self.identity
-                if self.identity_track_id is not None
-                and self.identity_track_id == local_id
-                else None
+                self.track_identities.get(local_id)
             )
 
             if len(trail) >= 2:
@@ -1046,50 +1127,51 @@ class CameraWorker:
                 )
                 if candidate is not None:
                     face_box, face_result = candidate
-                    if face_result.get("known"):
-                        self.identity_track_id = target_track["track_id"]
                     self.last_face_box = face_box
                     self.last_face_result = face_result
                     self.last_face_box_at = now
 
         # Publish a name only after the coordinator grants the single-owner
         # identity lock. Conflicts remain anonymous instead of being mislabelled.
-        if self.identity and self.identity_track_id is not None:
+        for identity_local_id, identity in list(self.track_identities.items()):
             bound_track = next(
-                (item for item in tracks if item["track_id"] == self.identity_track_id),
+                (item for item in tracks if item["track_id"] == identity_local_id),
                 None,
             )
             if bound_track is not None:
-                current_global_id = global_ids_by_local_id.get(self.identity_track_id)
+                current_global_id = global_ids_by_local_id.get(identity_local_id)
                 current_position = self.project_box(
                     bound_track["box"], frame.shape
                 )
                 locked_identity = self.coordinator.set_identity(
                     current_global_id,
-                    self.identity,
+                    identity,
                     self.camera["id"],
                     current_position,
                     now=now,
                 )
                 if locked_identity is None:
-                    self.clear_identity()
+                    self.clear_identity(identity_local_id)
                 else:
-                    self.identity = locked_identity
+                    self.track_identities[identity_local_id] = locked_identity
+                    if self.identity_track_id == identity_local_id:
+                        self.identity = locked_identity
                     for observation in observations:
-                        if observation.get("local_id") != self.identity_track_id:
+                        if observation.get("local_id") != identity_local_id:
                             continue
                         observation.update(
                             {
-                                "person_id": self.identity.get("person_id"),
-                                "person_number": self.identity.get("person_number"),
-                                "name": self.identity.get("name"),
-                                "identity_source": self.identity.get("identity_source", "face"),
-                                "identity_lock_status": self.identity.get("identity_lock_status"),
-                                "global_track_id": self.identity.get("global_track_id"),
-                                "handoff_from_camera": self.identity.get("handoff_from_camera"),
+                                "person_id": locked_identity.get("person_id"),
+                                "person_number": locked_identity.get("person_number"),
+                                "name": locked_identity.get("name"),
+                                "identity_source": locked_identity.get("identity_source", "face"),
+                                "identity_lock_status": locked_identity.get("identity_lock_status"),
+                                "global_track_id": locked_identity.get("global_track_id"),
+                                "handoff_from_camera": locked_identity.get("handoff_from_camera"),
                             }
                         )
-                    self.refresh_handoff(frame, bound_track["box"])
+                    self.refresh_handoff(frame, bound_track["box"], locked_identity)
+        self._sync_primary_identity()
 
         self.yolo_trails.prune(now=now)
         if not should_infer or hold_cached_tracks:
@@ -1103,7 +1185,7 @@ class CameraWorker:
             self.yolo_tracks = published_tracks
             if should_infer and not hold_cached_tracks and published_tracks:
                 self.last_yolo_tracks_at = now
-            elif not published_tracks and self.last_yolo_tracks_at is not None and now - self.last_yolo_tracks_at > YOLO_TRACK_HOLD_SECONDS:
+            elif not published_tracks and self.last_yolo_tracks_at is not None and now - self.last_yolo_tracks_at > self.camera["track_hold_seconds"]:
                 self.last_yolo_tracks_at = None
             if should_publish_map:
                 self.map_observations = observations
@@ -1338,6 +1420,24 @@ class CameraWorker:
                     "global_track_id",
                 )
             }
+        identities = []
+        for local_id, track_identity in sorted(self.track_identities.items()):
+            identities.append(
+                {
+                    "local_id": local_id,
+                    **{
+                        key: track_identity.get(key)
+                        for key in (
+                            "person_id",
+                            "person_number",
+                            "name",
+                            "identity_source",
+                            "identity_lock_status",
+                            "global_track_id",
+                        )
+                    },
+                }
+            )
         with self.lock:
             map_observation = dict(self.map_observation) if self.map_observation else None
             map_observations = [dict(item) for item in self.map_observations]
@@ -1366,6 +1466,7 @@ class CameraWorker:
             "rtsp_transport": RTSP_TRANSPORT if self.camera["source_type"] == "rtsp" else None,
             "reconnect_count": self.reconnect_count,
             "identity": identity,
+            "identities": identities,
             "tracking": tracking,
             "tracked_people": len(yolo_tracks),
             "tracker_engine": "YOLOv8n + ByteTrack",
@@ -1375,18 +1476,40 @@ class CameraWorker:
             "track_confidence": round(confidence, 4),
             "track_failures": 1 if self.yolo_error else 0,
             "tracker_error": self.yolo_error,
-            "inference_frame_stride": YOLO_FRAME_STRIDE,
+            "inference_frame_stride": self.camera["yolo_frame_stride"],
+            "detector_confidence_threshold": self.camera["yolo_confidence"],
+            "detector_image_size": self.camera["yolo_image_size"],
             "last_inference_age_seconds": (
                 round(time.time() - self.last_yolo_at, 2)
                 if self.last_yolo_at is not None
                 else None
             ),
             "inference_ms": self.yolo_inference_ms,
+            "track_hold_ms": int(self.camera["track_hold_seconds"] * 1000),
             "map_publish_interval_ms": int(MAP_PUBLISH_INTERVAL_SECONDS * 1000),
             "map_observation": map_observation,
             "map_observations": map_observations,
             "slam": dict(self.slam_state),
+            "interaction": self.interaction_manager.state_for(self.camera),
         }
+
+    def interaction_people(self):
+        """Translate this app's stable YOLO tracks into the plugin's public schema."""
+        with self.lock:
+            tracks = [dict(item) for item in self.yolo_tracks]
+        people = []
+        for track in tracks:
+            x, y, width, height = track["box"]
+            identity = self.track_identities.get(track.get("local_id"))
+            people.append(
+                {
+                    "person_id": str(track["track_id"]),
+                    "person_name": identity.get("name") if identity else None,
+                    "bbox": [int(x), int(y), int(x + width), int(y + height)],
+                    "confidence": float(track["confidence"]),
+                }
+            )
+        return people
 
     def publish_placeholder(self, message):
         frame = self.placeholder(message)
@@ -1414,8 +1537,9 @@ class CameraWorker:
 
 
 class CameraManager:
-    def __init__(self, cameras, face_store):
+    def __init__(self, cameras, face_store, interaction_manager):
         self.face_store = face_store
+        self.interaction_manager = interaction_manager
         self.floor_map = FloorMapProjector.from_path(FLOOR_MAP_PATH)
         self.reid_embedder = ReIDEmbedder(REID_MODEL_PATH)
         self.handoff = IdentityHandoff(
@@ -1440,6 +1564,7 @@ class CameraManager:
                 self.recorder,
                 self.floor_map,
                 self.coordinator,
+                self.interaction_manager,
             )
             for camera in cameras
         }
@@ -1448,6 +1573,7 @@ class CameraManager:
         for worker in self.workers.values():
             worker.stop()
         self.recorder.stop_if_active()
+        self.interaction_manager.stop()
 
     def state(self):
         cameras = [worker.status_payload() for worker in self.workers.values()]
@@ -1497,6 +1623,10 @@ class CameraManager:
                 "face_quality_gate": "brightness + contrast + sharpness + open-set margin",
                 "face_feature_fusion_frames": 5,
                 "arcface_gallery_people": len(self.face_store.modern_features),
+                "arcface_gallery_required_features": ARCFACE_MIN_GALLERY_FEATURES,
+                "arcface_gallery_feature_counts": dict(
+                    self.face_store.modern_feature_counts
+                ),
                 "arcface_gallery_missing_ids": sorted(
                     set(self.face_store.people) - set(self.face_store.modern_features)
                 ),
@@ -1513,6 +1643,7 @@ class CameraManager:
                 "slam_marker_reacquire": "automatic",
                 "track_hold_ms": int(YOLO_TRACK_HOLD_SECONDS * 1000),
             },
+            "instrument_interaction": self.interaction_manager.status(),
             "floor_map": self.floor_map.state(observations),
         }
 
@@ -1802,13 +1933,40 @@ def _validate_annotation_payload(payload, config):
     regions = payload.get("regions") or {}
     if not isinstance(regions, dict):
         raise ValueError("regions must be an object")
-    allowed_types = {"main_aisle", "secondary_aisle", "overlap"}
+    allowed_types = {"main_aisle", "secondary_aisle", "rear_service", "overlap"}
     clean_regions = {}
     for region_type, region in regions.items():
         if region_type not in allowed_types:
             raise ValueError(f"unsupported region type: {region_type}")
         if not isinstance(region, dict):
             raise ValueError(f"{region_type} must be an object")
+        if region_type == "main_aisle" and "points" in region:
+            points = region.get("points")
+            if not isinstance(points, list) or len(points) != 4:
+                raise ValueError("main_aisle.points must contain four points")
+            clean_points = [
+                _validate_annotation_point(
+                    point, "main_aisle.points", normalized=True
+                )
+                for point in points
+            ]
+            # Opposite diagonals of a parallelogram share one midpoint.
+            diagonal_error = np.linalg.norm(
+                np.asarray(clean_points[0]) + np.asarray(clean_points[2])
+                - np.asarray(clean_points[1]) - np.asarray(clean_points[3])
+            )
+            if diagonal_error > 0.002:
+                raise ValueError("main_aisle.points must form a parallelogram")
+            area = abs(
+                np.cross(
+                    np.asarray(clean_points[1]) - np.asarray(clean_points[0]),
+                    np.asarray(clean_points[3]) - np.asarray(clean_points[0]),
+                )
+            )
+            if area < 0.0004:
+                raise ValueError("main_aisle parallelogram is too small")
+            clean_regions[region_type] = {"points": clean_points}
+            continue
         values = {}
         for key in ("x", "y", "width", "height"):
             try:
@@ -1888,7 +2046,8 @@ face_store = FaceIdentityStore(
     modern_model_root=MODERN_FACE_MODEL_ROOT,
     required_engine=FACE_RECOGNITION_ENGINE,
 )
-camera_manager = CameraManager(load_cameras(), face_store)
+interaction_manager = InstrumentInteractionManager(BASE_DIR, DATA_DIR)
+camera_manager = CameraManager(load_cameras(), face_store, interaction_manager)
 face_registration = FaceRegistrationManager(face_store, camera_manager.workers)
 atexit.register(camera_manager.stop)
 

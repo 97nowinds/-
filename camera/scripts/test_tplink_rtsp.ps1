@@ -12,7 +12,7 @@ if (-not (Test-Path -LiteralPath $ffmpeg)) {
     $ffmpeg = Join-Path $projectRoot ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"
 }
 if (-not (Test-Path -LiteralPath $ffmpeg)) {
-    throw "FFmpeg was not found. Install imageio-ffmpeg in C:\codex1\.venv first."
+    throw "FFmpeg was not found. Install imageio-ffmpeg in the repository virtual environment first."
 }
 
 if (-not (Test-Connection -ComputerName $CameraIp -Count 1 -Quiet)) {

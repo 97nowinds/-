@@ -15,7 +15,7 @@
   const pointList = document.getElementById("pointList");
   const status = document.getElementById("status");
   const state = { config: null, annotations: {}, cameraId: null, draft: null, drag: null, pendingImage: null };
-  const colors = { main_aisle: "#4bb4ff", secondary_aisle: "#b18cff", overlap: "#f0ae5a" };
+  const colors = { main_aisle: "#4bb4ff", secondary_aisle: "#b18cff", rear_service: "#66d9ef", overlap: "#f0ae5a" };
 
   function setStatus(message, isError) {
     status.textContent = message;
@@ -48,6 +48,69 @@
     return { x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)), y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)) };
   }
 
+  function regionPoints(region) {
+    if (Array.isArray(region?.points) && region.points.length === 4) return region.points;
+    if (region && Number.isFinite(region.x) && Number.isFinite(region.y)) {
+      return [
+        [region.x, region.y],
+        [region.x + region.width, region.y],
+        [region.x + region.width, region.y + region.height],
+        [region.x, region.y + region.height],
+      ];
+    }
+    return null;
+  }
+
+  function drawPolygonRegion(type, points, width, height) {
+    ctx.beginPath();
+    points.forEach((point, index) => {
+      const x = point[0] * width; const y = point[1] * height;
+      if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    if (type === "main_aisle" && modeSelect.value === "main_aisle") {
+      points.forEach((point, index) => {
+        const x = point[0] * width; const y = point[1] * height;
+        ctx.beginPath(); ctx.arc(x, y, 8, 0, Math.PI * 2);
+        ctx.fillStyle = colors.main_aisle; ctx.fill();
+        ctx.strokeStyle = "#07131c"; ctx.lineWidth = 2; ctx.stroke();
+        ctx.fillStyle = "#fff"; ctx.font = "700 11px sans-serif";
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(String(index + 1), x, y);
+      });
+      ctx.textAlign = "start"; ctx.textBaseline = "alphabetic";
+    }
+  }
+
+  function handleAt(point) {
+    const region = state.draft?.regions?.main_aisle;
+    const points = regionPoints(region);
+    if (!points) return -1;
+    const rect = canvas.getBoundingClientRect();
+    const threshold = 14;
+    return points.findIndex((candidate) => Math.hypot(
+      (candidate[0] - point.x) * rect.width,
+      (candidate[1] - point.y) * rect.height,
+    ) <= threshold);
+  }
+
+  function moveParallelogramHandle(points, index, point) {
+    const moved = points.map((item) => [...item]);
+    const previous = moved[index];
+    const dx = point.x - previous[0]; const dy = point.y - previous[1];
+    if (index === 0 || index === 2) {
+      const opposite = index === 0 ? 2 : 0;
+      moved[index] = [point.x, point.y];
+      moved[opposite] = [moved[opposite][0] - dx, moved[opposite][1] - dy];
+    } else {
+      const opposite = index === 1 ? 3 : 1;
+      moved[index] = [point.x, point.y];
+      moved[opposite] = [moved[opposite][0] - dx, moved[opposite][1] - dy];
+    }
+    if (moved.some(([x, y]) => x < 0 || x > 1 || y < 0 || y > 1)) return points;
+    return moved.map(([x, y]) => [Number(x.toFixed(5)), Number(y.toFixed(5))]);
+  }
+
   function drawCanvas() {
     const rect = canvas.getBoundingClientRect();
     const width = rect.width || 1;
@@ -59,11 +122,16 @@
       ctx.strokeStyle = colors[type] || "#fff";
       ctx.lineWidth = 2;
       ctx.setLineDash(type === "overlap" ? [8, 5] : []);
-      ctx.fillRect(region.x * width, region.y * height, region.width * width, region.height * height);
-      ctx.strokeRect(region.x * width, region.y * height, region.width * width, region.height * height);
+      const points = type === "main_aisle" ? regionPoints(region) : null;
+      if (points) drawPolygonRegion(type, points, width, height);
+      else {
+        ctx.fillRect(region.x * width, region.y * height, region.width * width, region.height * height);
+        ctx.strokeRect(region.x * width, region.y * height, region.width * width, region.height * height);
+      }
       ctx.font = "600 13px Microsoft YaHei, sans-serif";
       ctx.fillStyle = colors[type] || "#fff";
-      ctx.fillText({ main_aisle: "主通道", secondary_aisle: "内侧通道", overlap: "重叠区" }[type] || type, region.x * width + 8, region.y * height + 18);
+      const labelPoint = points ? points[0] : [region.x, region.y];
+      ctx.fillText({ main_aisle: "主通道", secondary_aisle: "副通道", rear_service: "侧向通道", overlap: "重叠区" }[type] || type, labelPoint[0] * width + 8, labelPoint[1] * height + 18);
     });
     ctx.setLineDash([]);
     (state.draft.image_points || []).forEach((point, index) => {
@@ -92,12 +160,14 @@
     ["mapFixtures", "mapZones", "mapCameras"].forEach((id) => { document.getElementById(id).replaceChildren(); });
     const sx = 1200 / state.config.width_m; const sy = 700 / state.config.height_m;
     (state.config.fixtures || []).forEach((fixture) => {
+      if (fixture.id === "rear_console") return;
       const x = fixture.x * sx; const y = fixture.y * sy; const w = fixture.width * sx; const h = fixture.height * sy;
       document.getElementById("mapFixtures").append(svgElement("rect", { class: "map-fixture", x, y, width: w, height: h, rx: 3 }), svgElement("text", { class: "map-label", x: x + w / 2, y: y + h / 2 + 6 }, fixture.name));
     });
     (state.config.zones || []).forEach((zone) => {
       const x = zone.x * sx; const y = zone.y * sy; const w = zone.width * sx; const h = zone.height * sy;
-      document.getElementById("mapZones").append(svgElement("rect", { class: `map-zone ${zone.kind === "overlap" ? "overlap" : ""}`, x, y, width: w, height: h }), svgElement("text", { class: "map-label", x: x + w / 2, y: y + h / 2 + 5 }, zone.name));
+      const label = zone.id === "secondary_aisle" ? "副通道" : zone.id === "rear_service" ? "侧向通道" : zone.name;
+      document.getElementById("mapZones").append(svgElement("rect", { class: `map-zone ${zone.kind === "overlap" ? "overlap" : ""}`, x, y, width: w, height: h }), svgElement("text", { class: "map-label", x: x + w / 2, y: y + h / 2 + 5 }, label));
     });
     Object.entries(state.config.cameras || {}).forEach(([id, camera]) => {
       const x = camera.position[0] * sx; const y = camera.position[1] * sy;
@@ -115,6 +185,7 @@
     state.cameraId = cameraId;
     state.draft = emptyDraft(cameraId);
     state.drag = null; state.pendingImage = null;
+    canvas.classList.toggle("editing-polygon", modeSelect.value === "main_aisle" && Boolean(state.draft.regions.main_aisle));
     frame.src = `${API_BASE}/video/${encodeURIComponent(cameraId)}?remote=1`;
     document.getElementById("cameraTitle").textContent = state.config.cameras[cameraId].label || cameraId;
     setStatus(`当前为 ${cameraId}，可以开始标注。`, false);
@@ -139,23 +210,51 @@
       drawCanvas(); drawMap(); updateSteps();
       return;
     }
-    state.drag = { start: point, current: point };
+    if (modeSelect.value === "main_aisle") {
+      const handle = handleAt(point);
+      if (handle >= 0) {
+        state.drag = { kind: "polygon-handle", handle, current: point };
+        canvas.classList.add("dragging-handle");
+        canvas.setPointerCapture(event.pointerId);
+        return;
+      }
+    }
+    state.drag = { kind: "rectangle", start: point, current: point };
     canvas.setPointerCapture(event.pointerId);
   });
 
   canvas.addEventListener("pointermove", (event) => {
     if (!state.drag) return;
-    state.drag.current = canvasPoint(event); drawCanvas();
+    state.drag.current = canvasPoint(event);
+    if (state.drag.kind === "polygon-handle") {
+      const region = state.draft.regions.main_aisle;
+      region.points = moveParallelogramHandle(regionPoints(region), state.drag.handle, state.drag.current);
+      setStatus("正在调整主通道；对边将保持平行。", false);
+      drawCanvas(); return;
+    }
+    drawCanvas();
     const rect = canvas.getBoundingClientRect(); const a = state.drag.start; const b = state.drag.current;
     ctx.strokeStyle = colors[modeSelect.value]; ctx.setLineDash([8, 5]); ctx.strokeRect(Math.min(a.x, b.x) * rect.width, Math.min(a.y, b.y) * rect.height, Math.abs(a.x - b.x) * rect.width, Math.abs(a.y - b.y) * rect.height); ctx.setLineDash([]);
   });
 
   canvas.addEventListener("pointerup", (event) => {
     if (!state.drag) return;
+    if (state.drag.kind === "polygon-handle") {
+      state.drag = null; canvas.classList.remove("dragging-handle");
+      setStatus("主通道平行四边形已调整，可继续拖动控制点或进行四点标注。", false);
+      drawCanvas(); return;
+    }
     const a = state.drag.start; const b = state.drag.current; state.drag = null;
     const region = { x: Number(Math.min(a.x, b.x).toFixed(5)), y: Number(Math.min(a.y, b.y).toFixed(5)), width: Number(Math.abs(a.x - b.x).toFixed(5)), height: Number(Math.abs(a.y - b.y).toFixed(5)) };
     if (region.width < 0.02 || region.height < 0.02) { setStatus("框选区域太小，请重新拖拽。", true); drawCanvas(); return; }
-    state.draft.regions[modeSelect.value] = region; setStatus("区域已记录，可以继续标注或保存。", false); drawCanvas();
+    if (modeSelect.value === "main_aisle") {
+      state.draft.regions.main_aisle = { points: regionPoints(region).map(([x, y]) => [Number(x.toFixed(5)), Number(y.toFixed(5))]) };
+      setStatus("主通道已创建；拖动四个控制点调整平行四边形，再进行四点标注。", false);
+    } else {
+      state.draft.regions[modeSelect.value] = region;
+      setStatus("区域已记录，可以继续标注或保存。", false);
+    }
+    drawCanvas();
   });
 
   mapSvg.addEventListener("click", (event) => {
@@ -166,7 +265,16 @@
     setStatus(`参考点 ${index + 1} 已配对，请继续点击画面设置下一个点。`, false); drawMap(); updateSteps();
   });
 
-  modeSelect.addEventListener("change", () => { state.drag = null; setStatus(modeSelect.value === "reference" ? "按顺序点击画面点，再点击地图对应位置。" : "在画面中拖拽框选区域。", false); updateSteps(); drawCanvas(); });
+  modeSelect.addEventListener("change", () => {
+    state.drag = null; canvas.classList.remove("dragging-handle");
+    canvas.classList.toggle("editing-polygon", modeSelect.value === "main_aisle" && Boolean(state.draft?.regions?.main_aisle));
+    const message = modeSelect.value === "reference"
+      ? "按顺序点击画面点，再点击地图对应位置。"
+      : modeSelect.value === "main_aisle"
+        ? "拖出主通道后，拖动四个控制点调整平行四边形。"
+        : "在画面中拖拽框选区域。";
+    setStatus(message, false); updateSteps(); drawCanvas();
+  });
   cameraSelect.addEventListener("change", () => selectCamera(cameraSelect.value));
   window.addEventListener("resize", resizeCanvas);
   document.getElementById("clearButton").addEventListener("click", () => {

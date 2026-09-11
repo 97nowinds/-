@@ -18,7 +18,8 @@ fi
 export MODULEPATH="${MODULEPATH:-/cluster/home/opt/modulefiles:/etc/lmod/modules:/usr/share/lmod/lmod/modulefiles}"
 module load anaconda
 PYTHON_BIN="/cluster/home/opt/anaconda3/envs/omat25/bin/python"
-PY_ROOT="${LAB_PYTHON_ROOT:-/tmp/lab-camera-python}"
+NODE_DATA_ROOT="${LAB_NODE_DATA_ROOT:-/cluster/dataX/$USER}"
+PY_ROOT="${LAB_PYTHON_ROOT:-$NODE_DATA_ROOT/lab-camera-python}"
 WHEELHOUSE="${LAB_WHEELHOUSE:-$HOME/lab-safety-wheels}"
 PROJECT_ROOT="${SLURM_SUBMIT_DIR}"
 
@@ -29,7 +30,7 @@ echo "wheelhouse=${WHEELHOUSE}"
 df -h /tmp
 
 rm -rf "$PY_ROOT"
-mkdir -p "$PY_ROOT"
+mkdir -p "$NODE_DATA_ROOT" "$PY_ROOT"
 if [[ ! -d "$WHEELHOUSE" ]]; then
     echo "Offline wheelhouse not found: $WHEELHOUSE" >&2
     exit 2

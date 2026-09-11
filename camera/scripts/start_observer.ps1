@@ -1,5 +1,5 @@
 param(
-    [string]$LabHost = "100.126.39.4",
+    [string]$LabHost = "127.0.0.1",
     [int]$BackendPort = 5000,
     [int]$FrontendPort = 5173
 )

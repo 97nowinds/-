@@ -1,14 +1,20 @@
 param(
-    [string]$CameraIp = "192.168.1.64",
+    [string]$CameraIp = "192.168.31.190",
     [string]$Username = "admin",
     [ValidateSet("101", "102")]
     [string]$Channel = "102",
     [ValidateSet("tcp", "udp")]
-    [string]$RtspTransport = "tcp"
+    [string]$RtspTransport = "tcp",
+    [switch]$DisableInstrumentInteraction,
+    [string]$InteractionServerUrl = $env:LAB_INTERACTION_SERVER_URL
 )
 
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$InteractionServerUrl = if ($InteractionServerUrl) { $InteractionServerUrl.TrimEnd('/') } else { "" }
+if (-not $DisableInstrumentInteraction -and [string]::IsNullOrWhiteSpace($InteractionServerUrl)) {
+    throw "未配置远程交互推理服务器。请传入 -InteractionServerUrl http://服务器IP:6000，或使用 -DisableInstrumentInteraction。"
+}
 $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $probe = Join-Path $PSScriptRoot "probe_rtsp.py"
 $app = Join-Path $projectRoot "app.py"
@@ -60,6 +66,12 @@ try {
     $encodedPassword = [Uri]::EscapeDataString($plainPassword)
     $env:LAB_CAM_2_RTSP = "rtsp://${encodedUsername}:${encodedPassword}@${CameraIp}:554/Streaming/Channels/${Channel}"
     $env:LAB_RTSP_TRANSPORT = $RtspTransport
+    if ($DisableInstrumentInteraction) {
+        $env:LAB_INTERACTION_ENABLED = "0"
+    } else {
+        $env:LAB_INTERACTION_ENABLED = "1"
+        $env:LAB_INTERACTION_SERVER_URL = $InteractionServerUrl
+    }
     $env:OPENCV_FFMPEG_CAPTURE_OPTIONS = "rtsp_transport;$RtspTransport|stimeout;5000000|fflags;nobuffer|flags;low_delay|max_delay;0|analyzeduration;0|probesize;32768"
     $plainPassword = $null
 
@@ -80,4 +92,5 @@ finally {
     Remove-Item Env:LAB_CAM_2_RTSP -ErrorAction SilentlyContinue
     Remove-Item Env:LAB_RTSP_TRANSPORT -ErrorAction SilentlyContinue
     Remove-Item Env:OPENCV_FFMPEG_CAPTURE_OPTIONS -ErrorAction SilentlyContinue
+    Remove-Item Env:LAB_INTERACTION_ENABLED,Env:LAB_INTERACTION_SERVER_URL -ErrorAction SilentlyContinue
 }

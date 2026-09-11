@@ -11,7 +11,8 @@
 set -Eeuo pipefail
 
 PROJECT_ROOT="${SLURM_SUBMIT_DIR}"
-WORK_ROOT="${SLURM_TMPDIR:-/tmp}/lab-rtsp-${SLURM_JOB_ID}"
+NODE_DATA_ROOT="${LAB_NODE_DATA_ROOT:-/cluster/dataX/$USER}"
+WORK_ROOT="$NODE_DATA_ROOT/lab-rtsp-${SLURM_JOB_ID}"
 ARCHIVE="$PROJECT_ROOT/tools/mediamtx/mediamtx_v1.18.2_linux_amd64.tar.gz"
 
 if [[ ! -f "$ARCHIVE" ]]; then
@@ -24,7 +25,7 @@ if ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)8554$'; then
 fi
 
 rm -rf "$WORK_ROOT"
-mkdir -p "$WORK_ROOT"
+mkdir -p "$NODE_DATA_ROOT" "$WORK_ROOT"
 tar -xzf "$ARCHIVE" -C "$WORK_ROOT"
 cat > "$WORK_ROOT/mediamtx.yml" <<'YAML'
 logLevel: info

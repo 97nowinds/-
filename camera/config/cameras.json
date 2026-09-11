@@ -11,6 +11,7 @@
     "name": "Hikvision Camera 2",
     "role": "tracking",
     "face_recognition": false,
+    "interaction_camera_id": "lab_camera_view_2",
     "source_env": "LAB_CAM_2_RTSP"
   },
   {
@@ -18,7 +19,11 @@
     "name": "Entrance ArcFace Camera",
     "role": "entrance_identity",
     "face_recognition": true,
-    "face_interval_seconds": 0.25,
+    "face_interval_seconds": 0.2,
+    "yolo_confidence": 0.3,
+    "yolo_image_size": 768,
+    "yolo_frame_stride": 3,
+    "track_hold_seconds": 1.5,
     "optional": true,
     "source_env": "LAB_CAM_ENTRANCE_RTSP"
   }

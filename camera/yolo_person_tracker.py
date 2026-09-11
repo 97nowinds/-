@@ -76,7 +76,34 @@ class YoloPersonTracker:
                     "confidence": round(float(confidence), 4),
                 }
             )
-        return sorted(tracks, key=lambda item: item["track_id"])
+        return self.deduplicate_tracks(tracks)
+
+    @staticmethod
+    def box_iou(first, second):
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        left = max(ax, bx)
+        top = max(ay, by)
+        right = min(ax + aw, bx + bw)
+        bottom = min(ay + ah, by + bh)
+        intersection = max(0, right - left) * max(0, bottom - top)
+        union = aw * ah + bw * bh - intersection
+        return intersection / max(union, 1)
+
+    @classmethod
+    def deduplicate_tracks(cls, tracks, iou_threshold=0.85):
+        """Suppress duplicate tracker boxes while preserving distinct people."""
+        kept = []
+        for track in sorted(
+            tracks, key=lambda item: float(item.get("confidence", 0.0)), reverse=True
+        ):
+            if any(
+                cls.box_iou(track["box"], existing["box"]) >= iou_threshold
+                for existing in kept
+            ):
+                continue
+            kept.append(track)
+        return sorted(kept, key=lambda item: item["track_id"])
 
     def reset(self):
         # Ultralytics stores persistent tracker state on the predictor.
@@ -131,6 +158,8 @@ class CrossCameraTrackCoordinator:
         similarity_threshold=0.72,
         match_margin=0.05,
         feature_refresh_seconds=1.0,
+        same_camera_similarity_threshold=0.82,
+        same_camera_ttl_seconds=2.0,
     ):
         self.feature_extractor = feature_extractor
         self.floor_map = floor_map
@@ -138,6 +167,10 @@ class CrossCameraTrackCoordinator:
         self.similarity_threshold = float(similarity_threshold)
         self.match_margin = float(match_margin)
         self.feature_refresh_seconds = float(feature_refresh_seconds)
+        self.same_camera_similarity_threshold = float(
+            same_camera_similarity_threshold
+        )
+        self.same_camera_ttl_seconds = float(same_camera_ttl_seconds)
         self.transitions = list(
             floor_map.config.get("camera_transitions", []) if floor_map else []
         )
@@ -217,10 +250,65 @@ class CrossCameraTrackCoordinator:
             "camera_id": camera_id,
             "appearance": appearance,
             "position": position,
+            "box": None,
             "last_seen": now,
             "in_overlap": self._is_overlap(position, camera_id),
         }
         return global_id
+
+    @staticmethod
+    def _box_center_distance(first, second):
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        return math.hypot(
+            ax + aw * 0.5 - (bx + bw * 0.5),
+            ay + ah * 0.5 - (by + bh * 0.5),
+        )
+
+    def _same_camera_candidates(
+        self,
+        camera_id,
+        appearance,
+        position,
+        box,
+        now,
+        active_local_ids,
+    ):
+        """Reconnect a recent ByteTrack ID switch without merging live peers."""
+        if appearance is None or active_local_ids is None:
+            return []
+        active_local_ids = {int(item) for item in active_local_ids}
+        eligible = []
+        for candidate_id, target in self.global_tracks.items():
+            if target.get("camera_id") != camera_id:
+                continue
+            age = now - target.get("last_seen", 0.0)
+            if age < 0.0 or age > self.same_camera_ttl_seconds:
+                continue
+            if any(
+                key[0] == camera_id
+                and bound_id == candidate_id
+                and key[1] in active_local_ids
+                for key, bound_id in self.local_bindings.items()
+            ):
+                continue
+            target_position = target.get("position")
+            if position is not None and target_position is not None:
+                if math.hypot(
+                    position["x"] - target_position["x"],
+                    position["y"] - target_position["y"],
+                ) > 2.0:
+                    continue
+            target_box = target.get("box")
+            if box is not None and target_box is not None:
+                iou = YoloPersonTracker.box_iou(box, target_box)
+                scale = max(box[2], box[3], target_box[2], target_box[3], 1)
+                if iou < 0.05 and self._box_center_distance(box, target_box) > scale * 0.75:
+                    continue
+            score = self.similarity(target.get("appearance"), appearance)
+            if score >= self.same_camera_similarity_threshold:
+                eligible.append((score, candidate_id))
+        return sorted(eligible, reverse=True)
 
     @staticmethod
     def _number(global_id):
@@ -446,8 +534,18 @@ class CrossCameraTrackCoordinator:
             if lock_owner and lock_owner != global_id:
                 owner_record = self.global_identities.get(lock_owner)
                 if self._identity_is_active(owner_record, now):
-                    return None
-                self._release_identity(lock_owner)
+                    if camera_id != "cam_entrance":
+                        return None
+                    # Entrance is the authoritative face camera. If another
+                    # view already owns this registered person, fold the new
+                    # entrance track into that global target instead of
+                    # publishing a second anonymous person on the floor map.
+                    merged_id = self._merge(lock_owner, global_id)
+                    if merged_id is None:
+                        return None
+                    global_id = merged_id
+                else:
+                    self._release_identity(lock_owner)
 
             locked_identity = dict(identity)
             locked_identity.update(
@@ -512,7 +610,16 @@ class CrossCameraTrackCoordinator:
             )
             return result
 
-    def update(self, camera_id, local_id, frame, box, position, now=None):
+    def update(
+        self,
+        camera_id,
+        local_id,
+        frame,
+        box,
+        position,
+        active_local_ids=None,
+        now=None,
+    ):
         now = time.time() if now is None else float(now)
         binding_key = (camera_id, int(local_id))
         with self.lock:
@@ -529,30 +636,54 @@ class CrossCameraTrackCoordinator:
 
             current_overlap = self._is_overlap(position, camera_id)
             if global_id is None:
-                candidates = self._matching_candidates(
-                    camera_id, appearance, position, now
+                same_camera_candidates = self._same_camera_candidates(
+                    camera_id,
+                    appearance,
+                    position,
+                    box,
+                    now,
+                    active_local_ids,
                 )
-                if self._has_unique_best_match(candidates):
-                    global_id = candidates[0][1]
+                if self._has_unique_best_match(same_camera_candidates):
+                    global_id = same_camera_candidates[0][1]
                 else:
-                    # The old global track may have expired while the person
-                    # crossed the blind zone. Rehydrate it from the confirmed
-                    # identity registry, still gated by the overlap zone.
-                    identity_candidates = self._identity_candidates(
+                    candidates = self._matching_candidates(
                         camera_id, appearance, position, now
                     )
-                    if self._has_unique_best_match(identity_candidates):
-                        global_id = identity_candidates[0][1]
-                        self.global_tracks[global_id] = {
-                            "camera_id": camera_id,
-                            "appearance": appearance,
-                            "position": position,
-                            "last_seen": now,
-                            "in_overlap": current_overlap,
-                        }
+                    if self._has_unique_best_match(candidates):
+                        global_id = candidates[0][1]
                     else:
-                        global_id = self._new_global(now, camera_id, appearance, position)
+                        # The old global track may have expired while the person
+                        # crossed the blind zone. Rehydrate it from the confirmed
+                        # identity registry, still gated by the overlap zone.
+                        identity_candidates = self._identity_candidates(
+                            camera_id, appearance, position, now
+                        )
+                        if self._has_unique_best_match(identity_candidates):
+                            global_id = identity_candidates[0][1]
+                            self.global_tracks[global_id] = {
+                                "camera_id": camera_id,
+                                "appearance": appearance,
+                                "position": position,
+                                "box": box,
+                                "last_seen": now,
+                                "in_overlap": current_overlap,
+                            }
+                        else:
+                            global_id = self._new_global(
+                                now, camera_id, appearance, position
+                            )
                 self.local_bindings[binding_key] = global_id
+                if active_local_ids is not None:
+                    for key, bound_id in list(self.local_bindings.items()):
+                        if (
+                            key != binding_key
+                            and key[0] == camera_id
+                            and bound_id == global_id
+                            and key[1] not in active_local_ids
+                        ):
+                            self.local_bindings.pop(key, None)
+                            self.local_features.pop(key, None)
 
             # Existing camera-local tracks may have received separate IDs before
             # reaching the overlap. Merge them once both views agree there.
@@ -602,6 +733,7 @@ class CrossCameraTrackCoordinator:
                 {
                     "camera_id": camera_id,
                     "position": position,
+                    "box": box,
                     "last_seen": now,
                     "in_overlap": current_overlap,
                 }
@@ -613,3 +745,10 @@ class CrossCameraTrackCoordinator:
             for key in [key for key in self.local_bindings if key[0] == camera_id]:
                 self.local_bindings.pop(key, None)
                 self.local_features.pop(key, None)
+
+    def forget_local(self, camera_id, local_id):
+        """Release one camera-local binding without disturbing its peers."""
+        key = (camera_id, int(local_id))
+        with self.lock:
+            self.local_bindings.pop(key, None)
+            self.local_features.pop(key, None)

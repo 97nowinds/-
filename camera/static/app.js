@@ -27,6 +27,12 @@ const FLOOR_VIEWBOX = {width: 1200, height: 700};
 const floorTrails = new Map();
 let floorMapSignature = "";
 
+function floorMapLabel(item) {
+  if (item?.id === "secondary_aisle") return "副通道";
+  if (item?.id === "rear_service") return "侧向通道";
+  return item?.name || "";
+}
+
 async function fetchState() {
   const response = await fetch(`${API_BASE}/api/state`, {cache: "no-store"});
   if (!response.ok) throw new Error("状态接口不可用");
@@ -95,12 +101,23 @@ function renderFloorPlan(floorMap) {
   }));
 
   for (const zone of floorMap.zones || []) {
-    if (zone.kind !== "overlap") continue;
     const rect = mapRect(floorMap, zone);
-    floorMapStatic.appendChild(createSvg("rect", {...rect, class: "map-overlap"}));
+    if (zone.kind === "overlap") {
+      floorMapStatic.appendChild(createSvg("rect", {...rect, class: "map-overlap"}));
+    } else if (zone.id === "rear_service") {
+      floorMapStatic.appendChild(createSvg("rect", {...rect, rx: 5, class: "map-side-aisle"}));
+      appendMapLabel(
+        floorMapStatic,
+        rect.x + rect.width / 2,
+        rect.y + rect.height / 2 + 10,
+        "侧向通道",
+        "map-side-aisle-label",
+      );
+    }
   }
 
   for (const fixture of floorMap.fixtures || []) {
+    if (fixture.id === "rear_console") continue;
     const rect = mapRect(floorMap, fixture);
     floorMapStatic.appendChild(createSvg("rect", {
       ...rect,
@@ -111,7 +128,7 @@ function renderFloorPlan(floorMap) {
       floorMapStatic,
       rect.x + rect.width / 2,
       rect.y + rect.height / 2 + 11,
-      fixture.name,
+      floorMapLabel(fixture),
       "map-fixture-label",
     );
   }
@@ -127,6 +144,17 @@ function renderFloorPlan(floorMap) {
     appendMapLabel(floorMapStatic, position.x, position.y + 10, camera.label, "map-camera-label");
   }
 
+  const secondaryAisle = (floorMap.zones || []).find((zone) => zone.id === "secondary_aisle");
+  if (secondaryAisle) {
+    const rect = mapRect(floorMap, secondaryAisle);
+    appendMapLabel(
+      floorMapStatic,
+      rect.x + rect.width / 2,
+      rect.y + rect.height / 2 + 10,
+      "副通道",
+      "map-area-label",
+    );
+  }
   appendMapLabel(floorMapStatic, 600, 550, "主通道", "map-area-label");
 }
 
@@ -197,7 +225,7 @@ function renderFloorMap(floorMap) {
       <div class="floor-person-row">
         <span class="floor-person-indicator ${person.identified ? "identified" : "unknown"}"></span>
         <strong>${escapeHtml(personLabel(person))}</strong>
-        <span class="floor-person-location">${escapeHtml(person.zone)} · ${escapeHtml(person.cameras.join(" + "))}</span>
+        <span class="floor-person-location">${escapeHtml(["内侧通道", "后端操作区"].includes(person.zone) ? "侧向通道" : person.zone)} · ${escapeHtml(person.cameras.join(" + "))}</span>
         <span class="floor-person-lock ${person.identity_lock_status === "locked" ? "locked" : "visual"}">${person.identity_lock_status === "locked" ? "已锁定" : "视觉追踪"} · ${escapeHtml(person.global_track_id || person.track_id)}</span>
       </div>
     `).join("")
@@ -217,6 +245,21 @@ function modeText(camera) {
   return ["handoff", "overlap_handoff", "transition_handoff"].includes(camera.identity.identity_source)
     ? `跨镜头继承自 ${camera.identity.handoff_from_camera}`
     : "本摄像头人脸确认";
+}
+
+function interactionText(camera) {
+  const interaction = camera.interaction;
+  if (!interaction?.configured) return "";
+  if (interaction.error) return "交互识别异常";
+  const active = interaction.current_interactions || [];
+  if (active.length) {
+    const item = active[0];
+    const person = item.person_name || item.person_id || "人员";
+    return `${person} 正在操作 ${item.instrument_name || item.instrument_id}`;
+  }
+  if (["warming_up", "analyzing"].includes(interaction.status)) return "交互识别预热中";
+  if (interaction.status === "error") return "交互识别异常";
+  return "未确认仪器交互";
 }
 
 function renderPeopleList(people) {
@@ -246,6 +289,7 @@ function renderInitial(state) {
       <footer>
         <strong class="camera-identity">${escapeHtml(identityText(camera.identity))}</strong>
         <span class="camera-mode">${escapeHtml(modeText(camera))}</span>
+        <span class="camera-interaction">${escapeHtml(interactionText(camera))}</span>
         <span class="camera-fps">${escapeHtml(camera.fps)} FPS</span>
       </footer>
     </article>
@@ -276,6 +320,8 @@ function update(state) {
     badge.className = `camera-badge ${camera.status}`;
     card.querySelector(".camera-identity").textContent = identityText(camera.identity);
     card.querySelector(".camera-mode").textContent = modeText(camera);
+    const interaction = card.querySelector(".camera-interaction");
+    if (interaction) interaction.textContent = interactionText(camera);
     const latency = camera.processing_latency_ms == null ? "-" : camera.processing_latency_ms;
     card.querySelector(".camera-fps").textContent = `采 ${camera.capture_fps || 0}/处 ${camera.fps || 0} FPS · ${latency}ms · 丢 ${camera.dropped_frames || 0}`;
   }

@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 
@@ -22,6 +23,16 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn("/api/annotation/config", script)
         self.assertIn("/api/annotation/save", script)
 
+    def test_main_aisle_uses_adjustable_parallelogram(self):
+        template = (ROOT / "templates" / "annotate.html").read_text(encoding="utf-8")
+        script = (ROOT / "static" / "annotate.js").read_text(encoding="utf-8")
+        app_source = (ROOT / "app.py").read_text(encoding="utf-8")
+        self.assertIn("主通道（平行四边形）", template)
+        self.assertIn("drawPolygonRegion", script)
+        self.assertIn("moveParallelogramHandle", script)
+        self.assertIn('region_type == "main_aisle" and "points" in region', app_source)
+        self.assertIn("must form a parallelogram", app_source)
+
     def test_face_registration_surface_exists(self):
         template = (ROOT / "templates" / "faces.html").read_text(encoding="utf-8")
         script = (ROOT / "static" / "faces.js").read_text(encoding="utf-8")
@@ -36,6 +47,11 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn("${API_BASE}/api/state", source)
         self.assertIn("${API_BASE}/video/", source)
 
+    def test_frontend_server_injects_configured_backend(self):
+        source = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
+        self.assertIn("window.__LAB_API_BASE__", source)
+        self.assertIn("server.api_base = args.api", source)
+
     def test_monitoring_page_exposes_fixed_calibration_entry(self):
         template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
         app_source = (ROOT / "app.py").read_text(encoding="utf-8")
@@ -43,6 +59,47 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn('id="calibrationLink"', template)
         self.assertIn('@app.route("/annotate")', app_source)
         self.assertIn("calibrationLink.href", script)
+
+    def test_secondary_and_side_aisle_names_are_distinct(self):
+        template = (ROOT / "templates" / "annotate.html").read_text(encoding="utf-8")
+        script = (ROOT / "static" / "annotate.js").read_text(encoding="utf-8")
+        monitor = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        floor_map = (ROOT / "config" / "floor_map.json").read_text(encoding="utf-8")
+        self.assertIn("副通道", template)
+        self.assertIn('value="rear_service">侧向通道（框选）', template)
+        self.assertIn('secondary_aisle: "副通道"', script)
+        self.assertIn('zone.id === "rear_service" ? "侧向通道"', script)
+        self.assertIn('item?.id === "secondary_aisle"', monitor)
+        self.assertIn('item?.id === "rear_service"', monitor)
+        self.assertIn('"name": "副通道"', floor_map)
+        self.assertIn('"name": "侧向通道"', floor_map)
+        self.assertNotIn("后端操作区", floor_map)
+        self.assertNotIn("后端仪器", floor_map)
+        self.assertIn('fixture.id === "rear_console"', script)
+
+    def test_top_fixture_and_corridor_keep_distinct_names(self):
+        floor_map = (ROOT / "config" / "floor_map.json").read_text(encoding="utf-8")
+
+        self.assertIn('"id": "wall_bench_zone"', floor_map)
+        self.assertIn('"name": "沿墙实验区"', floor_map)
+        self.assertIn('"id": "secondary_aisle"', floor_map)
+        self.assertIn('"name": "副通道"', floor_map)
+
+    def test_entrance_uses_tracking_pipeline_with_stronger_detection_and_face_checks(self):
+        cameras = json.loads((ROOT / "config" / "cameras.json").read_text(encoding="utf-8"))
+        entrance = next(camera for camera in cameras if camera["id"] == "cam_entrance")
+
+        self.assertTrue(entrance["face_recognition"])
+        self.assertLessEqual(entrance["face_interval_seconds"], 0.2)
+        self.assertLess(entrance["yolo_confidence"], 0.45)
+        self.assertLess(entrance["yolo_frame_stride"], 5)
+        self.assertGreater(entrance["track_hold_seconds"], 0.8)
+
+    def test_state_reports_arcface_gallery_completion_counts(self):
+        backend = (ROOT / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn('"arcface_gallery_required_features"', backend)
+        self.assertIn('"arcface_gallery_feature_counts"', backend)
 
 
 if __name__ == "__main__":

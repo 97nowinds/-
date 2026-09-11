@@ -2,8 +2,8 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^rtsps?://')]
     [string]$RemoteBaseUrl,
-    [string]$Camera1Ip = "192.168.1.64",
-    [string]$Camera2Ip = "192.168.1.65",
+    [string]$Camera1Ip = "192.168.31.191",
+    [string]$Camera2Ip = "192.168.31.190",
     [string]$EntranceCameraIp = "192.168.31.192",
     [string]$Camera1Username = "admin",
     [string]$Camera2Username = "admin",
@@ -13,7 +13,8 @@ param(
     [string]$Channel = "102",
     [ValidateSet("tcp", "udp")]
     [string]$RtspTransport = "tcp",
-    [int]$RestartSeconds = 5
+    [int]$RestartSeconds = 5,
+    [switch]$PromptInConsole
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,14 +24,13 @@ if ($RemoteBaseUrl -match '@') {
 $projectRoot = Split-Path -Parent $PSScriptRoot
 function Find-FfmpegPath {
     $candidates = @(
-        (Join-Path "C:\codex1" ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"),
         (Join-Path $projectRoot ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe"),
         (Join-Path (Split-Path -Parent $projectRoot) ".venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe")
     )
     foreach ($candidate in $candidates) {
         if (Test-Path -LiteralPath $candidate) { return $candidate }
     }
-    throw "FFmpeg was not found. Install imageio-ffmpeg in C:\codex1\.venv or camera\.venv first."
+    throw "FFmpeg was not found. Install imageio-ffmpeg in camera\.venv or the repository virtual environment first."
 }
 $ffmpeg = Find-FfmpegPath
 
@@ -39,6 +39,14 @@ $processes = @{}
 $remotePassword = ""
 
 function Read-SecureStringInWindow([string]$Prompt) {
+    if ($PromptInConsole) {
+        $secure = Read-Host -Prompt $Prompt -AsSecureString
+        if (-not $secure) {
+            throw "Password prompt returned an empty value."
+        }
+        return $secure
+    }
+
     $tempFile = [System.IO.Path]::GetTempFileName()
     try {
         $escapedPrompt = $Prompt.Replace("'", "''")

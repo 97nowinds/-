@@ -82,8 +82,9 @@ h2 { font-size: 16px; }
 .camera-viewport img { display: block; width: 100%; height: 100%; object-fit: contain; }
 .camera-card footer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 12px; min-height: 68px; padding: 11px 12px; border-top: 1px solid #2d343c; }
 .camera-identity { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
-.camera-mode, .camera-fps { color: #84909c; font-size: 11px; }
+.camera-mode, .camera-fps, .camera-interaction { color: #84909c; font-size: 11px; }
 .camera-mode { grid-column: 1; }
+.camera-interaction { grid-column: 1 / -1; color: #95b6d1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .camera-fps { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
 
 .floor-map-panel { overflow: hidden; border: 1px solid #2d343c; border-radius: 7px; background: #171b20; }
@@ -99,6 +100,8 @@ h2 { font-size: 16px; }
 .map-fixture.instrument { fill: #3b3330; stroke: #8a756a; }
 .map-fixture-label { fill: #bac4cd; font-size: 31px; font-weight: 700; letter-spacing: 0; }
 .map-overlap { fill: rgba(54, 171, 112, 0.13); stroke: #3eaa76; stroke-width: 4; stroke-dasharray: 14 10; }
+.map-side-aisle { fill: rgba(75, 180, 255, 0.08); stroke: #4bb4ff; stroke-width: 3; stroke-dasharray: 10 8; }
+.map-side-aisle-label { fill: #8ed5ff; font-size: 27px; font-weight: 700; text-anchor: middle; }
 .map-area-label { fill: #6f7c87; font-size: 30px; letter-spacing: 0; }
 .map-fov { stroke-width: 3; fill-opacity: 0.07; stroke-opacity: 0.5; }
 .map-fov.cam_1 { fill: #51a8d6; stroke: #51a8d6; }

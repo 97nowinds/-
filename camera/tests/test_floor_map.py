@@ -218,7 +218,7 @@ class FloorMapProjectorTests(unittest.TestCase):
         cam_2_inner = projector.project("cam_2", (0.10 * 1000, 0.80 * 1000, 0.02 * 1000, 0.06 * 1000), (1000, 1000, 3))
         cam_2_main = projector.project("cam_2", (0.60 * 1000, 0.80 * 1000, 0.02 * 1000, 0.06 * 1000), (1000, 1000, 3))
 
-        self.assertEqual(projector.zone_for(**cam_2_inner), "内侧通道")
+        self.assertEqual(projector.zone_for(**cam_2_inner), "副通道")
         self.assertEqual(projector.zone_for(**cam_2_main), "主通道")
         self.assertNotEqual(projector.zone_for(**cam_2_inner), projector.zone_for(**cam_2_main))
 

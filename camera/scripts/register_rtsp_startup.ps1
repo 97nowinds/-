@@ -1,8 +1,8 @@
 $ErrorActionPreference = "Stop"
 
 $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-$tunnelScript = "C:\codex1\camera\scripts\start_cluster_tunnel.ps1"
-$pushScript = "C:\codex1\camera\scripts\start_rtsp_push.ps1"
+$tunnelScript = Join-Path $PSScriptRoot "start_cluster_tunnel.ps1"
+$pushScript = Join-Path $PSScriptRoot "start_rtsp_push.ps1"
 $identityFile = "$env:USERPROFILE\.ssh\lab_rtsp_ed25519"
 $taskUser = "$env:USERDOMAIN\$env:USERNAME"
 

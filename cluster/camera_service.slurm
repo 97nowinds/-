@@ -18,9 +18,10 @@ export MODULEPATH="${MODULEPATH:-/cluster/home/opt/modulefiles:/etc/lmod/modules
 module load anaconda
 
 PROJECT_ROOT="${LAB_PROJECT_ROOT:-$PWD}"
-WORK_ROOT="${SLURM_TMPDIR:-/tmp}/lab-camera-${SLURM_JOB_ID}"
+NODE_DATA_ROOT="${LAB_NODE_DATA_ROOT:-/cluster/dataX/$USER}"
+WORK_ROOT="$NODE_DATA_ROOT/lab-camera-${SLURM_JOB_ID}"
 PYTHON_BIN="${PYTHON_BIN:-/cluster/home/opt/anaconda3/envs/omat25/bin/python}"
-PY_ROOT="${LAB_PYTHON_ROOT:-/tmp/lab-camera-python}"
+PY_ROOT="${LAB_PYTHON_ROOT:-$NODE_DATA_ROOT/lab-camera-python}"
 CAM1_RTSP="${LAB_CAM_1_RTSP:?LAB_CAM_1_RTSP is required}"
 CAM2_RTSP="${LAB_CAM_2_RTSP:?LAB_CAM_2_RTSP is required}"
 
@@ -41,7 +42,7 @@ for name in ("LAB_CAM_1_RTSP", "LAB_CAM_2_RTSP"):
 PY
 
 rm -rf "$WORK_ROOT"
-mkdir -p "$WORK_ROOT"
+mkdir -p "$NODE_DATA_ROOT" "$WORK_ROOT"
 cp -a "$PROJECT_ROOT/camera" "$WORK_ROOT/camera"
 cp -a "$PROJECT_ROOT/person_track" "$WORK_ROOT/person_track"
 

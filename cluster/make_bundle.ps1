@@ -1,13 +1,22 @@
 param(
-    [string]$Output = "C:\codex1\camera_cluster_bundle.zip"
+    [string]$Output = ""
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($Output)) {
+    $Output = Join-Path $root "camera_cluster_bundle.tar.gz"
+}
 $staging = Join-Path $env:TEMP ("camera-cluster-bundle-" + [Guid]::NewGuid().ToString("N"))
 try {
     New-Item -ItemType Directory -Force -Path $staging | Out-Null
-    Copy-Item -LiteralPath (Join-Path $root "camera") -Destination $staging -Recurse -Force
+    $cameraSource = Join-Path $root "camera"
+    $cameraDestination = Join-Path $staging "camera"
+    $excludedTopLevel = @(".venv", ".venv-interaction", "__pycache__", "runtime")
+    New-Item -ItemType Directory -Force -Path $cameraDestination | Out-Null
+    Get-ChildItem -LiteralPath $cameraSource -Force |
+        Where-Object { $_.Name -notin $excludedTopLevel } |
+        Copy-Item -Destination $cameraDestination -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $root "person_track") -Destination $staging -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $root "cluster") -Destination $staging -Recurse -Force
     $linuxMtx = Join-Path $root "tools\mediamtx\mediamtx_v1.18.2_linux_amd64.tar.gz"
@@ -16,7 +25,7 @@ try {
         Copy-Item -LiteralPath $linuxMtx -Destination (Join-Path $staging "tools\mediamtx") -Force
     }
     Get-ChildItem -LiteralPath $staging -Recurse -Directory -Force |
-        Where-Object { $_.Name -in @(".venv", "__pycache__") } |
+        Where-Object { $_.Name -in @(".venv", ".venv-interaction", "__pycache__", "runtime", "cache", "outputs") } |
         Sort-Object FullName -Descending |
         Remove-Item -Recurse -Force
     Remove-Item -LiteralPath $Output -Force -ErrorAction SilentlyContinue
@@ -26,7 +35,23 @@ try {
         (Join-Path $staging "cluster")
     )
     if (Test-Path -LiteralPath (Join-Path $staging "tools")) { $paths += Join-Path $staging "tools" }
-    Compress-Archive -Path $paths -DestinationPath $Output -CompressionLevel Optimal
+    if ($Output.EndsWith(".tar.gz", [StringComparison]::OrdinalIgnoreCase)) {
+        $entries = @("camera", "person_track", "cluster")
+        if (Test-Path -LiteralPath (Join-Path $staging "tools")) { $entries += "tools" }
+        Push-Location $staging
+        try {
+            & tar.exe -czf $Output @entries
+            if ($LASTEXITCODE -ne 0) {
+                throw "tar.exe failed with exit code $LASTEXITCODE"
+            }
+        }
+        finally {
+            Pop-Location
+        }
+    }
+    else {
+        Compress-Archive -Path $paths -DestinationPath $Output -CompressionLevel Optimal
+    }
     Write-Host "Bundle: $Output" -ForegroundColor Green
     Write-Host "No camera passwords are included."
 }

@@ -6,11 +6,11 @@ from camera_source import resolve_camera_source
 class CameraSourceTests(unittest.TestCase):
     def test_rtsp_credentials_are_not_exposed_in_display_value(self):
         result = resolve_camera_source(
-            {"source": "rtsp://admin:secret@192.168.1.64:554/Streaming/Channels/102"}
+            {"source": "rtsp://admin:secret@10.0.0.8:554/Streaming/Channels/102"}
         )
 
         self.assertEqual(result["source_type"], "rtsp")
-        self.assertEqual(result["source_display"], "rtsp://192.168.1.64:554/Streaming/Channels/102")
+        self.assertEqual(result["source_display"], "rtsp://10.0.0.8:554/Streaming/Channels/102")
         self.assertNotIn("secret", result["source_display"])
 
     def test_reads_rtsp_url_from_environment_variable(self):
