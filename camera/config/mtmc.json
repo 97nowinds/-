@@ -1,0 +1,38 @@
+{
+  "algorithm_version": "mtmc-2.0.0",
+  "calibration": {
+    "formal_required_for_geometry": true,
+    "max_stream_skew_seconds": 0.5,
+    "fusion_max_distance_m": 2.0,
+    "observation_max_age_seconds": 2.0
+  },
+  "reid": {
+    "gallery_capacity": 12,
+    "min_sample_quality": 0.45,
+    "duplicate_similarity": 0.985,
+    "top_k": 3,
+    "feature_refresh_seconds": 0.8,
+    "high_similarity": 0.82,
+    "medium_similarity": 0.70,
+    "match_margin": 0.08
+  },
+  "association": {
+    "window_seconds": 0.75,
+    "global_track_ttl_seconds": 8.0,
+    "identity_retention_seconds": 90.0,
+    "pending_ttl_seconds": 3.0,
+    "high_confidence_score": 0.78,
+    "medium_confidence_score": 0.62,
+    "weights": {
+      "reid": 0.65,
+      "time": 0.20,
+      "geometry": 0.10,
+      "motion": 0.05
+    }
+  },
+  "events": {
+    "path": "runtime/mtmc_events.jsonl",
+    "memory_limit": 300,
+    "retention_days": 30
+  }
+}

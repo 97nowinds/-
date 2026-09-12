@@ -1,4 +1,5 @@
 import atexit
+import csv
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ from pathlib import Path
 try:
     import cv2
     import numpy as np
-    from flask import Flask, Response, jsonify, render_template, request
+    from flask import Flask, Response, jsonify, render_template, request, send_file
 
     from camera_source import resolve_camera_source
     from dataset_recorder import DatasetRecorder, RecordingError
@@ -26,8 +27,9 @@ try:
     )
     from floor_map import FloorMapProjector
     from identity_handoff import IdentityHandoff
-    from instrument_interaction import InstrumentInteractionManager
     from motion_person_detector import MotionPersonDetector
+    from mtmc_config import load_mtmc_config, public_config
+    from mtmc_events import AssociationEventStore
     from person_tracking import PersonTrack
     from reid_embedder import ReIDEmbedder
     from slam_localizer import SlamLocalizer
@@ -62,11 +64,14 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING)
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config" / "cameras.json"
 FLOOR_MAP_PATH = BASE_DIR / "config" / "floor_map.json"
+MTMC_CONFIG_PATH = BASE_DIR / "config" / "mtmc.json"
 DATA_DIR = BASE_DIR / "data"
 FACE_DATA_DIR = Path(os.environ.get("LAB_FACE_DATA_DIR", DATA_DIR)).expanduser().resolve()
 PEOPLE_PATH = FACE_DATA_DIR / "people.json"
 KNOWN_FACES_DIR = FACE_DATA_DIR / "known_faces"
-RECORDINGS_DIR = DATA_DIR / "recordings"
+RECORDINGS_DIR = Path(
+    os.environ.get("LAB_RECORDINGS_DIR", FACE_DATA_DIR / "recordings")
+).expanduser().resolve()
 YOLO_MODEL_PATH = BASE_DIR / "models" / "yolov8n.pt"
 FACE_MODEL_PATH = BASE_DIR / "models" / "face_detection_yunet_2023mar.onnx"
 FACE_RECOGNITION_MODEL_PATH = BASE_DIR / "models" / "face_recognition_sface_2021dec.onnx"
@@ -104,8 +109,65 @@ MAP_PUBLISH_INTERVAL_SECONDS = 0.2
 SLAM_UPDATE_INTERVAL_SECONDS = 0.5
 ANNOTATION_LOCK = threading.RLock()
 REGISTRATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+RECORDING_PATH_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+REPLAY_REALTIME = os.environ.get("LAB_REPLAY_REALTIME") == "1"
+REPLAY_LOOP = os.environ.get("LAB_REPLAY_LOOP") == "1"
 
 app = Flask(__name__)
+
+
+def recording_session_directory(subject_id, session_id):
+    if not RECORDING_PATH_PATTERN.fullmatch(str(subject_id or "")):
+        raise ValueError("invalid recording subject")
+    if not RECORDING_PATH_PATTERN.fullmatch(str(session_id or "")):
+        raise ValueError("invalid recording session")
+    directory = (RECORDINGS_DIR / subject_id / session_id).resolve()
+    if RECORDINGS_DIR.resolve() not in directory.parents or not directory.is_dir():
+        raise FileNotFoundError("recording session not found")
+    return directory
+
+
+def recording_session_payload(directory):
+    info_path = directory / "info.json"
+    if not info_path.is_file():
+        raise FileNotFoundError("recording metadata not found")
+    payload = json.loads(info_path.read_text(encoding="utf-8"))
+    payload["subject_id"] = directory.parent.name
+    payload["session_id"] = directory.name
+    return payload
+
+
+def recording_frame_at(directory, camera_id, relative_seconds):
+    info = recording_session_payload(directory)
+    stream = info.get("streams", {}).get(camera_id)
+    if not stream or not stream.get("timestamps_file"):
+        raise ValueError(f"camera timestamps unavailable: {camera_id}")
+    path = (directory / stream["timestamps_file"]).resolve()
+    if directory not in path.parents or not path.is_file():
+        raise ValueError(f"camera timestamps missing: {camera_id}")
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"camera timestamps empty: {camera_id}")
+    requested_seconds = float(relative_seconds)
+    if not np.isfinite(requested_seconds) or requested_seconds < 0:
+        raise ValueError("video time must be a finite non-negative number")
+    fps = float(stream.get("fps") or 0)
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError(f"camera FPS unavailable: {camera_id}")
+    first_unix = float(rows[0]["unix_time"])
+    requested_frame = requested_seconds * fps
+    nearest = min(rows, key=lambda row: abs(int(row["frame_index"]) - requested_frame))
+    frame_index = int(nearest["frame_index"])
+    unix_time = float(nearest["unix_time"])
+    return {
+        # relative_seconds remains the selected video's timeline for old clients.
+        "relative_seconds": round(frame_index / fps, 3),
+        "video_seconds": round(frame_index / fps, 3),
+        "capture_relative_seconds": round(unix_time - first_unix, 3),
+        "unix_time": unix_time,
+        "frame_index": frame_index,
+    }
 
 
 @app.after_request
@@ -113,7 +175,7 @@ def add_api_cors(response):
     """Allow the separately served static frontend to call this API."""
     origin = os.environ.get("LAB_FRONTEND_ORIGIN", "*")
     response.headers["Access-Control-Allow-Origin"] = origin
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
 
@@ -130,7 +192,6 @@ def load_cameras():
                 "id": camera.get("id", f"cam_{index + 1}"),
                 "name": camera.get("name", f"Camera {index + 1}"),
                 "role": camera.get("role", "tracking"),
-                "interaction_camera_id": camera.get("interaction_camera_id"),
                 "face_recognition": bool(camera.get("face_recognition", True)),
                 "face_interval_seconds": max(
                     0.1,
@@ -169,7 +230,6 @@ class CameraWorker:
         recorder,
         floor_map,
         coordinator,
-        interaction_manager,
     ):
         self.camera = camera
         self.face_store = face_store
@@ -177,7 +237,6 @@ class CameraWorker:
         self.recorder = recorder
         self.floor_map = floor_map
         self.coordinator = coordinator
-        self.interaction_manager = interaction_manager
         self.face_recognition_ready = (
             face_store.modern.available and bool(face_store.modern_features)
             if FACE_RECOGNITION_ENGINE == "arcface"
@@ -246,6 +305,7 @@ class CameraWorker:
         self.identity_votes = deque(maxlen=7)
         self.track_identities = {}
         self.identity_votes_by_track = defaultdict(lambda: deque(maxlen=7))
+        self.active_local_ids = set()
         self.handoff_unknown_count = 0
         self.last_face_at = None
         self.last_face_attempt_at = 0.0
@@ -270,6 +330,12 @@ class CameraWorker:
         self.fps = 0.0
         self.capture_fps = 0.0
         self.processing_latency_ms = None
+        self.inference_started_at = None
+        self.inference_ended_at = None
+        self.status_published_at = None
+        self.last_capture_monotonic = None
+        self.last_frame_monotonic = None
+        self.current_frame_monotonic = None
         self.last_frame_at = None
         self.last_capture_at = None
         self.reconnect_count = 0
@@ -282,6 +348,14 @@ class CameraWorker:
         self._capture_fps_started = time.monotonic()
         self._capture_fps_frames = 0
         self.source_fps = 20.0
+        self.replay_enabled = REPLAY_REALTIME and self.camera["source_type"] == "file_or_url"
+        self.replay_loop = self.replay_enabled and REPLAY_LOOP
+        self.replay_start_monotonic = None
+        self.replay_start_unix = None
+        self.replay_frame_index = 0
+        self.replay_cycle = 0
+        self.replay_duration_seconds = None
+        self.replay_finished = False
         self.capture_condition = threading.Condition()
         self.latest_capture = None
         self.capture_sequence = 0
@@ -293,6 +367,8 @@ class CameraWorker:
         self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
         self.thread = threading.Thread(target=self.process_loop, daemon=True)
         self.encoder_thread = threading.Thread(target=self.encode_loop, daemon=True)
+
+    def start(self):
         self.capture_thread.start()
         self.thread.start()
         self.encoder_thread.start()
@@ -301,6 +377,9 @@ class CameraWorker:
         capture = None
         while self.running:
             if capture is None:
+                if self.replay_finished:
+                    time.sleep(0.25)
+                    continue
                 if self.camera["configuration_error"]:
                     self.status = "configuration_error"
                     self.publish_placeholder("RTSP environment variable is not configured")
@@ -316,6 +395,10 @@ class CameraWorker:
 
                 source_fps = capture.get(cv2.CAP_PROP_FPS)
                 self.source_fps = source_fps if 1.0 <= source_fps <= 60.0 else 20.0
+                if self.replay_enabled:
+                    frame_count = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 1))
+                    self.replay_duration_seconds = frame_count / self.source_fps
+                    self.replay_frame_index = 0
                 with self.capture_condition:
                     self.capture_generation += 1
                     self.latest_capture = None
@@ -325,6 +408,13 @@ class CameraWorker:
             if not ok or frame is None:
                 capture.release()
                 capture = None
+                if self.replay_enabled:
+                    if self.replay_loop:
+                        self.replay_cycle += 1
+                        continue
+                    self.replay_finished = True
+                    self.status = "replay_complete"
+                    continue
                 self.reconnect_count += 1
                 self.status = "reconnecting"
                 with self.capture_condition:
@@ -335,17 +425,32 @@ class CameraWorker:
                 continue
 
             self.status = "running"
-            captured_at = time.time()
+            if self.replay_enabled:
+                cycle_offset = self.replay_cycle * self.replay_duration_seconds
+                frame_offset = self.replay_frame_index / self.source_fps
+                captured_monotonic = self.replay_start_monotonic + cycle_offset + frame_offset
+                captured_at = self.replay_start_unix + cycle_offset + frame_offset
+                delay = captured_monotonic - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                self.replay_frame_index += 1
+            else:
+                captured_at = time.time()
+                captured_monotonic = time.monotonic()
+            self.coordinator.register_stream_timestamp(
+                self.camera["id"], captured_monotonic, captured_at
+            )
             self.recorder.submit(
                 self.camera["id"], frame, fps=self.source_fps, captured_at=captured_at
             )
-            self.record_capture(captured_at)
+            self.record_capture(captured_at, captured_monotonic)
             with self.capture_condition:
                 self.capture_sequence += 1
                 self.latest_capture = (
                     self.capture_sequence,
                     self.capture_generation,
                     captured_at,
+                    captured_monotonic,
                     frame,
                 )
                 self.capture_condition.notify_all()
@@ -372,7 +477,7 @@ class CameraWorker:
             if capture is None:
                 continue
 
-            sequence, generation, captured_at, frame = capture
+            sequence, generation, captured_at, captured_monotonic, frame = capture
             if generation != processed_generation:
                 self.reset_processing_state()
                 processed_generation = generation
@@ -382,21 +487,25 @@ class CameraWorker:
 
             frame = self.resize(frame)
             self.frame_counter += 1
-            self.record_frame()
-            display = self.process(frame)
-            self.interaction_manager.submit(
-                self.camera,
+            inference_started_at = time.time()
+            inference_started_monotonic = time.monotonic()
+            self.inference_started_at = inference_started_at
+            self.record_frame(inference_started_at, inference_started_monotonic)
+            display = self.process(
                 frame,
-                self.interaction_people(),
+                frame_unix_time=captured_at,
+                frame_monotonic_time=captured_monotonic,
             )
+            self.inference_ended_at = time.time()
             if generation != self.capture_generation or self.status != "running":
                 continue
             with self.display_condition:
                 self.frame = frame
                 self.display_frame = display
                 self.processing_latency_ms = round(
-                    (time.time() - captured_at) * 1000.0, 1
+                    (time.monotonic() - captured_monotonic) * 1000.0, 1
                 )
+                self.status_published_at = time.time()
                 self.display_sequence += 1
                 self.display_condition.notify_all()
 
@@ -408,6 +517,8 @@ class CameraWorker:
         self.yolo_trails.clear()
         self.last_yolo_tracks_at = None
         self.coordinator.forget_camera(self.camera["id"])
+        self.face_store.forget_camera(self.camera["id"])
+        self.active_local_ids.clear()
         self.yolo_generation += 1
         self.last_yolo_at = None
         self.last_map_publish_at = 0.0
@@ -479,8 +590,11 @@ class CameraWorker:
         scale = FRAME_WIDTH / width
         return cv2.resize(frame, (FRAME_WIDTH, int(height * scale)))
 
-    def record_frame(self):
-        self.last_frame_at = time.time()
+    def record_frame(self, unix_time=None, monotonic_time=None):
+        self.last_frame_at = time.time() if unix_time is None else float(unix_time)
+        self.last_frame_monotonic = (
+            time.monotonic() if monotonic_time is None else float(monotonic_time)
+        )
         self._fps_frames += 1
         elapsed = time.monotonic() - self._fps_started
         if elapsed >= 1.0:
@@ -488,8 +602,11 @@ class CameraWorker:
             self._fps_frames = 0
             self._fps_started = time.monotonic()
 
-    def record_capture(self, captured_at):
+    def record_capture(self, captured_at, monotonic_time=None):
         self.last_capture_at = captured_at
+        self.last_capture_monotonic = (
+            time.monotonic() if monotonic_time is None else float(monotonic_time)
+        )
         self.capture_frame_counter += 1
         self._capture_fps_frames += 1
         elapsed = time.monotonic() - self._capture_fps_started
@@ -865,7 +982,7 @@ class CameraWorker:
         self.coordinator.forget_camera(self.camera["id"])
 
     def body_candidate_is_stable(self, box, frame_shape, require_displacement=False):
-        now = time.time()
+        now = time.monotonic()
         center = (box[0] + box[2] / 2.0, box[1] + box[3] / 2.0)
         if (
             self.pending_body_box is not None
@@ -894,7 +1011,7 @@ class CameraWorker:
         identity = identity or self.identity
         if not identity or not identity.get("person_id"):
             return
-        now = time.time()
+        now = time.monotonic()
         if now - self.last_handoff_refresh_at < 0.75:
             return
         appearance = self.handoff.appearance(frame, box)
@@ -909,7 +1026,9 @@ class CameraWorker:
         """Project a person's foot point, preferring the active visual SLAM pose."""
         x, y, width, height = box
         foot = ((x + width * 0.5), (y + height))
-        slam_position = self.slam.project_pixel(foot)
+        slam_position = self.slam.project_pixel(
+            foot, monotonic_time=self.current_frame_monotonic
+        )
         if slam_position is not None:
             return self.floor_map.clamp_position(slam_position)
         return self.floor_map.project(self.camera["id"], box, frame_shape)
@@ -922,15 +1041,19 @@ class CameraWorker:
             80 + (track_id * 31) % 160,
         )
 
-    def process(self, frame):
+    def process(self, frame, frame_unix_time=None, frame_monotonic_time=None):
         display = frame.copy()
-        now = time.time()
+        frame_unix_time = time.time() if frame_unix_time is None else float(frame_unix_time)
+        now = time.monotonic() if frame_monotonic_time is None else float(frame_monotonic_time)
+        self.current_frame_monotonic = now
         if now - self.last_slam_at >= SLAM_UPDATE_INTERVAL_SECONDS:
             self.slam_state = self.slam.update(
                 frame,
                 baseline_transform=self.floor_map.pixel_transform(
                     self.camera["id"], frame.shape
                 ),
+                monotonic_time=now,
+                unix_time=frame_unix_time,
             )
             self.last_slam_at = now
         # 只在每路摄像头配置的抽样帧运行 YOLO。非抽样帧使用上一批检测框绘制画面，
@@ -999,15 +1122,18 @@ class CameraWorker:
         # A confirmed identity belongs to the active ByteTrack target. Keep
         # that name while the target moves, but clear it when the ID is gone.
         active_local_ids = {int(item["track_id"]) for item in tracks}
-        for missing_local_id in set(self.track_identities) - active_local_ids:
+        for missing_local_id in self.active_local_ids - active_local_ids:
             self.clear_identity(missing_local_id)
+            self.face_store.forget_track((self.camera["id"], missing_local_id))
             self.coordinator.forget_local(self.camera["id"], missing_local_id)
+        self.active_local_ids = active_local_ids
 
         observations = []
         published_tracks = []
         global_ids_by_local_id = {}
         face_result = None
         face_box = None
+        prepared_tracks = []
         for track in tracks:
             local_id = track["track_id"]
             x, y, width, height = track["box"]
@@ -1017,20 +1143,43 @@ class CameraWorker:
             height = max(1, min(height, frame.shape[0] - y))
             box = (x, y, width, height)
             foot = (x + width // 2, y + height)
-            position = self.project_box(box, frame.shape)
-            global_id = (
-                self.coordinator.update(
-                    self.camera["id"],
-                    local_id,
-                    frame,
-                    box,
-                    position,
-                    active_local_ids=active_local_ids,
-                    now=now,
-                )
-                    if should_infer and not hold_cached_tracks
-                    else cached_global_ids[local_id]
-                )
+            # A fixed tracking anchor is only meaningful for one person at a
+            # doorway. Publishing that same coordinate for a crowd makes the
+            # map falsely collapse multiple workers into one point.
+            position = (
+                None
+                if len(tracks) > 1
+                and not self.floor_map.has_projection(self.camera["id"])
+                else self.project_box(box, frame.shape)
+            )
+            prepared_tracks.append(
+                {
+                    **track,
+                    "track_id": local_id,
+                    "box": box,
+                    "position": position,
+                }
+            )
+        if should_infer and not hold_cached_tracks:
+            batch_global_ids = self.coordinator.update_batch(
+                self.camera["id"],
+                prepared_tracks,
+                frame,
+                active_local_ids=active_local_ids,
+                monotonic_time=now,
+                unix_time=frame_unix_time,
+                stream_skew_seconds=self.coordinator.stream_skew_seconds(now),
+            )
+        else:
+            batch_global_ids = cached_global_ids
+
+        for track in prepared_tracks:
+            local_id = track["track_id"]
+            x, y, width, height = track["box"]
+            box = track["box"]
+            foot = (x + width // 2, y + height)
+            position = track["position"]
+            global_id = batch_global_ids[local_id]
             global_ids_by_local_id[local_id] = global_id
             # A confirmed identity stored by cam_1 is adopted by cam_2 only
             # after this target is physically inside the overlap zone.
@@ -1099,15 +1248,26 @@ class CameraWorker:
                         "name": track_identity.get("name") if track_identity else None,
                         "identity_source": track_identity.get("identity_source", "face") if track_identity else "yolo_handoff",
                         "confidence": track["confidence"],
-                        "observed_at": now,
+                        "observed_at": frame_unix_time,
+                        "observed_monotonic": now,
+                        "timestamp_source": (
+                            "recording_replay" if self.replay_enabled else "host_receive"
+                        ),
                     }
                 )
+            mtmc_diagnostics = self.coordinator.track_diagnostics(
+                self.camera["id"], local_id
+            )
             published_tracks.append(
                 {
                     "track_id": global_id,
                     "local_id": local_id,
                     "box": box,
                     "confidence": track["confidence"],
+                    "reid_gallery": mtmc_diagnostics["gallery"],
+                    "association_confidence": mtmc_diagnostics["confidence"],
+                    "association_score": mtmc_diagnostics["final_match_score"],
+                    "association_pending": mtmc_diagnostics["pending"],
                 }
             )
 
@@ -1401,9 +1561,24 @@ class CameraWorker:
         }, None
 
     def status_payload(self):
-        age = time.time() - self.last_frame_at if self.last_frame_at else None
-        capture_age = time.time() - self.last_capture_at if self.last_capture_at else None
-        status = "stale" if self.status == "running" and age > FRAME_STALE_SECONDS else self.status
+        now_monotonic = time.monotonic()
+        age = (
+            now_monotonic - self.last_frame_monotonic
+            if self.last_frame_monotonic is not None
+            else None
+        )
+        capture_age = (
+            now_monotonic - self.last_capture_monotonic
+            if self.last_capture_monotonic is not None
+            else None
+        )
+        status = (
+            "stale"
+            if self.status == "running"
+            and age is not None
+            and age > FRAME_STALE_SECONDS
+            else self.status
+        )
         identity = None
         if self.identity:
             identity = {
@@ -1446,6 +1621,14 @@ class CameraWorker:
         confidence = max(
             (track["confidence"] for track in yolo_tracks), default=0.0
         )
+        stream_skew = self.coordinator.stream_skew_seconds(now_monotonic)
+        max_skew = self.coordinator.mtmc_config["calibration"]["max_stream_skew_seconds"]
+        localization = self.floor_map.localization_status(
+            self.camera["id"],
+            slam_state=self.slam_state,
+            stream_skew_seconds=stream_skew,
+            max_stream_skew_seconds=max_skew,
+        )
         return {
             "id": self.camera["id"],
             "name": self.camera["name"],
@@ -1461,14 +1644,29 @@ class CameraWorker:
             "frame_age_seconds": round(age, 2) if age is not None else None,
             "capture_age_seconds": round(capture_age, 2) if capture_age is not None else None,
             "processing_latency_ms": self.processing_latency_ms,
+            "timestamp_source": "recording_replay" if self.replay_enabled else "host_receive",
+            "capture_received_at": self.last_capture_at,
+            "inference_started_at": self.inference_started_at,
+            "inference_ended_at": self.inference_ended_at,
+            "status_published_at": self.status_published_at,
+            "estimated_stream_skew_seconds": round(stream_skew, 4),
             "dropped_frames": self.dropped_frames,
-            "pipeline_mode": "latest_frame",
+            "pipeline_mode": "replay_latest_frame" if self.replay_enabled else "latest_frame",
+            "replay": {
+                "enabled": self.replay_enabled,
+                "loop": self.replay_loop,
+                "cycle": self.replay_cycle,
+                "frame_index": self.replay_frame_index,
+                "duration_seconds": self.replay_duration_seconds,
+                "finished": self.replay_finished,
+            },
             "rtsp_transport": RTSP_TRANSPORT if self.camera["source_type"] == "rtsp" else None,
             "reconnect_count": self.reconnect_count,
             "identity": identity,
             "identities": identities,
             "tracking": tracking,
             "tracked_people": len(yolo_tracks),
+            "yolo_tracks": yolo_tracks,
             "tracker_engine": "YOLOv8n + ByteTrack",
             "face_detector": self.face_detector_backend,
             "face_detector_error": self.face_detector_error,
@@ -1480,7 +1678,7 @@ class CameraWorker:
             "detector_confidence_threshold": self.camera["yolo_confidence"],
             "detector_image_size": self.camera["yolo_image_size"],
             "last_inference_age_seconds": (
-                round(time.time() - self.last_yolo_at, 2)
+                round(now_monotonic - self.last_yolo_at, 2)
                 if self.last_yolo_at is not None
                 else None
             ),
@@ -1490,26 +1688,8 @@ class CameraWorker:
             "map_observation": map_observation,
             "map_observations": map_observations,
             "slam": dict(self.slam_state),
-            "interaction": self.interaction_manager.state_for(self.camera),
+            "localization": localization,
         }
-
-    def interaction_people(self):
-        """Translate this app's stable YOLO tracks into the plugin's public schema."""
-        with self.lock:
-            tracks = [dict(item) for item in self.yolo_tracks]
-        people = []
-        for track in tracks:
-            x, y, width, height = track["box"]
-            identity = self.track_identities.get(track.get("local_id"))
-            people.append(
-                {
-                    "person_id": str(track["track_id"]),
-                    "person_name": identity.get("name") if identity else None,
-                    "bbox": [int(x), int(y), int(x + width), int(y + height)],
-                    "confidence": float(track["confidence"]),
-                }
-            )
-        return people
 
     def publish_placeholder(self, message):
         frame = self.placeholder(message)
@@ -1537,22 +1717,29 @@ class CameraWorker:
 
 
 class CameraManager:
-    def __init__(self, cameras, face_store, interaction_manager):
+    def __init__(self, cameras, face_store):
         self.face_store = face_store
-        self.interaction_manager = interaction_manager
         self.floor_map = FloorMapProjector.from_path(FLOOR_MAP_PATH)
+        self.mtmc_config = load_mtmc_config(MTMC_CONFIG_PATH)
+        event_config = self.mtmc_config["events"]
+        self.event_store = AssociationEventStore(
+            BASE_DIR / event_config["path"],
+            memory_limit=event_config["memory_limit"],
+            retention_days=event_config["retention_days"],
+        )
         self.reid_embedder = ReIDEmbedder(REID_MODEL_PATH)
         self.handoff = IdentityHandoff(
             self.reid_embedder,
             ttl_seconds=IDENTITY_HANDOFF_TTL_SECONDS,
-            similarity_threshold=0.72,
-            match_margin=0.05,
+            similarity_threshold=self.mtmc_config["reid"]["high_similarity"],
+            match_margin=self.mtmc_config["reid"]["match_margin"],
         )
         self.coordinator = CrossCameraTrackCoordinator(
             self.reid_embedder,
             self.floor_map,
-            similarity_threshold=0.72,
-            match_margin=0.05,
+            mtmc_config=self.mtmc_config,
+            event_store=self.event_store,
+            camera_roles={camera["id"]: camera["role"] for camera in cameras},
         )
         camera_ids = [camera["id"] for camera in cameras]
         self.recorder = DatasetRecorder(RECORDINGS_DIR, camera_ids)
@@ -1564,44 +1751,23 @@ class CameraManager:
                 self.recorder,
                 self.floor_map,
                 self.coordinator,
-                self.interaction_manager,
             )
             for camera in cameras
         }
+        replay_start_monotonic = time.monotonic() + 2.0
+        replay_start_unix = time.time() + 2.0
+        for worker in self.workers.values():
+            worker.replay_start_monotonic = replay_start_monotonic
+            worker.replay_start_unix = replay_start_unix
+            worker.start()
 
     def stop(self):
         for worker in self.workers.values():
             worker.stop()
         self.recorder.stop_if_active()
-        self.interaction_manager.stop()
 
     def state(self):
         cameras = [worker.status_payload() for worker in self.workers.values()]
-        # Keep the map label synchronized with the large tracked-person box.
-        # During the face detector interval a camera may publish a fresh
-        # position before the next identity check; for a single active target
-        # it is safe to carry the camera's confirmed identity onto that map
-        # observation instead of briefly showing it as unregistered.
-        for camera in cameras:
-            identity = camera.get("identity")
-            if not identity:
-                continue
-            observations = camera.get("map_observations") or []
-            if len(observations) != 1:
-                continue
-            observation = observations[0]
-            if observation.get("person_id"):
-                continue
-            observation.update(
-                {
-                    "person_id": identity.get("person_id"),
-                    "person_number": identity.get("person_number"),
-                    "name": identity.get("name"),
-                    "identity_source": identity.get("identity_source", "face"),
-                    "identity_lock_status": identity.get("identity_lock_status"),
-                    "global_track_id": identity.get("global_track_id"),
-                }
-            )
         observations = [
             observation
             for camera in cameras
@@ -1612,6 +1778,8 @@ class CameraManager:
             "people": list(face_store.people.values()),
             "recording": self.recorder.status(),
             "processing": {
+                "inference_device": str(self.reid_embedder.device),
+                "cpu_fallback_allowed": os.environ.get("LAB_ALLOW_CPU_FALLBACK") == "1",
                 "inference_frame_stride": YOLO_FRAME_STRIDE,
                 "map_publish_interval_ms": int(MAP_PUBLISH_INTERVAL_SECONDS * 1000),
                 "frontend_poll_interval_ms": 200,
@@ -1632,9 +1800,9 @@ class CameraManager:
                 ),
                 "reid_engine": "ResNet50-IBN",
                 "reid_feature_dimensions": 2048,
-                "reid_similarity_threshold": 0.72,
-                "reid_match_margin": 0.05,
-                "reid_feature_refresh_ms": 1000,
+                "reid_similarity_threshold": self.mtmc_config["reid"]["high_similarity"],
+                "reid_match_margin": self.mtmc_config["reid"]["match_margin"],
+                "reid_feature_refresh_ms": int(self.mtmc_config["reid"]["feature_refresh_seconds"] * 1000),
                 "identity_handoff_ttl_seconds": IDENTITY_HANDOFF_TTL_SECONDS,
                 "identity_handoff_path": "entrance ArcFace -> directed Re-ID transition -> indoor tracks",
                 "identity_lock_policy": "single active global track per registered person; conflicts stay anonymous",
@@ -1642,12 +1810,22 @@ class CameraManager:
                 "slam_engine": "ArUco anchors + ORB monocular SLAM",
                 "slam_marker_reacquire": "automatic",
                 "track_hold_ms": int(YOLO_TRACK_HOLD_SECONDS * 1000),
+                "algorithm_version": self.mtmc_config["algorithm_version"],
+                "effective_mtmc_config": public_config(self.mtmc_config),
+                "mtmc_diagnostics": self.coordinator.diagnostics(),
             },
-            "instrument_interaction": self.interaction_manager.status(),
-            "floor_map": self.floor_map.state(observations),
+            "floor_map": self.floor_map.state(
+                observations,
+                stream_skew_seconds=self.coordinator.stream_skew_seconds(),
+                max_stream_skew_seconds=self.mtmc_config["calibration"]["max_stream_skew_seconds"],
+                observation_max_age_seconds=self.mtmc_config["calibration"]["observation_max_age_seconds"],
+                fusion_max_distance_m=self.mtmc_config["calibration"]["fusion_max_distance_m"],
+            ),
         }
 
     def start_recording(self, subject_id, notes=""):
+        if REPLAY_REALTIME:
+            raise RecordingError("录像回放模式不能再次开始数据录制")
         unavailable = [
             worker.camera["id"]
             for worker in self.workers.values()
@@ -2046,8 +2224,7 @@ face_store = FaceIdentityStore(
     modern_model_root=MODERN_FACE_MODEL_ROOT,
     required_engine=FACE_RECOGNITION_ENGINE,
 )
-interaction_manager = InstrumentInteractionManager(BASE_DIR, DATA_DIR)
-camera_manager = CameraManager(load_cameras(), face_store, interaction_manager)
+camera_manager = CameraManager(load_cameras(), face_store)
 face_registration = FaceRegistrationManager(face_store, camera_manager.workers)
 atexit.register(camera_manager.stop)
 
@@ -2099,6 +2276,21 @@ def api_state():
     return jsonify(camera_manager.state())
 
 
+@app.route("/api/mtmc/events")
+def api_mtmc_events():
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        return jsonify({"error": "limit must be an integer"}), 400
+    return jsonify(
+        {
+            "events": camera_manager.event_store.recent(limit),
+            "summary": camera_manager.event_store.summary(),
+            "algorithm_version": camera_manager.mtmc_config["algorithm_version"],
+        }
+    )
+
+
 @app.route("/api/annotation/config")
 def api_annotation_config():
     with ANNOTATION_LOCK:
@@ -2109,6 +2301,7 @@ def api_annotation_config():
             "width_m": float(config.get("width_m", 0.0)),
             "height_m": float(config.get("height_m", 0.0)),
             "calibrated": bool(config.get("calibrated", False)),
+            "calibration": config.get("calibration", {}),
             "zones": config.get("zones", []),
             "fixtures": config.get("fixtures", []),
             "cameras": config.get("cameras", {}),
@@ -2142,6 +2335,11 @@ def api_annotation_save():
                 if not all_calibrated:
                     raise ValueError("请先为每路摄像头完成四点标定")
                 config["calibrated"] = True
+                config.setdefault("calibration", {})["status"] = "formal"
+                config["calibration"]["geometry_fusion_allowed"] = True
+                config["calibration"]["reason"] = "all camera control points activated by operator"
+                for camera in config.get("cameras", {}).values():
+                    camera["localization_mode"] = "formal_homography"
             _save_floor_map_config(config)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         return jsonify({"ok": False, "error": str(error)}), 400
@@ -2151,6 +2349,7 @@ def api_annotation_save():
             "camera_id": camera_id,
             "requires_restart": True,
             "calibrated": bool(config.get("calibrated", False)),
+            "calibration_status": config.get("calibration", {}).get("status", "uncalibrated"),
             "message": "标注已保存；重启后端后新的四点映射才会应用",
         }
     )
@@ -2223,6 +2422,195 @@ def api_recording_stop():
         return jsonify(camera_manager.recorder.stop("operator"))
     except RecordingError as error:
         return jsonify({"error": str(error)}), 409
+
+
+@app.route("/api/recordings", methods=["GET"])
+def api_recordings():
+    sessions = []
+    for info_path in RECORDINGS_DIR.glob("*/*/info.json"):
+        try:
+            session = recording_session_payload(info_path.parent)
+            if session.get("status") == "complete":
+                sessions.append(session)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    sessions.sort(key=lambda item: item.get("started_at") or "", reverse=True)
+    return jsonify({"sessions": sessions[:100]})
+
+
+@app.route(
+    "/api/recordings/<subject_id>/<session_id>/video/<camera_id>",
+    methods=["GET"],
+)
+def api_recording_video(subject_id, session_id, camera_id):
+    try:
+        directory = recording_session_directory(subject_id, session_id)
+        info = recording_session_payload(directory)
+        stream = info.get("streams", {}).get(camera_id)
+        if not stream or not stream.get("video_file"):
+            raise FileNotFoundError("recorded camera video not found")
+        video_path = (directory / stream["video_file"]).resolve()
+        if directory not in video_path.parents or not video_path.is_file():
+            raise FileNotFoundError("recorded camera video not found")
+        return send_file(video_path, conditional=True)
+    except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError) as error:
+        return jsonify({"error": str(error)}), 404
+
+
+@app.route(
+    "/api/recordings/<subject_id>/<session_id>/frame/<camera_id>",
+    methods=["GET"],
+)
+def api_recording_frame(subject_id, session_id, camera_id):
+    capture = None
+    try:
+        directory = recording_session_directory(subject_id, session_id)
+        info = recording_session_payload(directory)
+        stream = info.get("streams", {}).get(camera_id)
+        if not stream or not stream.get("video_file"):
+            raise FileNotFoundError("recorded camera video not found")
+        frame_index = int(request.args.get("index", 0))
+        frame_count = int(stream.get("frames") or 0)
+        if frame_index < 0 or frame_index >= frame_count:
+            raise ValueError(f"frame index must be between 0 and {max(0, frame_count - 1)}")
+        video_path = (directory / stream["video_file"]).resolve()
+        if directory not in video_path.parents or not video_path.is_file():
+            raise FileNotFoundError("recorded camera video not found")
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            raise ValueError("recorded camera video cannot be decoded")
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = capture.read()
+        if not ok or frame is None:
+            raise ValueError(f"recorded frame cannot be decoded: {frame_index}")
+        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        if not ok:
+            raise ValueError("recorded frame cannot be encoded")
+        response = Response(encoded.tobytes(), mimetype="image/jpeg")
+        response.headers["Cache-Control"] = "private, max-age=3600"
+        response.headers["X-Frame-Index"] = str(frame_index)
+        return response
+    except (FileNotFoundError, ValueError, TypeError, OSError, json.JSONDecodeError) as error:
+        return jsonify({"error": str(error)}), 400
+    finally:
+        if capture is not None:
+            capture.release()
+
+
+def manual_handoff_payload(directory):
+    path = directory / "manual_handoffs.json"
+    if not path.exists():
+        annotations = []
+    else:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        annotations = payload.get("annotations", [])
+    by_pair = defaultdict(list)
+    for item in annotations:
+        by_pair[f"{item['from_camera']}->{item['to_camera']}"].append(
+            float(item["gap_seconds"])
+        )
+    suggestions = {}
+    for pair, values in sorted(by_pair.items()):
+        suggestions[pair] = {
+            "samples": len(values),
+            "median_gap_seconds": round(float(np.median(values)), 3),
+            "p90_gap_seconds": round(float(np.percentile(values, 90)), 3),
+            "automatic_config_update": False,
+        }
+    return {
+        "format_version": "manual-mtmc-handoffs-v1",
+        "session_id": directory.name,
+        "annotations": annotations,
+        "suggestions": suggestions,
+    }
+
+
+def save_manual_handoffs(directory, document, annotations):
+    path = directory / "manual_handoffs.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "format_version": document["format_version"],
+                "session_id": document["session_id"],
+                "annotations": annotations,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+@app.route(
+    "/api/recordings/<subject_id>/<session_id>/handoffs",
+    methods=["GET", "POST"],
+)
+def api_recording_handoffs(subject_id, session_id):
+    try:
+        directory = recording_session_directory(subject_id, session_id)
+        if request.method == "GET":
+            return jsonify(manual_handoff_payload(directory))
+        payload = request.get_json(silent=True) or {}
+        person_id = str(payload.get("person_id") or "").strip()
+        source_camera = str(payload.get("from_camera") or "").strip()
+        target_camera = str(payload.get("to_camera") or "").strip()
+        if not RECORDING_PATH_PATTERN.fullmatch(person_id):
+            raise ValueError("person_id must use letters, numbers, underscore or dash")
+        info = recording_session_payload(directory)
+        cameras = set(info.get("streams", {}))
+        if source_camera == target_camera or {source_camera, target_camera} - cameras:
+            raise ValueError("select two different cameras recorded in this session")
+        source = recording_frame_at(
+            directory, source_camera, payload.get("source_end_seconds", 0.0)
+        )
+        target = recording_frame_at(
+            directory, target_camera, payload.get("target_start_seconds", 0.0)
+        )
+        with ANNOTATION_LOCK:
+            document = manual_handoff_payload(directory)
+            sequence = max(
+                [int(item.get("id", 0)) for item in document["annotations"]] + [0]
+            ) + 1
+            annotation = {
+                "id": sequence,
+                "person_id": person_id,
+                "from_camera": source_camera,
+                "to_camera": target_camera,
+                "source_end": source,
+                "target_start": target,
+                "gap_seconds": round(target["unix_time"] - source["unix_time"], 3),
+                "notes": str(payload.get("notes") or "").strip()[:300],
+                "created_at": time.time(),
+            }
+            document["annotations"].append(annotation)
+            save_manual_handoffs(directory, document, document["annotations"])
+        return jsonify(manual_handoff_payload(directory)), 201
+    except (FileNotFoundError, ValueError, TypeError, OSError, json.JSONDecodeError) as error:
+        return jsonify({"error": str(error)}), 400
+
+
+@app.route(
+    "/api/recordings/<subject_id>/<session_id>/handoffs/<int:annotation_id>",
+    methods=["DELETE"],
+)
+def api_recording_handoff_delete(subject_id, session_id, annotation_id):
+    try:
+        directory = recording_session_directory(subject_id, session_id)
+        with ANNOTATION_LOCK:
+            document = manual_handoff_payload(directory)
+            kept = [
+                item
+                for item in document["annotations"]
+                if int(item.get("id", 0)) != annotation_id
+            ]
+            if len(kept) == len(document["annotations"]):
+                raise FileNotFoundError("handoff annotation not found")
+            save_manual_handoffs(directory, document, kept)
+        return jsonify(manual_handoff_payload(directory))
+    except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError) as error:
+        return jsonify({"error": str(error)}), 404
 
 
 if __name__ == "__main__":

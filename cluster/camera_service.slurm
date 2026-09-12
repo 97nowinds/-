@@ -22,6 +22,7 @@ NODE_DATA_ROOT="${LAB_NODE_DATA_ROOT:-/cluster/dataX/$USER}"
 WORK_ROOT="$NODE_DATA_ROOT/lab-camera-${SLURM_JOB_ID}"
 PYTHON_BIN="${PYTHON_BIN:-/cluster/home/opt/anaconda3/envs/omat25/bin/python}"
 PY_ROOT="${LAB_PYTHON_ROOT:-$NODE_DATA_ROOT/lab-camera-python}"
+ALLOW_CPU_FALLBACK="${LAB_ALLOW_CPU_FALLBACK:-0}"
 CAM1_RTSP="${LAB_CAM_1_RTSP:?LAB_CAM_1_RTSP is required}"
 CAM2_RTSP="${LAB_CAM_2_RTSP:?LAB_CAM_2_RTSP is required}"
 
@@ -31,10 +32,21 @@ nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 
 "$PYTHON_BIN" - <<'PY'
 import os
+from pathlib import Path
 from urllib.parse import urlsplit
 
-for name in ("LAB_CAM_1_RTSP", "LAB_CAM_2_RTSP"):
+replay = os.environ.get("LAB_REPLAY_REALTIME") == "1"
+names = ["LAB_CAM_1_RTSP", "LAB_CAM_2_RTSP"]
+if os.environ.get("LAB_CAM_ENTRANCE_RTSP"):
+    names.append("LAB_CAM_ENTRANCE_RTSP")
+for name in names:
     value = os.environ[name]
+    if replay:
+        path = Path(value).expanduser()
+        if not path.is_file():
+            raise SystemExit(f"Replay file does not exist for {name}: {path}")
+        print(f"{name}=replay_file name={path.name}")
+        continue
     parsed = urlsplit(value)
     if parsed.scheme not in ("rtsp", "rtsps") or not parsed.hostname or not parsed.path:
         raise SystemExit(f"Invalid RTSP URL in {name}")
@@ -53,17 +65,21 @@ if [[ ! -d "$PY_ROOT" ]]; then
 fi
 export PYTHONPATH="$PY_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
-"$PYTHON_BIN" - <<'PY'
+LAB_ALLOW_CPU_FALLBACK="$ALLOW_CPU_FALLBACK" "$PYTHON_BIN" - <<'PY'
+import os
 import torch
 import onnxruntime as ort
 
 print("torch=", torch.__version__)
 print("torch.cuda.is_available=", torch.cuda.is_available())
 print("onnxruntime_providers=", ort.get_available_providers())
-if not torch.cuda.is_available():
-    raise SystemExit("CUDA is not available inside the Slurm allocation")
-if "CUDAExecutionProvider" not in ort.get_available_providers():
-    raise SystemExit("ONNX Runtime CUDAExecutionProvider is not available")
+gpu_ready = torch.cuda.is_available() and "CUDAExecutionProvider" in ort.get_available_providers()
+if not gpu_ready and os.environ.get("LAB_ALLOW_CPU_FALLBACK") != "1":
+    raise SystemExit(
+        "CUDA is unavailable. Set LAB_ALLOW_CPU_FALLBACK=1 only for an explicit "
+        "temporary degraded deployment."
+    )
+print("inference_mode=", "gpu" if gpu_ready else "cpu_fallback")
 PY
 
 export LAB_CAM_1_RTSP="$CAM1_RTSP"
@@ -75,7 +91,9 @@ export LAB_RTSP_TRANSPORT="${LAB_RTSP_TRANSPORT:-tcp}"
 export OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;${LAB_RTSP_TRANSPORT}|stimeout;5000000|fflags;nobuffer|flags;low_delay|max_delay;0|analyzeduration;0|probesize;32768"
 export LAB_FACE_ENGINE="arcface"
 export LAB_FACE_DATA_DIR="${LAB_FACE_DATA_DIR:-$PROJECT_ROOT/camera/data}"
+export LAB_RECORDINGS_DIR="${LAB_RECORDINGS_DIR:-$PROJECT_ROOT/camera/data/recordings}"
 mkdir -p "$LAB_FACE_DATA_DIR/known_faces"
+mkdir -p "$LAB_RECORDINGS_DIR"
 export LAB_APP_HOST="0.0.0.0"
 export LAB_APP_PORT="${LAB_APP_PORT:-5000}"
 export LAB_API_ONLY="${LAB_API_ONLY:-0}"
@@ -95,8 +113,8 @@ for index, url in enumerate(urls, 1):
     ok, frame = cap.read()
     cap.release()
     if not ok or frame is None:
-        raise SystemExit(f"RTSP frame check failed for camera {index}")
-    print(f"rtsp_camera_{index}=ok shape={frame.shape}")
+        raise SystemExit(f"source frame check failed for camera {index}")
+    print(f"source_camera_{index}=ok shape={frame.shape}")
 PY
 
 "$PYTHON_BIN" app.py &

@@ -4,6 +4,10 @@
     "name": "Hikvision Camera 1",
     "role": "tracking",
     "face_recognition": false,
+    "yolo_confidence": 0.3,
+    "yolo_image_size": 768,
+    "yolo_frame_stride": 3,
+    "track_hold_seconds": 1.5,
     "source_env": "LAB_CAM_1_RTSP"
   },
   {
@@ -11,7 +15,6 @@
     "name": "Hikvision Camera 2",
     "role": "tracking",
     "face_recognition": false,
-    "interaction_camera_id": "lab_camera_view_2",
     "source_env": "LAB_CAM_2_RTSP"
   },
   {

@@ -7,6 +7,10 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+from association import ASSOCIATION_ALGORITHM, AssociationObservation, AssociationTarget, BatchAssociator
+from mtmc_config import load_mtmc_config
+from reid_gallery import BodyQualityScorer, TrackFeatureGallery
+
 
 class YoloPersonTracker:
     """YOLO person detector with one persistent ByteTrack state per camera."""
@@ -154,21 +158,39 @@ class CrossCameraTrackCoordinator:
         self,
         feature_extractor,
         floor_map=None,
-        ttl_seconds=6.0,
-        similarity_threshold=0.72,
-        match_margin=0.05,
-        feature_refresh_seconds=1.0,
-        same_camera_similarity_threshold=0.82,
+        ttl_seconds=None,
+        similarity_threshold=None,
+        match_margin=None,
+        feature_refresh_seconds=None,
+        same_camera_similarity_threshold=None,
         same_camera_ttl_seconds=2.0,
+        mtmc_config=None,
+        event_store=None,
+        camera_roles=None,
     ):
         self.feature_extractor = feature_extractor
         self.floor_map = floor_map
-        self.ttl_seconds = float(ttl_seconds)
-        self.similarity_threshold = float(similarity_threshold)
-        self.match_margin = float(match_margin)
-        self.feature_refresh_seconds = float(feature_refresh_seconds)
+        self.mtmc_config = mtmc_config or load_mtmc_config()
+        reid_config = self.mtmc_config["reid"]
+        association_config = self.mtmc_config["association"]
+        self.ttl_seconds = float(
+            association_config["global_track_ttl_seconds"] if ttl_seconds is None else ttl_seconds
+        )
+        self.similarity_threshold = float(
+            reid_config["medium_similarity"] if similarity_threshold is None else similarity_threshold
+        )
+        self.match_margin = float(
+            reid_config["match_margin"] if match_margin is None else match_margin
+        )
+        self.feature_refresh_seconds = float(
+            reid_config["feature_refresh_seconds"]
+            if feature_refresh_seconds is None
+            else feature_refresh_seconds
+        )
         self.same_camera_similarity_threshold = float(
-            same_camera_similarity_threshold
+            reid_config["high_similarity"]
+            if same_camera_similarity_threshold is None
+            else same_camera_similarity_threshold
         )
         self.same_camera_ttl_seconds = float(same_camera_ttl_seconds)
         self.transitions = list(
@@ -178,11 +200,17 @@ class CrossCameraTrackCoordinator:
             [self.ttl_seconds]
             + [float(item.get("max_gap_seconds", 0.0)) for item in self.transitions]
         )
-        self.identity_retention_seconds = max(self.ttl_seconds, 90.0)
+        self.identity_retention_seconds = max(
+            self.ttl_seconds,
+            float(association_config["identity_retention_seconds"]),
+        )
         self.lock = __import__("threading").RLock()
         self.next_id = 1
         self.local_bindings = {}
         self.local_features = {}
+        self.local_galleries = {}
+        self.local_motion = {}
+        self.global_galleries = {}
         self.global_tracks = {}
         # A global identity survives the short ByteTrack TTL so it can be
         # handed from cam_1 to cam_2 after the target leaves the overlap.
@@ -190,6 +218,59 @@ class CrossCameraTrackCoordinator:
         # One registered person may own only one active global track. This
         # prevents a weak Re-ID match from showing the same identity twice.
         self.person_locks = {}
+        self.pending = {}
+        self.redirects = {}
+        self.active_local_ids_by_camera = {}
+        self.stream_timestamps = {}
+        self.association_reservations = {}
+        self.recent_associations = deque(maxlen=300)
+        self.event_store = event_store
+        self.camera_roles = dict(camera_roles or {})
+        calibration_status = getattr(floor_map, "calibration_status", "uncalibrated")
+        self.batch_associator = BatchAssociator(
+            self.mtmc_config,
+            transitions=self.transitions,
+            calibration_status=calibration_status,
+        )
+
+    def register_stream_timestamp(self, camera_id, monotonic_time, unix_time):
+        with self.lock:
+            self.stream_timestamps[camera_id] = {
+                "monotonic_time": float(monotonic_time),
+                "unix_time": float(unix_time),
+            }
+
+    def stream_skew_seconds(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        with self.lock:
+            recent = [
+                item["monotonic_time"]
+                for item in self.stream_timestamps.values()
+                if 0.0 <= now - item["monotonic_time"] <= self.retention_seconds
+            ]
+        return max(recent) - min(recent) if len(recent) >= 2 else 0.0
+
+    def _geometry_allowed(self):
+        if not self.floor_map:
+            return False
+        if hasattr(self.floor_map, "geometry_fusion_allowed"):
+            return bool(self.floor_map.geometry_fusion_allowed)
+        return bool(getattr(self.floor_map, "config", {}).get("calibrated", False))
+
+    def _camera_geometry_allowed(self, camera_id):
+        if not self._geometry_allowed():
+            return False
+        checker = getattr(self.floor_map, "has_projection", None)
+        return bool(checker(camera_id)) if checker is not None else True
+
+    def _new_gallery(self):
+        config = self.mtmc_config["reid"]
+        return TrackFeatureGallery(
+            capacity=config["gallery_capacity"],
+            min_quality=config["min_sample_quality"],
+            duplicate_similarity=config["duplicate_similarity"],
+            top_k=config["top_k"],
+        )
 
     @staticmethod
     def similarity(first, second):
@@ -199,7 +280,16 @@ class CrossCameraTrackCoordinator:
         return float(np.dot(first, second) / denominator) if denominator > 1e-8 else -1.0
 
     def _is_overlap(self, position, camera_id=None, other_camera_id=None):
-        if not self.floor_map or not position:
+        if (
+            not self.floor_map
+            or not position
+            or not self._geometry_allowed()
+            or (camera_id is not None and not self._camera_geometry_allowed(camera_id))
+            or (
+                other_camera_id is not None
+                and not self._camera_geometry_allowed(other_camera_id)
+            )
+        ):
             return False
         for zone in self.floor_map.config.get("zones", []):
             if zone.get("kind") != "overlap":
@@ -243,7 +333,25 @@ class CrossCameraTrackCoordinator:
         maximum_gap = self._transition_gap(source_camera_id, target_camera_id)
         return maximum_gap is not None and age_seconds <= maximum_gap
 
-    def _new_global(self, now, camera_id, appearance, position):
+    def _record_event(self, event, **fields):
+        if self.event_store is not None:
+            if fields.get("unix_time") is None:
+                fields.pop("unix_time", None)
+            return self.event_store.record(event, **fields)
+        return None
+
+    def _new_global(
+        self,
+        now,
+        camera_id,
+        appearance,
+        position,
+        *,
+        gallery=None,
+        local_id=None,
+        unix_time=None,
+        confidence="low",
+    ):
         global_id = f"person_{self.next_id}"
         self.next_id += 1
         self.global_tracks[global_id] = {
@@ -251,9 +359,22 @@ class CrossCameraTrackCoordinator:
             "appearance": appearance,
             "position": position,
             "box": None,
+            "local_id": local_id,
             "last_seen": now,
             "in_overlap": self._is_overlap(position, camera_id),
         }
+        if gallery is not None:
+            self.global_galleries[global_id] = gallery
+        self._record_event(
+            "create",
+            global_id=global_id,
+            target_camera=camera_id,
+            target_local_id=local_id,
+            confidence=confidence,
+            monotonic_time=now,
+            unix_time=unix_time,
+            algorithm_version=ASSOCIATION_ALGORITHM,
+        )
         return global_id
 
     @staticmethod
@@ -327,7 +448,11 @@ class CrossCameraTrackCoordinator:
             ):
                 continue
             target_position = target.get("position")
-            if position and target_position:
+            if (
+                self._geometry_allowed()
+                and position
+                and target_position
+            ):
                 distance = math.hypot(
                     position["x"] - target_position["x"],
                     position["y"] - target_position["y"],
@@ -391,7 +516,11 @@ class CrossCameraTrackCoordinator:
         self, camera_id, appearance, position, now, exclude=None
     ):
         """Recover a late indoor track from one recent entrance confirmation."""
-        if appearance is None or position is None:
+        if (
+            appearance is None
+            or position is None
+            or not self._geometry_allowed()
+        ):
             return []
         active_here = {
             global_id
@@ -403,14 +532,22 @@ class CrossCameraTrackCoordinator:
             return []
 
         eligible = []
+        entrance_cameras = {
+            item
+            for item, role in self.camera_roles.items()
+            if role in {"entrance", "entrance_identity"}
+        }
+        if not entrance_cameras:
+            entrance_cameras = {"cam_entrance"}  # legacy configuration fallback
         for global_id, record in self.global_identities.items():
-            if global_id == exclude or record.get("camera_id") != "cam_entrance":
+            if global_id == exclude or record.get("camera_id") not in entrance_cameras:
                 continue
+            source_camera_id = record.get("camera_id")
             transition = next(
                 (
                     item
                     for item in self.transitions
-                    if item.get("from") == "cam_entrance"
+                    if item.get("from") == source_camera_id
                     and item.get("to") == camera_id
                 ),
                 None,
@@ -471,8 +608,12 @@ class CrossCameraTrackCoordinator:
             <= self.identity_retention_seconds
         )
 
-    def _merge(self, first_id, second_id):
-        keep_id, remove_id = sorted((first_id, second_id), key=self._number)
+    def _merge(self, first_id, second_id, prefer=None, unix_time=None):
+        if prefer in (first_id, second_id):
+            keep_id = prefer
+            remove_id = second_id if prefer == first_id else first_id
+        else:
+            keep_id, remove_id = sorted((first_id, second_id), key=self._number)
         if keep_id == remove_id:
             return keep_id
         keep_identity = self.global_identities.get(keep_id)
@@ -498,6 +639,29 @@ class CrossCameraTrackCoordinator:
         for key, bound_id in list(self.local_bindings.items()):
             if bound_id == remove_id:
                 self.local_bindings[key] = keep_id
+        keep_gallery = self.global_galleries.get(keep_id)
+        remove_gallery = self.global_galleries.pop(remove_id, None)
+        if keep_gallery is None and remove_gallery is not None:
+            self.global_galleries[keep_id] = remove_gallery
+        elif keep_gallery is not None and remove_gallery is not None:
+            keep_gallery.merge(remove_gallery)
+        self.redirects[remove_id] = keep_id
+        self.pending.pop(remove_id, None)
+        self._record_event(
+            "merge",
+            global_id=keep_id,
+            source_global_id=remove_id,
+            target_global_id=keep_id,
+            unix_time=unix_time,
+            algorithm_version=ASSOCIATION_ALGORITHM,
+        )
+        self._record_event(
+            "redirect",
+            global_id=remove_id,
+            redirect_to=keep_id,
+            unix_time=unix_time,
+            algorithm_version=ASSOCIATION_ALGORITHM,
+        )
         return keep_id
 
     def merge_global_ids(self, global_ids):
@@ -534,16 +698,13 @@ class CrossCameraTrackCoordinator:
             if lock_owner and lock_owner != global_id:
                 owner_record = self.global_identities.get(lock_owner)
                 if self._identity_is_active(owner_record, now):
-                    if camera_id != "cam_entrance":
-                        return None
-                    # Entrance is the authoritative face camera. If another
-                    # view already owns this registered person, fold the new
-                    # entrance track into that global target instead of
-                    # publishing a second anonymous person on the floor map.
-                    merged_id = self._merge(lock_owner, global_id)
-                    if merged_id is None:
-                        return None
-                    global_id = merged_id
+                    # A face result is not sufficient evidence to merge two
+                    # simultaneously active bodies. Occlusion can put another
+                    # worker's face crop on the wrong ByteTrack box; merging
+                    # here would then label every involved local track as the
+                    # same registered person. Cross-camera continuity must be
+                    # established by the spatial/Re-ID coordinator first.
+                    return None
                 else:
                     self._release_identity(lock_owner)
 
@@ -609,6 +770,305 @@ class CrossCameraTrackCoordinator:
                 }
             )
             return result
+
+    def update_batch(
+        self,
+        camera_id,
+        tracks,
+        frame,
+        *,
+        active_local_ids=None,
+        monotonic_time=None,
+        unix_time=None,
+        stream_skew_seconds=0.0,
+    ):
+        """Associate one camera frame as a deterministic, one-to-one batch.
+
+        The worker calls this once per inference result. Feature extraction and
+        gallery admission happen per local track, while all newly observed
+        tracks share one Hungarian assignment against the same target snapshot.
+        """
+        monotonic_time = (
+            time.monotonic() if monotonic_time is None else float(monotonic_time)
+        )
+        unix_time = time.time() if unix_time is None else float(unix_time)
+        active_local_ids = {
+            int(item)
+            for item in (
+                active_local_ids
+                if active_local_ids is not None
+                else [track["track_id"] for track in tracks]
+            )
+        }
+        prepared = []
+        for track in tracks:
+            local_id = int(track["track_id"])
+            box = tuple(track["box"])
+            key = (camera_id, local_id)
+            gallery = self.local_galleries.setdefault(key, self._new_gallery())
+            cached = self.local_features.get(key)
+            if cached is None or monotonic_time - cached[1] >= self.feature_refresh_seconds:
+                quality = BodyQualityScorer.assess(frame, box)
+                appearance = self.feature_extractor.extract(frame, box)
+                if appearance is not None:
+                    gallery.add(
+                        appearance,
+                        monotonic_time=monotonic_time,
+                        unix_time=unix_time,
+                        quality=quality["score"],
+                        camera_id=camera_id,
+                        quality_details=quality,
+                    )
+                    representative = gallery.representative
+                    # Preserve the historical single-vector contract even if
+                    # the sample was below the gallery quality threshold.
+                    self.local_features[key] = (
+                        representative if representative is not None else appearance,
+                        monotonic_time,
+                    )
+            appearance = gallery.representative
+            if appearance is None and self.local_features.get(key):
+                appearance = self.local_features[key][0]
+            position = track.get("position")
+            direction = track.get("direction")
+            previous_motion = self.local_motion.get(key)
+            if direction is None and position is not None and previous_motion is not None:
+                previous_position, previous_at = previous_motion
+                elapsed = monotonic_time - previous_at
+                if elapsed > 1e-6:
+                    direction = (
+                        (position["x"] - previous_position["x"]) / elapsed,
+                        (position["y"] - previous_position["y"]) / elapsed,
+                    )
+            if position is not None:
+                self.local_motion[key] = (dict(position), monotonic_time)
+            prepared.append(
+                {
+                    "local_id": local_id,
+                    "box": box,
+                    "position": position,
+                    "direction": direction,
+                    "gallery": gallery,
+                    "appearance": appearance,
+                }
+            )
+        prepared.sort(key=lambda item: (str(camera_id), int(item["local_id"])))
+
+        with self.lock:
+            self.active_local_ids_by_camera[camera_id] = set(active_local_ids)
+            for global_id, target in list(self.global_tracks.items()):
+                if monotonic_time - target["last_seen"] > self.retention_seconds:
+                    self.global_tracks.pop(global_id, None)
+                    self.global_galleries.pop(global_id, None)
+                    self.pending.pop(global_id, None)
+                    self._record_event(
+                        "expire",
+                        global_id=global_id,
+                        unix_time=unix_time,
+                        algorithm_version=ASSOCIATION_ALGORITHM,
+                    )
+            for global_id, record in list(self.global_identities.items()):
+                if not self._identity_is_active(record, monotonic_time):
+                    self._release_identity(global_id)
+            for temporary_id, pending in list(self.pending.items()):
+                if monotonic_time > pending["expires_at"]:
+                    self.pending.pop(temporary_id, None)
+            batch_window = self.mtmc_config["association"]["window_seconds"]
+            for reserved_id, reserved_at in list(self.association_reservations.items()):
+                if monotonic_time - reserved_at > batch_window:
+                    self.association_reservations.pop(reserved_id, None)
+
+            active_by_global = defaultdict(set)
+            for (bound_camera, local_id), global_id in self.local_bindings.items():
+                if local_id in self.active_local_ids_by_camera.get(bound_camera, set()):
+                    active_by_global[global_id].add(bound_camera)
+
+            observations = []
+            observation_by_key = {}
+            existing_results = {}
+            for item in prepared:
+                key = (camera_id, item["local_id"])
+                bound_id = self.local_bindings.get(key)
+                if bound_id in self.redirects:
+                    bound_id = self.redirects[bound_id]
+                    self.local_bindings[key] = bound_id
+                observation = AssociationObservation(
+                    camera_id=camera_id,
+                    local_id=item["local_id"],
+                    monotonic_time=monotonic_time,
+                    gallery=item["gallery"],
+                    appearance=item["appearance"],
+                    position=item["position"],
+                    direction=item["direction"],
+                    geometry_trusted=self._camera_geometry_allowed(camera_id),
+                )
+                observations.append(observation)
+                observation_by_key[(camera_id, item["local_id"])] = item
+
+            targets = []
+            for global_id, target in self.global_tracks.items():
+                if global_id in self.association_reservations:
+                    continue
+                targets.append(
+                    AssociationTarget(
+                        global_id=global_id,
+                        camera_id=target["camera_id"],
+                        last_seen=target["last_seen"],
+                        gallery=self.global_galleries.get(global_id),
+                        appearance=target.get("appearance"),
+                        position=target.get("position"),
+                        direction=target.get("direction"),
+                        active_camera_ids=active_by_global.get(global_id, set()),
+                        person_id=(
+                            self.global_identities.get(global_id, {})
+                            .get("identity", {})
+                            .get("person_id")
+                        ),
+                        geometry_trusted=self._camera_geometry_allowed(target["camera_id"]),
+                        source_local_id=target.get("local_id"),
+                    )
+                )
+            decisions, evaluations = self.batch_associator.associate(
+                observations,
+                targets,
+                stream_skew_seconds=stream_skew_seconds,
+            )
+            for evaluation in evaluations:
+                self._record_event(
+                    "associate",
+                    **evaluation,
+                    accepted=False,
+                    confidence="low",
+                    unix_time=unix_time,
+                )
+
+            decision_by_local = {item["local_id"]: item for item in decisions}
+            results = dict(existing_results)
+            for observation in observations:
+                item = observation_by_key[(camera_id, observation.local_id)]
+                key = (camera_id, observation.local_id)
+                decision = decision_by_local[observation.local_id]
+                previous_id = self.local_bindings.get(key)
+                candidate_id = decision.get("candidate_global_id")
+                if decision.get("accepted") and candidate_id in self.global_tracks:
+                    global_id = candidate_id
+                    if previous_id in self.global_tracks and previous_id != candidate_id:
+                        merged_id = self._merge(
+                            previous_id,
+                            candidate_id,
+                            unix_time=unix_time,
+                        )
+                        if merged_id is not None:
+                            global_id = merged_id
+                        else:
+                            global_id = previous_id
+                            decision = {
+                                **decision,
+                                "accepted": False,
+                                "confidence": "low",
+                                "reason": "different_known_identities_never_merge",
+                            }
+                    if decision.get("accepted"):
+                        self.association_reservations[global_id] = monotonic_time
+                elif decision.get("confidence") == "medium" and candidate_id:
+                    if previous_id in self.global_tracks:
+                        global_id = previous_id
+                    else:
+                        global_gallery = self._new_gallery()
+                        global_gallery.merge(item["gallery"])
+                        global_id = self._new_global(
+                            monotonic_time,
+                            camera_id,
+                            item["appearance"],
+                            item["position"],
+                            gallery=global_gallery,
+                            local_id=observation.local_id,
+                            unix_time=unix_time,
+                            confidence="medium",
+                        )
+                    self.pending[global_id] = {
+                        "candidate_global_id": candidate_id,
+                        "expires_at": monotonic_time
+                        + self.mtmc_config["association"]["pending_ttl_seconds"],
+                        "last_score": decision.get("final_score"),
+                    }
+                elif previous_id in self.global_tracks:
+                    global_id = previous_id
+                else:
+                    global_gallery = self._new_gallery()
+                    global_gallery.merge(item["gallery"])
+                    global_id = self._new_global(
+                        monotonic_time,
+                        camera_id,
+                        item["appearance"],
+                        item["position"],
+                        gallery=global_gallery,
+                        local_id=observation.local_id,
+                        unix_time=unix_time,
+                        confidence="low",
+                    )
+                self.local_bindings[key] = global_id
+                results[observation.local_id] = global_id
+                recorded = {**decision, "global_id": global_id}
+                self.recent_associations.append(recorded)
+                self._record_event("associate", **recorded, unix_time=unix_time)
+
+            for item in prepared:
+                global_id = results[item["local_id"]]
+                target = self.global_tracks[global_id]
+                global_gallery = self.global_galleries.setdefault(global_id, self._new_gallery())
+                global_gallery.merge(item["gallery"])
+                appearance = global_gallery.representative
+                if appearance is None:
+                    appearance = item["appearance"]
+                target.update(
+                    {
+                        "camera_id": camera_id,
+                        "appearance": appearance,
+                        "position": item["position"],
+                        "box": item["box"],
+                        "local_id": item["local_id"],
+                        "direction": item["direction"],
+                        "last_seen": monotonic_time,
+                        "in_overlap": self._is_overlap(item["position"], camera_id),
+                    }
+                )
+            return results
+
+    def track_diagnostics(self, camera_id, local_id):
+        key = (camera_id, int(local_id))
+        with self.lock:
+            global_id = self.local_bindings.get(key)
+            gallery = self.local_galleries.get(key)
+            recent = next(
+                (
+                    item
+                    for item in reversed(self.recent_associations)
+                    if item.get("camera_id") == camera_id
+                    and int(item.get("local_id", -1)) == int(local_id)
+                ),
+                None,
+            )
+            return {
+                "global_id": global_id,
+                "gallery": gallery.snapshot() if gallery is not None else self._new_gallery().snapshot(),
+                "confidence": (recent or {}).get("confidence", "existing"),
+                "final_match_score": (recent or {}).get("final_score"),
+                "pending": global_id in self.pending,
+            }
+
+    def diagnostics(self):
+        with self.lock:
+            return {
+                "algorithm_version": self.mtmc_config["algorithm_version"],
+                "association_algorithm": ASSOCIATION_ALGORITHM,
+                "active_global_tracks": len(self.global_tracks),
+                "pending_associations": len(self.pending),
+                "batch_window_reservations": len(self.association_reservations),
+                "redirects": dict(self.redirects),
+                "recent_associations": list(self.recent_associations)[-30:],
+                "event_summary": self.event_store.summary() if self.event_store else None,
+            }
 
     def update(
         self,
@@ -745,6 +1205,9 @@ class CrossCameraTrackCoordinator:
             for key in [key for key in self.local_bindings if key[0] == camera_id]:
                 self.local_bindings.pop(key, None)
                 self.local_features.pop(key, None)
+                self.local_galleries.pop(key, None)
+                self.local_motion.pop(key, None)
+            self.active_local_ids_by_camera.pop(camera_id, None)
 
     def forget_local(self, camera_id, local_id):
         """Release one camera-local binding without disturbing its peers."""
@@ -752,3 +1215,5 @@ class CrossCameraTrackCoordinator:
         with self.lock:
             self.local_bindings.pop(key, None)
             self.local_features.pop(key, None)
+            self.local_galleries.pop(key, None)
+            self.local_motion.pop(key, None)

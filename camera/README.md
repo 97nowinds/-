@@ -141,3 +141,138 @@ ssh -N -i "$env:USERPROFILE\.ssh\lab_rtsp_ed25519" `
 ```
 
 观察端不直接连接摄像头，也不运行推理模型。
+
+## MTMC 2.0 数据流
+
+```text
+RTSP host_receive 时间戳
+  -> YOLOv8n 人员检测
+  -> 每路独立 ByteTrack 本地轨迹
+  -> 质量门控的 ResNet50-IBN 轨迹 gallery
+  -> 短窗口候选收集与硬约束过滤
+  -> 匈牙利一对一关联
+  -> high 继承 / medium pending / low 匿名
+  -> 全局 ID 事件、平面图与兼容 API
+
+cam_entrance ArcFace 注册身份
+  -> 身份单所有者锁
+  -> 已允许方向的跨摄交接
+  -> 迟到证据 merge/redirect
+```
+
+算法参数集中在 `config/mtmc.json`。启动时会校验阈值顺序、范围、权重和事件路径；最终生效值及 `mtmc-2.0.0` 算法版本可从 `/api/state` 的 `processing.effective_mtmc_config` 查看。入口语义来自 `config/cameras.json` 的 `role`，通用关联代码不硬编码入口摄像头 ID。
+
+## 标定状态
+
+`config/floor_map.json` 使用三态 `calibration.status`：
+
+- `uncalibrated`：没有可用的统一地面映射。只使用人员类别、摄像头有向拓扑、时间窗和 ReID。
+- `approximate`：允许显示近似位置，但地图距离和重叠区不能成为高置信度合并依据。
+- `formal`：现场控制点验收完成后，才允许统一地面坐标的严格距离门控和双摄位置融合。
+
+当前配置为 `approximate`：`cam_1`、`cam_2` 是近似单应性，`cam_entrance` 是固定入口锚点；SLAM 为 relative 且没有 ArUco marker。因此当前地图只能用于操作提示，不能证明两个人是同一人。入口画面多人同时出现时不会把固定锚点复制给每个人。每路状态的 `localization` 字段公开定位模式、标定状态、几何融合许可、最近质量和降级原因；明显流间偏差也会关闭几何融合。
+
+正式标定时，应为三路摄像头各采集至少四个不共线地面控制点，填写归一化图像点和同一实验室坐标系的米制地图点，检查重投影误差，再把状态改为 `formal`。若使用 SLAM 锚定，还必须给 `slam.markers` 填入现场 ArUco ID 与对应 `map_point`，不能用虚构坐标。
+
+## 轨迹级 ReID gallery
+
+每条 `(camera_id, local_track_id)` 维护有界 gallery。样本包含 2048 维 L2 归一化特征、帧时间、图像质量、质量分项和摄像头 ID；原始向量不会进入状态 API、事件日志或部署包。质量综合人体框面积、边界裁剪、清晰度、亮度和人体长宽比，低于阈值的帧被拒绝。近重复视角会去重，超容量时按质量与视角差异共同淘汰。跨轨迹比较使用质量加权 top-k 相似度；`appearance` 单向量仍保留作旧接口和空 gallery 回退。
+
+状态中的每条 `yolo_tracks` 会公开 `reid_gallery.gallery_size`、有效/拒绝/重复样本数、最后更新时间、关联置信度和最终分数，但不返回 embedding。
+
+## 批量关联与置信度
+
+每次 YOLO 推理结果作为一个批次处理。关联器先检查 person 类别、有向摄像头拓扑、最大通行时间、过期候选和同时出现冲突，再融合 gallery ReID、时间差、正式标定时的地图距离和可用运动方向。三摄像头规模使用确定性的匈牙利算法完成一对一分配，输入列表或线程先后不改变同一批次的结果。
+
+- `high`：分数、ReID 和唯一性 margin 均达标，允许继承已有 global ID。
+- `medium`：建立临时匿名 ID 并进入 pending，等待后续 gallery 证据；不会强行显示为已知人员。
+- `low`：创建临时匿名 ID。
+
+不同已知人员永不自动合并，已注册身份继续使用单所有者锁。迟到高置信度证据可以产生 `merge` 和 `redirect`；redirect 表为未来人工 split/纠错保留了明确边界。
+
+## 时间戳与诊断
+
+OpenCV RTSP 当前无法可靠获得设备原始曝光时间，因此时间戳来源明确标记为 `host_receive`，不是 `camera_capture`。捕获线程记录 Unix 时间和单调时间；同一帧时间贯穿处理、SLAM、地图观察与跨摄关联。TTL、窗口和帧龄使用单调时钟，对外展示使用 Unix 时间。
+
+`/api/state` 每路摄像头包含捕获接收时间、推理开始/结束时间、状态发布时间、帧龄、推理耗时和估计流间偏差。流间偏差超过 `calibration.max_stream_skew_seconds` 时不允许高置信度空间融合，并在 `localization.degraded_reason` 说明原因。
+
+最近跨摄候选及结果可查询：
+
+```text
+GET /api/mtmc/events?limit=50
+```
+
+每个事件记录源/目标摄像头、本地轨迹、global ID、ReID/时间/几何/融合分数、采用或拒绝原因、置信度和算法版本。事件以追加 JSONL 保存在 `runtime/mtmc_events.jsonl`，默认保留 30 天并只恢复历史查询；服务重启绝不恢复已过期的实时轨迹。日志会过滤 embedding 等生物特征字段，也不写 RTSP 完整凭据。
+
+## 录制、标注与离线评测
+
+先从页面或 `/api/recording/start` 使用 `DatasetRecorder` 同步录制三路原始视频和 `*_timestamps.csv`。复制 `config/ground_truth.example.json` 后人工填写：
+
+### 完整路线人工交接标记
+
+观察页顶部的“开始录像”适合一次走完完整路线。输入匿名实验编号（例如 `worker_001`），开始录像后按计划依次经过入口、`cam_1` 和 `cam_2`，走出最后一路画面后停止录像。不要把姓名写入编号或备注。
+
+停止后点击顶部“路线复核”，也可以直接打开：
+
+```text
+http://127.0.0.1:5173/recordings?api=http://127.0.0.1:15000
+```
+
+在复核页选择录像会话，然后对每一次交接执行：
+
+1. 选择源摄像头和目标摄像头。
+2. 拖动源视频到人员最后仍可见的画面，逐帧微调后点击“使用源视频当前画面”。
+3. 拖动目标视频到人员首次可见的画面，点击“使用目标视频当前画面”。
+4. 填写同一个匿名真实人员 ID 并保存。
+5. 入口到 `cam_1`、入口到 `cam_2`、`cam_1` 到 `cam_2` 等交接分别保存；反向路线要另录或另标。
+
+后端先把播放器时间按该路录像 FPS 映射到准确帧号，再从对应 `*_timestamps.csv` 取得 `host_receive` Unix 时间，因此不同摄像头的启动偏差和采集间隔不会被误当成同一视频时间轴。结果保存在会话目录的 `manual_handoffs.json`，包含源末帧、目标首帧、两路 Unix 时间和真实 gap。页面按摄像头方向显示样本数、中位数和 P90；这些只是人工标定建议，单次样本不会自动修改线上 `max_transit_seconds`。建议每条方向至少采集 5 次正常步速，并另采慢速、遮挡和交叉场景后再调整配置。
+
+复核页只列出已经停止且状态为 `complete` 的录像；正在写入的视频不会开放复核。删除某条人工标记只删除 `manual_handoffs.json` 中对应记录，不删除原始录像。
+
+- `camera_id`；
+- `frame_index` 或 `unix_time`；
+- `local_detection.local_id` 与可选 `box`；
+- 真实 `person_id`；
+- `attributes` 中的 `occluded`、`registered`、`crowd_size`；
+- `handoffs` 中的人员、源/目标摄像头和交接时间区间。
+
+预测文件格式参考 `config/predictions.example.json`。运行：
+
+```powershell
+.\.venv\Scripts\python.exe .\mtmc_evaluate.py `
+  --session .\data\recordings\<subject>\<session> `
+  --ground-truth .\data\recordings\<subject>\<session>\ground_truth.json `
+  --predictions .\data\recordings\<subject>\<session>\predictions.json `
+  --output .\data\recordings\<subject>\<session>\mtmc_report
+```
+
+`--session` 会读取 `info.json` 和各路 `*_timestamps.csv`，校验标注帧确实存在，并把 recorder 的 host_receive 时间补入只有帧号的标注。输出机器可读 JSON 和人可读 Markdown，包含跨摄交接成功率、错误身份继承率、漏交接率、ID switches、IDF1，以及按摄像头对、人数、遮挡和注册状态分组的结果。本工具没有把自定义指标称为 HOTA；当前未固定并接入标准 HOTA 依赖。空标注会明确输出“尚无真实评测数据”，不会生成虚假成绩。
+
+## 当前已知限制
+
+- 当前地图不是正式标定，入口也没有逐像素映射，几何仅供显示。
+- ArUco marker 列表为空，relative SLAM 只能从近似单应性建立参考，不能提升到正式标定。
+- `host_receive` 能衡量主机接收偏差，不能替代摄像头硬件同步或设备时间戳。
+- 相似实验服、长时间完全遮挡和跨摄盲区仍可能使目标保持匿名或产生 ID switch；策略优先避免错误认人。
+- 事件只持久化关联历史，不持久化实时 tracker 状态；服务重启后会创建新的实时轨迹。
+- 尚无现场人工 ground truth，因此不能声称真实准确率已经提升。
+
+## 现场验收清单
+
+按顺序录像、标注并运行评测，每项同时检查画面、地图、`/api/state` 和 `/api/mtmc/events`：
+
+1. 单人从入口到 `cam_1`。
+2. 单人从入口到 `cam_2`。
+3. `cam_1` 与 `cam_2` 双向交接。
+4. 两人同时进入。
+5. 两人交叉。
+6. 两人穿相似实验服。
+7. 短时遮挡后恢复。
+8. 长时离开后重新进入。
+9. 摄像头断流并自动重连。
+10. 服务重启，确认历史事件可查但实时轨迹不恢复。
+11. 未注册人员始终保持匿名。
+12. 人脸不可见时只依赖保守 ReID，不继承已知身份。
+13. 将地图置为 `uncalibrated` 或使标定失效，确认几何融合关闭。
+14. 人为制造明显 RTSP 延迟不一致，确认流间偏差告警且几何融合降级。

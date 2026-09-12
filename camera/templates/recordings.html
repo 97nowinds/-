@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>完整路线录像复核</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="app-shell route-review-shell">
+      <header class="topbar">
+        <div>
+          <h1>完整路线录像复核</h1>
+          <p>分别定位源摄像头最后可见帧和目标摄像头第一可见帧，保存人工交接时间</p>
+        </div>
+        <div class="topbar-actions">
+          <a id="monitorLink" class="tool-link" href="/">返回监控</a>
+          <span id="reviewServiceState" class="service-state">连接中</span>
+        </div>
+      </header>
+
+      <section class="review-toolbar">
+        <label>
+          <span>录像会话</span>
+          <select id="recordingSessionSelect"><option value="">正在加载…</option></select>
+        </label>
+        <div class="review-toolbar-actions">
+          <button id="restartVideosButton" class="secondary-button" type="button">三路回到开头</button>
+          <button id="pauseVideosButton" class="secondary-button" type="button">全部暂停</button>
+        </div>
+      </section>
+
+      <p id="reviewError" class="recording-error" role="alert" hidden></p>
+      <section id="recordedVideoGrid" class="recorded-video-grid"></section>
+
+      <section class="handoff-editor">
+        <header>
+          <div>
+            <h2>人工标记一次交接</h2>
+            <span>先拖动对应视频到准确画面，再分别捕获两个时间点</span>
+          </div>
+        </header>
+        <form id="handoffForm">
+          <div class="handoff-fields">
+            <label class="recording-field">
+              <span>真实人员 ID</span>
+              <input id="handoffPersonId" required maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,39}" placeholder="worker_001">
+            </label>
+            <label class="recording-field">
+              <span>源摄像头</span>
+              <select id="handoffSourceCamera" required></select>
+            </label>
+            <label class="recording-field">
+              <span>目标摄像头</span>
+              <select id="handoffTargetCamera" required></select>
+            </label>
+          </div>
+
+          <div class="handoff-marker-grid">
+            <article>
+              <span>① 源摄像头最后可见画面</span>
+              <strong id="sourceMarkerValue">尚未标记</strong>
+              <button id="captureSourceButton" type="button">使用源视频当前画面</button>
+            </article>
+            <article>
+              <span>② 目标摄像头第一可见画面</span>
+              <strong id="targetMarkerValue">尚未标记</strong>
+              <button id="captureTargetButton" type="button">使用目标视频当前画面</button>
+            </article>
+          </div>
+
+          <label class="recording-field">
+            <span>备注</span>
+            <textarea id="handoffNotes" maxlength="300" rows="2" placeholder="例如主通道正常步速，目标第一帧有轻微遮挡"></textarea>
+          </label>
+          <div class="handoff-save-row">
+            <span id="handoffGapPreview">等待两个时间点</span>
+            <button id="saveHandoffButton" class="recording-start-button" type="submit">保存人工交接</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="handoff-results">
+        <header>
+          <div><h2>已保存的人工交接</h2><span>不会自动修改线上配置</span></div>
+        </header>
+        <div id="handoffSuggestions" class="handoff-suggestions"></div>
+        <div id="handoffList" class="handoff-list"><span class="empty">尚无标注</span></div>
+      </section>
+    </main>
+    <script src="/static/recordings.js"></script>
+  </body>
+</html>

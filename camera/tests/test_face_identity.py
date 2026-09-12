@@ -1,7 +1,10 @@
 import tempfile
+import threading
 import unittest
 import json
+from collections import defaultdict, deque
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -52,6 +55,54 @@ class FaceIdentityResultTests(unittest.TestCase):
 
             self.assertFalse(result["known"])
             self.assertEqual(result["reason"], "arcface_unavailable")
+
+    def test_track_cache_resets_when_face_changes_abruptly(self):
+        store = FaceIdentityStore.__new__(FaceIdentityStore)
+        store.lock = threading.RLock()
+        store.models = {"available": object()}
+        store.capture_policy = SimpleNamespace(
+            assess=lambda face: {"accepted": True}
+        )
+        store.modern = SimpleNamespace(available=True, engine="ArcFace")
+        store.modern_features = {
+            "p1": np.asarray([1.0, 0.0], dtype=np.float32),
+            "p2": np.asarray([0.0, 1.0], dtype=np.float32),
+        }
+        store.people = {
+            "p1": {"name": "first", "label": 1, "sample_count": 5},
+            "p2": {"name": "second", "label": 2, "sample_count": 5},
+        }
+        store.query_features = defaultdict(lambda: deque(maxlen=5))
+        track_key = ("cam_entrance", 7)
+
+        first = store.predict(
+            np.zeros((112, 112), dtype=np.uint8),
+            track_key=track_key,
+            query_embedding=np.asarray([1.0, 0.0], dtype=np.float32),
+        )
+        second = store.predict(
+            np.zeros((112, 112), dtype=np.uint8),
+            track_key=track_key,
+            query_embedding=np.asarray([0.0, 1.0], dtype=np.float32),
+        )
+
+        self.assertEqual(first["person_id"], "p1")
+        self.assertEqual(second["person_id"], "p2")
+        self.assertEqual(len(store.query_features[track_key]), 1)
+
+    def test_forget_camera_removes_only_that_cameras_face_cache(self):
+        store = FaceIdentityStore.__new__(FaceIdentityStore)
+        store.lock = threading.RLock()
+        store.query_features = defaultdict(lambda: deque(maxlen=5))
+        store.query_features[("cam_1", 1)].append(np.ones(2))
+        store.query_features[("cam_2", 1)].append(np.ones(2))
+
+        store.forget_track(("cam_1", 1))
+        self.assertNotIn(("cam_1", 1), store.query_features)
+        self.assertIn(("cam_2", 1), store.query_features)
+
+        store.forget_camera("cam_2")
+        self.assertFalse(store.query_features)
 
 
 class FaceCapturePolicyTests(unittest.TestCase):

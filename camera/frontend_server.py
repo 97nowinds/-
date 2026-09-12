@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parent
 TEMPLATE = ROOT / "templates" / "index.html"
 ANNOTATE_TEMPLATE = ROOT / "templates" / "annotate.html"
 FACES_TEMPLATE = ROOT / "templates" / "faces.html"
+RECORDINGS_TEMPLATE = ROOT / "templates" / "recordings.html"
 STATIC = ROOT / "static"
 
 
@@ -30,6 +31,9 @@ class FrontendHandler(SimpleHTTPRequestHandler):
             return
         if route == "/faces":
             self._send_html(FACES_TEMPLATE)
+            return
+        if route == "/recordings":
+            self._send_html(RECORDINGS_TEMPLATE)
             return
         if route.startswith("/static/"):
             relative = route.removeprefix("/static/")

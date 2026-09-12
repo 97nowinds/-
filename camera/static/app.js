@@ -11,6 +11,26 @@ const floorMapPeopleLayer = document.querySelector("#floorMapPeople");
 const floorMapMode = document.querySelector("#floorMapMode");
 const floorMapCount = document.querySelector("#floorMapCount");
 const floorMapPeopleList = document.querySelector("#floorMapPeopleList");
+const recordingControlButton = document.querySelector("#recordingControlButton");
+const recordingControlLabel = document.querySelector("#recordingControlLabel");
+const recordingDialog = document.querySelector("#recordingDialog");
+const recordingForm = document.querySelector("#recordingForm");
+const recordingCloseButton = document.querySelector("#recordingCloseButton");
+const recordingCancelButton = document.querySelector("#recordingCancelButton");
+const recordingStartButton = document.querySelector("#recordingStartButton");
+const recordingStopButton = document.querySelector("#recordingStopButton");
+const recordingSubjectId = document.querySelector("#recordingSubjectId");
+const recordingNotes = document.querySelector("#recordingNotes");
+const recordingBanner = document.querySelector("#recordingBanner");
+const recordingStatusTitle = document.querySelector("#recordingStatusTitle");
+const recordingStatusDetail = document.querySelector("#recordingStatusDetail");
+const recordingElapsed = document.querySelector("#recordingElapsed");
+const recordingCameraList = document.querySelector("#recordingCameraList");
+const recordingSessionDetails = document.querySelector("#recordingSessionDetails");
+const recordingSessionId = document.querySelector("#recordingSessionId");
+const recordingDirectory = document.querySelector("#recordingDirectory");
+const recordingFrameCount = document.querySelector("#recordingFrameCount");
+const recordingError = document.querySelector("#recordingError");
 const API_BASE = (
   window.__LAB_API_BASE__ ||
   new URLSearchParams(location.search).get("api") ||
@@ -20,12 +40,154 @@ const faceCaptureLink = document.querySelector("#faceCaptureLink");
 if (faceCaptureLink) faceCaptureLink.href = `/faces?api=${encodeURIComponent(API_BASE)}`;
 const calibrationLink = document.querySelector("#calibrationLink");
 if (calibrationLink) calibrationLink.href = `/annotate?api=${encodeURIComponent(API_BASE)}`;
+const recordingReviewLink = document.querySelector("#recordingReviewLink");
+if (recordingReviewLink) recordingReviewLink.href = `/recordings?api=${encodeURIComponent(API_BASE)}`;
 const remoteStream = location.hostname.startsWith("100.") ||
   new URLSearchParams(location.search).get("remote") === "1";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const FLOOR_VIEWBOX = {width: 1200, height: 700};
 const floorTrails = new Map();
 let floorMapSignature = "";
+let latestRecording = null;
+let latestCameras = [];
+let recordingMutationPending = false;
+
+function formatElapsed(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor(total % 3600 / 60);
+  const remainder = total % 60;
+  const base = `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+  return hours ? `${String(hours).padStart(2, "0")}:${base}` : base;
+}
+
+function recordingFrames(recording) {
+  return Object.values(recording?.streams || {}).reduce(
+    (total, stream) => total + Number(stream?.frames || 0),
+    0,
+  );
+}
+
+function showRecordingError(message = "") {
+  recordingError.textContent = message;
+  recordingError.hidden = !message;
+}
+
+function renderRecording(recording, cameras) {
+  latestRecording = recording || {active: false};
+  latestCameras = cameras || [];
+  const active = Boolean(latestRecording.active);
+  const allReady = latestCameras.length > 0 && latestCameras.every((camera) => camera.status === "running");
+
+  recordingControlButton.classList.toggle("active", active);
+  recordingControlLabel.textContent = active
+    ? `录像中 ${formatElapsed(latestRecording.elapsed_seconds)}`
+    : "录像";
+  recordingBanner.className = `recording-banner ${active ? "active" : allReady ? "ready" : "blocked"}`;
+  recordingStatusTitle.textContent = active
+    ? "正在同步录制"
+    : allReady
+      ? "摄像头已就绪"
+      : "录像条件未满足";
+  recordingStatusDetail.textContent = active
+    ? `${latestRecording.subject_id || "未命名"} · 三路原始画面与时间戳`
+    : allReady
+      ? "填写录像编号后即可开始"
+      : "所有已配置摄像头必须处于 running 状态";
+  recordingElapsed.textContent = formatElapsed(latestRecording.elapsed_seconds);
+
+  recordingCameraList.innerHTML = latestCameras.length
+    ? latestCameras.map((camera) => `
+      <div class="recording-camera-row">
+        <span class="recording-camera-indicator ${escapeHtml(camera.status)}"></span>
+        <strong>${escapeHtml(camera.id)}</strong>
+        <span>${escapeHtml(camera.status)}</span>
+        <span>${escapeHtml(camera.capture_fps || 0)} FPS</span>
+      </div>
+    `).join("")
+    : `<span class="empty">尚未取得摄像头状态</span>`;
+
+  recordingSessionDetails.hidden = !latestRecording.session_id;
+  recordingSessionId.textContent = latestRecording.session_id || "—";
+  recordingDirectory.textContent = latestRecording.directory || "—";
+  recordingFrameCount.textContent = `${recordingFrames(latestRecording)} 帧`;
+  recordingSubjectId.disabled = active || recordingMutationPending;
+  recordingNotes.disabled = active || recordingMutationPending;
+  recordingStartButton.hidden = active;
+  recordingStartButton.disabled = !allReady || recordingMutationPending;
+  recordingStopButton.hidden = !active;
+  recordingStopButton.disabled = recordingMutationPending;
+  recordingCancelButton.textContent = active ? "后台录制" : "关闭";
+}
+
+async function recordingRequest(path, options = {}) {
+  const response = await fetch(`${API_BASE}${path}`, {
+    cache: "no-store",
+    headers: {"Content-Type": "application/json", ...(options.headers || {})},
+    ...options,
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || `录像接口返回 ${response.status}`);
+  return payload;
+}
+
+function openRecordingDialog() {
+  showRecordingError();
+  renderRecording(latestRecording, latestCameras);
+  if (!recordingDialog.open) recordingDialog.showModal();
+  if (!latestRecording?.active) recordingSubjectId.focus();
+}
+
+function closeRecordingDialog() {
+  if (recordingDialog.open) recordingDialog.close();
+}
+
+recordingControlButton.addEventListener("click", openRecordingDialog);
+recordingCloseButton.addEventListener("click", closeRecordingDialog);
+recordingCancelButton.addEventListener("click", closeRecordingDialog);
+recordingDialog.addEventListener("click", (event) => {
+  if (event.target === recordingDialog) closeRecordingDialog();
+});
+
+recordingForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!recordingForm.reportValidity() || recordingMutationPending) return;
+  recordingMutationPending = true;
+  showRecordingError();
+  renderRecording(latestRecording, latestCameras);
+  try {
+    latestRecording = await recordingRequest("/api/recording/start", {
+      method: "POST",
+      body: JSON.stringify({
+        subject_id: recordingSubjectId.value.trim(),
+        notes: recordingNotes.value.trim(),
+      }),
+    });
+  } catch (error) {
+    showRecordingError(error.message);
+  } finally {
+    recordingMutationPending = false;
+    renderRecording(latestRecording, latestCameras);
+  }
+});
+
+recordingStopButton.addEventListener("click", async () => {
+  if (recordingMutationPending || !latestRecording?.active) return;
+  recordingMutationPending = true;
+  showRecordingError();
+  renderRecording(latestRecording, latestCameras);
+  try {
+    latestRecording = await recordingRequest("/api/recording/stop", {
+      method: "POST",
+      body: "{}",
+    });
+  } catch (error) {
+    showRecordingError(error.message);
+  } finally {
+    recordingMutationPending = false;
+    renderRecording(latestRecording, latestCameras);
+  }
+});
 
 function floorMapLabel(item) {
   if (item?.id === "secondary_aisle") return "副通道";
@@ -247,21 +409,6 @@ function modeText(camera) {
     : "本摄像头人脸确认";
 }
 
-function interactionText(camera) {
-  const interaction = camera.interaction;
-  if (!interaction?.configured) return "";
-  if (interaction.error) return "交互识别异常";
-  const active = interaction.current_interactions || [];
-  if (active.length) {
-    const item = active[0];
-    const person = item.person_name || item.person_id || "人员";
-    return `${person} 正在操作 ${item.instrument_name || item.instrument_id}`;
-  }
-  if (["warming_up", "analyzing"].includes(interaction.status)) return "交互识别预热中";
-  if (interaction.status === "error") return "交互识别异常";
-  return "未确认仪器交互";
-}
-
 function renderPeopleList(people) {
   peopleList.innerHTML = people.length
     ? people.map((person) => `
@@ -289,7 +436,6 @@ function renderInitial(state) {
       <footer>
         <strong class="camera-identity">${escapeHtml(identityText(camera.identity))}</strong>
         <span class="camera-mode">${escapeHtml(modeText(camera))}</span>
-        <span class="camera-interaction">${escapeHtml(interactionText(camera))}</span>
         <span class="camera-fps">${escapeHtml(camera.fps)} FPS</span>
       </footer>
     </article>
@@ -311,6 +457,7 @@ function update(state) {
     ? `${handoff.identity.handoff_from_camera} → ${handoff.id} · ${identityText(handoff.identity)}`
     : "等待重叠区继承";
   renderFloorMap(state.floor_map);
+  renderRecording(state.recording, state.cameras);
 
   for (const camera of state.cameras) {
     const card = document.querySelector(`[data-camera-id="${CSS.escape(camera.id)}"]`);
@@ -320,8 +467,6 @@ function update(state) {
     badge.className = `camera-badge ${camera.status}`;
     card.querySelector(".camera-identity").textContent = identityText(camera.identity);
     card.querySelector(".camera-mode").textContent = modeText(camera);
-    const interaction = card.querySelector(".camera-interaction");
-    if (interaction) interaction.textContent = interactionText(camera);
     const latency = camera.processing_latency_ms == null ? "-" : camera.processing_latency_ms;
     card.querySelector(".camera-fps").textContent = `采 ${camera.capture_fps || 0}/处 ${camera.fps || 0} FPS · ${latency}ms · 丢 ${camera.dropped_frames || 0}`;
   }

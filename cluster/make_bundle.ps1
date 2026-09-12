@@ -12,7 +12,9 @@ try {
     New-Item -ItemType Directory -Force -Path $staging | Out-Null
     $cameraSource = Join-Path $root "camera"
     $cameraDestination = Join-Path $staging "camera"
-    $excludedTopLevel = @(".venv", ".venv-interaction", "__pycache__", "runtime")
+    # Runtime data may contain recordings, registered faces or association
+    # history. Deploy code and model weights, never operational biometric data.
+    $excludedTopLevel = @(".venv", "__pycache__", "runtime", "data", "plugins")
     New-Item -ItemType Directory -Force -Path $cameraDestination | Out-Null
     Get-ChildItem -LiteralPath $cameraSource -Force |
         Where-Object { $_.Name -notin $excludedTopLevel } |
@@ -25,9 +27,12 @@ try {
         Copy-Item -LiteralPath $linuxMtx -Destination (Join-Path $staging "tools\mediamtx") -Force
     }
     Get-ChildItem -LiteralPath $staging -Recurse -Directory -Force |
-        Where-Object { $_.Name -in @(".venv", ".venv-interaction", "__pycache__", "runtime", "cache", "outputs") } |
+        Where-Object { $_.Name -in @(".venv", "__pycache__", "runtime", "cache", "outputs", "known_faces", "recordings") } |
         Sort-Object FullName -Descending |
         Remove-Item -Recurse -Force
+    Get-ChildItem -LiteralPath $staging -Recurse -File -Force |
+        Where-Object { $_.Extension -in @(".log", ".jsonl", ".bak", ".tmp") } |
+        Remove-Item -Force
     Remove-Item -LiteralPath $Output -Force -ErrorAction SilentlyContinue
     $paths = @(
         (Join-Path $staging "camera"),

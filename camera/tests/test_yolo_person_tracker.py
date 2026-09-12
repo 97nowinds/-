@@ -114,6 +114,21 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
             ],
         }
 
+    class ValidatedOverlapFloorMap:
+        config = {
+            "calibrated": False,
+            "calibration": {"status": "approximate"},
+            "zones": [],
+            "camera_transitions": [
+                {
+                    "from": "cam_entrance",
+                    "to": "cam_1",
+                    "max_gap_seconds": 20,
+                    "simultaneous_overlap_validated": True,
+                }
+            ],
+        }
+
     class SpatialTransitionFloorMap:
         config = {
             "calibrated": True,
@@ -132,6 +147,93 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
 
     def coordinator(self, floor_map, **kwargs):
         return CrossCameraTrackCoordinator(FakeFeatureExtractor(), floor_map, **kwargs)
+
+    def test_batch_update_is_one_to_one_and_order_independent(self):
+        floor_map = self.TransitionFloorMap()
+
+        def run(reverse=False):
+            coordinator = self.coordinator(floor_map)
+            frame = np.zeros((100, 160, 3), dtype=np.uint8)
+            frame[20:80, 10:50] = (20, 80, 180)
+            frame[20:80, 100:140] = (180, 80, 20)
+            source = [
+                {"track_id": 1, "box": (10, 20, 40, 60), "position": None},
+                {"track_id": 2, "box": (100, 20, 40, 60), "position": None},
+            ]
+            first = coordinator.update_batch(
+                "cam_entrance",
+                list(reversed(source)) if reverse else source,
+                frame,
+                monotonic_time=1.0,
+                unix_time=100.0,
+            )
+            coordinator.update_batch(
+                "cam_entrance",
+                [],
+                frame,
+                active_local_ids=set(),
+                monotonic_time=1.1,
+                unix_time=100.1,
+            )
+            target = [
+                {"track_id": 8, "box": (100, 20, 40, 60), "position": None},
+                {"track_id": 7, "box": (10, 20, 40, 60), "position": None},
+            ]
+            second = coordinator.update_batch(
+                "cam_1",
+                list(reversed(target)) if reverse else target,
+                frame,
+                monotonic_time=1.2,
+                unix_time=100.2,
+            )
+            return first, second
+
+        normal = run(False)
+        reversed_order = run(True)
+
+        self.assertEqual(normal, reversed_order)
+        self.assertEqual(normal[0][1], normal[1][7])
+        self.assertEqual(normal[0][2], normal[1][8])
+        self.assertEqual(len(set(normal[1].values())), 2)
+
+    def test_existing_anonymous_track_merges_after_source_disappears(self):
+        coordinator = self.coordinator(self.TransitionFloorMap())
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        frame[20:80, 30:70] = (20, 80, 180)
+        track = [{"track_id": 1, "box": (30, 20, 40, 60), "position": None}]
+        source = coordinator.update_batch(
+            "cam_entrance", track, frame, monotonic_time=1.0, unix_time=100.0
+        )[1]
+        simultaneous = coordinator.update_batch(
+            "cam_1", track, frame, monotonic_time=1.1, unix_time=100.1
+        )[1]
+
+        self.assertNotEqual(simultaneous, source)
+        coordinator.update_batch(
+            "cam_entrance", [], frame, active_local_ids=set(), monotonic_time=1.2, unix_time=100.2
+        )
+        merged = coordinator.update_batch(
+            "cam_1", track, frame, monotonic_time=2.0, unix_time=101.0
+        )[1]
+
+        self.assertEqual(merged, source)
+        self.assertEqual(coordinator.redirects[simultaneous], source)
+
+    def test_validated_simultaneous_overlap_preserves_oldest_global_id(self):
+        coordinator = self.coordinator(self.ValidatedOverlapFloorMap())
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        frame[20:80, 30:70] = (20, 80, 180)
+        track = [{"track_id": 1, "box": (30, 20, 40, 60), "position": None}]
+        oldest = coordinator.update_batch(
+            "cam_entrance", track, frame, monotonic_time=1.0, unix_time=100.0
+        )[1]
+
+        simultaneous = coordinator.update_batch(
+            "cam_1", track, frame, monotonic_time=1.1, unix_time=100.1
+        )[1]
+
+        self.assertEqual(simultaneous, oldest)
+        self.assertNotIn(oldest, coordinator.redirects)
 
     def test_same_appearance_in_overlap_keeps_global_id(self):
         coordinator = self.coordinator(self.FloorMap(), similarity_threshold=0.70)
@@ -341,7 +443,7 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         self.assertEqual(coordinator.person_locks["p1"], first)
         self.assertNotIn(second, coordinator.global_identities)
 
-    def test_entrance_face_confirmation_merges_existing_person_lock(self):
+    def test_entrance_face_conflict_does_not_merge_active_people(self):
         coordinator = self.coordinator(self.UncalibratedFloorMap())
         indoor = coordinator._new_global(1, "cam_1", None, {"x": 9.5, "y": 4.5})
         entrance = coordinator._new_global(
@@ -358,10 +460,29 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
             now=2,
         )
 
-        self.assertIsNotNone(confirmed)
-        self.assertEqual(confirmed["global_track_id"], indoor)
+        self.assertIsNone(confirmed)
         self.assertEqual(coordinator.person_locks["p1"], indoor)
-        self.assertNotIn(entrance, coordinator.global_tracks)
+        self.assertIn(entrance, coordinator.global_tracks)
+        self.assertNotIn(entrance, coordinator.global_identities)
+
+    def test_three_entrance_tracks_cannot_share_one_registered_identity(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        tracks = [
+            coordinator._new_global(1, "cam_entrance", None, None)
+            for _ in range(3)
+        ]
+        identity = {"known": True, "person_id": "p1", "name": "worker"}
+
+        results = [
+            coordinator.set_identity(track, identity, "cam_entrance", now=2)
+            for track in tracks
+        ]
+
+        self.assertIsNotNone(results[0])
+        self.assertIsNone(results[1])
+        self.assertIsNone(results[2])
+        self.assertEqual(coordinator.person_locks["p1"], tracks[0])
+        self.assertEqual(set(coordinator.global_tracks), set(tracks))
 
     def test_different_registered_people_are_never_merged(self):
         coordinator = self.coordinator(self.UncalibratedFloorMap())

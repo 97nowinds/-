@@ -12,11 +12,6 @@ tools/mediamtx/
 
 # Large model weights are deployed separately from source history
 person_track/weights/
-camera/plugins/instrument_interaction/models/
-camera/plugins/instrument_interaction/模块/models/
-camera/plugins/instrument_interaction/cache/
-camera/plugins/instrument_interaction/outputs/
-camera/.venv-interaction/
 camera/runtime/
 
 # Scheduler and runtime output

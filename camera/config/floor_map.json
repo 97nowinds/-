@@ -3,6 +3,11 @@
   "width_m": 12.0,
   "height_m": 7.0,
   "calibrated": false,
+  "calibration": {
+    "status": "approximate",
+    "geometry_fusion_allowed": false,
+    "reason": "cam_1/cam_2 use manually estimated homographies; entrance has only a fixed doorway anchor"
+  },
   "slam": {
     "enabled": true,
     "mode": "relative",
@@ -18,6 +23,8 @@
       "from": "cam_entrance",
       "to": "cam_1",
       "max_gap_seconds": 20,
+      "bidirectional": true,
+      "simultaneous_overlap_validated": true,
       "spatial_handoff_max_age_seconds": 3,
       "spatial_handoff_max_distance_m": 12.0,
       "spatial_handoff_similarity_threshold": 0.35
@@ -26,6 +33,8 @@
       "from": "cam_entrance",
       "to": "cam_2",
       "max_gap_seconds": 20,
+      "bidirectional": true,
+      "simultaneous_overlap_validated": true,
       "spatial_handoff_max_age_seconds": 3,
       "spatial_handoff_max_distance_m": 2.5,
       "spatial_handoff_similarity_threshold": 0.35
@@ -34,7 +43,8 @@
       "from": "cam_1",
       "to": "cam_2",
       "max_gap_seconds": 8,
-      "bidirectional": true
+      "bidirectional": true,
+      "simultaneous_overlap_validated": true
     }
   ],
   "zones": [
@@ -141,6 +151,7 @@
   "cameras": {
     "cam_1": {
       "label": "Cam1",
+      "localization_mode": "approximate_homography",
       "position": [
         11.75,
         0.25
@@ -202,6 +213,7 @@
     },
     "cam_2": {
       "label": "Cam2",
+      "localization_mode": "approximate_homography",
       "position": [
         0.25,
         6.75
@@ -263,6 +275,7 @@
     },
     "cam_entrance": {
       "label": "Entrance",
+      "localization_mode": "fixed_anchor",
       "position": [
         11.75,
         6.6

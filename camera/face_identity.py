@@ -9,6 +9,11 @@ import cv2
 import numpy as np
 
 
+ARCFACE_SIMILARITY_THRESHOLD = 0.55
+ARCFACE_MIN_MARGIN = 0.12
+ARCFACE_QUERY_CONTINUITY_THRESHOLD = 0.65
+
+
 class ModernFaceEngine:
     """Optional SCRFD + ArcFace/ResNet50 backend from local ONNX models.
 
@@ -421,7 +426,18 @@ class FaceIdentityStore:
                     if norm > 1e-8:
                         self.modern_features[person_id] = mean / norm
                 if sface_features:
-                    self.sface_features[person_id] = sface_features
+                        self.sface_features[person_id] = sface_features
+
+    def forget_track(self, track_key):
+        """Discard temporal face fusion when a ByteTrack identity disappears."""
+        with self.lock:
+            self.query_features.pop(track_key, None)
+
+    def forget_camera(self, camera_id):
+        """Discard all temporal face fusion state after a camera reconnect."""
+        with self.lock:
+            for key in [key for key in self.query_features if key[0] == camera_id]:
+                self.query_features.pop(key, None)
 
     @staticmethod
     def normalize(face_gray):
@@ -534,6 +550,16 @@ class FaceIdentityStore:
                 if query is not None:
                     if track_key is not None:
                         history = self.query_features[track_key]
+                        if history:
+                            centroid = np.mean(np.asarray(history), axis=0)
+                            centroid_norm = float(np.linalg.norm(centroid))
+                            continuity = (
+                                float(np.dot(query, centroid / centroid_norm))
+                                if centroid_norm > 1e-8
+                                else -1.0
+                            )
+                            if continuity < ARCFACE_QUERY_CONTINUITY_THRESHOLD:
+                                history.clear()
                         history.append(query)
                         query = np.mean(np.asarray(history), axis=0)
                         norm = float(np.linalg.norm(query))
@@ -552,7 +578,10 @@ class FaceIdentityStore:
                     margin = score - second
                     # Open-set gate: low-quality/ambiguous faces remain
                     # unregistered instead of being forced to the top match.
-                    if score < 0.45 or margin < 0.08:
+                    if (
+                        score < ARCFACE_SIMILARITY_THRESHOLD
+                        or margin < ARCFACE_MIN_MARGIN
+                    ):
                         return self.unknown("未注册", 1.0 - score, margin, quality=quality)
                     return {
                         "known": True,

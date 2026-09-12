@@ -35,11 +35,11 @@ class IdentityHandoff:
                 "identity": dict(identity),
                 "camera_id": camera_id,
                 "appearance": appearance.copy() if appearance is not None else None,
-                "updated_at": time.time(),
+                "updated_at": time.monotonic(),
             }
 
     def inherit(self, camera_id, appearance):
-        now = time.time()
+        now = time.monotonic()
         with self.lock:
             candidates = []
             for person_id, observation in list(self.observations.items()):

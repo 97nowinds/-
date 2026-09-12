@@ -14,6 +14,11 @@
           <p>人脸确认 · 侧脸/背身持续跟踪 · 跨摄像头身份继承</p>
         </div>
         <div class="topbar-actions">
+          <button id="recordingControlButton" class="tool-link recording-launch" type="button">
+            <span class="recording-dot" aria-hidden="true"></span>
+            <span id="recordingControlLabel">录像</span>
+          </button>
+          <a id="recordingReviewLink" class="tool-link" href="/recordings">路线复核</a>
           <a id="faceCaptureLink" class="tool-link" href="/faces">人脸采集</a>
           <a id="calibrationLink" class="tool-link" href="/annotate">地图四点标定</a>
           <span id="serviceState" class="service-state">连接中</span>
@@ -71,6 +76,56 @@
         <div id="peopleList" class="people-list"></div>
       </section>
     </main>
+
+    <dialog id="recordingDialog" class="recording-dialog" aria-labelledby="recordingDialogTitle">
+      <form id="recordingForm" class="recording-form">
+        <header class="recording-dialog-header">
+          <div>
+            <span class="recording-eyebrow">DatasetRecorder</span>
+            <h2 id="recordingDialogTitle">多摄像头同步录像</h2>
+          </div>
+          <button id="recordingCloseButton" class="dialog-close" type="button" aria-label="关闭">×</button>
+        </header>
+
+        <div id="recordingBanner" class="recording-banner idle" role="status">
+          <span class="recording-status-dot" aria-hidden="true"></span>
+          <div>
+            <strong id="recordingStatusTitle">尚未开始录像</strong>
+            <span id="recordingStatusDetail">开始前会检查所有摄像头是否在线</span>
+          </div>
+          <time id="recordingElapsed">00:00</time>
+        </div>
+
+        <div id="recordingCameraList" class="recording-camera-list" aria-label="录像摄像头状态"></div>
+
+        <label class="recording-field">
+          <span>录像编号</span>
+          <input id="recordingSubjectId" name="subject_id" type="text" maxlength="40"
+            pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,39}" placeholder="例如 base_ent_cam1_01" required>
+          <small>仅允许字母、数字、下划线和短横线，作为录像目录名称。</small>
+        </label>
+
+        <label class="recording-field">
+          <span>路线与备注</span>
+          <textarea id="recordingNotes" name="notes" maxlength="300" rows="3"
+            placeholder="例如 worker_001，cam_entrance → cam_1，单人基准"></textarea>
+        </label>
+
+        <div id="recordingSessionDetails" class="recording-session-details" hidden>
+          <div><span>会话</span><strong id="recordingSessionId">—</strong></div>
+          <div><span>保存目录</span><strong id="recordingDirectory">—</strong></div>
+          <div><span>已写入</span><strong id="recordingFrameCount">0 帧</strong></div>
+        </div>
+
+        <p id="recordingError" class="recording-error" role="alert" hidden></p>
+
+        <footer class="recording-actions">
+          <button id="recordingCancelButton" class="secondary-button" type="button">关闭</button>
+          <button id="recordingStopButton" class="recording-stop-button" type="button" hidden>停止并保存</button>
+          <button id="recordingStartButton" class="recording-start-button" type="submit">开始三路录像</button>
+        </footer>
+      </form>
+    </dialog>
     <script src="/static/app.js"></script>
   </body>
 </html>

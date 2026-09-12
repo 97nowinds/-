@@ -13,6 +13,7 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn("/static/", source)
         self.assertIn("/annotate", source)
         self.assertIn("/faces", source)
+        self.assertIn("/recordings", source)
         self.assertNotIn("/api/", source)
         self.assertNotIn("VideoCapture", source)
 
@@ -95,11 +96,58 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertLess(entrance["yolo_frame_stride"], 5)
         self.assertGreater(entrance["track_hold_seconds"], 0.8)
 
+    def test_cam1_uses_replay_validated_small_person_detection_settings(self):
+        cameras = json.loads((ROOT / "config" / "cameras.json").read_text(encoding="utf-8"))
+        cam1 = next(camera for camera in cameras if camera["id"] == "cam_1")
+
+        self.assertLessEqual(cam1["yolo_confidence"], 0.3)
+        self.assertLessEqual(cam1["yolo_frame_stride"], 3)
+        self.assertGreaterEqual(cam1["yolo_image_size"], 768)
+
+    def test_recorded_route_transitions_allow_validated_bidirectional_overlap(self):
+        floor_map = json.loads((ROOT / "config" / "floor_map.json").read_text(encoding="utf-8"))
+        transitions = floor_map["camera_transitions"]
+
+        self.assertEqual(len(transitions), 3)
+        self.assertTrue(all(item["bidirectional"] for item in transitions))
+        self.assertTrue(all(item["simultaneous_overlap_validated"] for item in transitions))
+
     def test_state_reports_arcface_gallery_completion_counts(self):
         backend = (ROOT / "app.py").read_text(encoding="utf-8")
 
         self.assertIn('"arcface_gallery_required_features"', backend)
         self.assertIn('"arcface_gallery_feature_counts"', backend)
+
+    def test_monitoring_page_has_recording_dialog_and_api_controls(self):
+        template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="recordingControlButton"', template)
+        self.assertIn('id="recordingDialog"', template)
+        self.assertIn('id="recordingSubjectId"', template)
+        self.assertIn('id="recordingStopButton"', template)
+        self.assertIn('recordingRequest("/api/recording/start"', script)
+        self.assertIn('recordingRequest("/api/recording/stop"', script)
+        self.assertIn("renderRecording(state.recording, state.cameras)", script)
+
+    def test_route_recording_review_surface_exists(self):
+        template = (ROOT / "templates" / "recordings.html").read_text(encoding="utf-8")
+        script = (ROOT / "static" / "recordings.js").read_text(encoding="utf-8")
+        monitor = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        backend = (ROOT / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn('id="recordingReviewLink"', monitor)
+        self.assertIn('id="recordingSessionSelect"', template)
+        self.assertIn('id="recordedVideoGrid"', template)
+        self.assertIn('id="captureSourceButton"', template)
+        self.assertIn('id="captureTargetButton"', template)
+        self.assertIn('api("/api/recordings")', script)
+        self.assertIn('sessionPath("/handoffs")', script)
+        self.assertIn('data-step-frames="-1"', script)
+        self.assertIn('data-step-frames="1"', script)
+        self.assertIn("recorded-frame-review", script)
+        self.assertIn('sessionPath(`/frame/', script)
+        self.assertIn('"/api/recordings/<subject_id>/<session_id>/handoffs"', backend)
 
 
 if __name__ == "__main__":

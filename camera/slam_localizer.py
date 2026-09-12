@@ -38,7 +38,9 @@ class SlamLocalizer:
         self.map_from_reference = None
         self.last_transform = None
         self.last_seen_at = None
+        self.last_seen_monotonic = None
         self.last_update_at = None
+        self.last_update_monotonic = None
         self.last_inliers = 0
         self.last_matches = 0
         self.marker_count = 0
@@ -67,7 +69,9 @@ class SlamLocalizer:
             self.map_from_reference = None
             self.last_transform = None
             self.last_seen_at = None
+            self.last_seen_monotonic = None
             self.last_update_at = None
+            self.last_update_monotonic = None
             self.last_inliers = 0
             self.last_matches = 0
             self.marker_count = 0
@@ -139,10 +143,19 @@ class SlamLocalizer:
         self.last_transform = self.map_from_reference @ current_to_reference
         return True
 
-    def update(self, frame, baseline_transform=None):
-        now = time.time()
+    def update(
+        self,
+        frame,
+        baseline_transform=None,
+        *,
+        monotonic_time=None,
+        unix_time=None,
+    ):
+        now = time.monotonic() if monotonic_time is None else float(monotonic_time)
+        unix_time = time.time() if unix_time is None else float(unix_time)
         with self.lock:
-            self.last_update_at = now
+            self.last_update_at = unix_time
+            self.last_update_monotonic = now
             if not self.enabled:
                 self.status = "disabled"
                 return self.status_payload()
@@ -155,7 +168,8 @@ class SlamLocalizer:
             self.last_matches = 0
             if self._calibrate_from_markers(gray, marker_ids, centers):
                 self.status = "anchored"
-                self.last_seen_at = now
+                self.last_seen_at = unix_time
+                self.last_seen_monotonic = now
                 self.last_inliers = self.marker_count
                 return self.status_payload()
             if (
@@ -165,21 +179,24 @@ class SlamLocalizer:
                 and self._set_reference(gray, np.asarray(baseline_transform, dtype=np.float64))
             ):
                 self.status = "relative_reference"
-                self.last_seen_at = now
+                self.last_seen_at = unix_time
+                self.last_seen_monotonic = now
                 return self.status_payload()
             if self._track_from_reference(gray):
                 self.status = "tracking"
-                self.last_seen_at = now
+                self.last_seen_at = unix_time
+                self.last_seen_monotonic = now
                 return self.status_payload()
             self.status = "lost" if self.map_from_reference is not None else "awaiting_markers"
             return self.status_payload()
 
-    def project_pixel(self, point):
+    def project_pixel(self, point, monotonic_time=None):
+        now = time.monotonic() if monotonic_time is None else float(monotonic_time)
         with self.lock:
             if (
                 self.last_transform is None
-                or self.last_seen_at is None
-                or time.time() - self.last_seen_at > self.max_pose_age_seconds
+                or self.last_seen_monotonic is None
+                or now - self.last_seen_monotonic > self.max_pose_age_seconds
             ):
                 return None
             source = np.asarray([[point]], dtype=np.float32)
@@ -202,5 +219,20 @@ class SlamLocalizer:
                 "inliers": self.last_inliers,
                 "max_pose_age_seconds": self.max_pose_age_seconds,
                 "last_seen_at": self.last_seen_at,
+                "timestamp_source": "host_receive",
+                "localization_quality": (
+                    "high"
+                    if self.status == "anchored" and self.marker_count >= self.min_markers
+                    else "medium"
+                    if self.status == "tracking"
+                    else "low"
+                ),
+                "degraded_reason": (
+                    "aruco_marker_map_empty"
+                    if self.enabled and not self.marker_map
+                    else "pose_unavailable"
+                    if self.status in {"awaiting_markers", "lost"}
+                    else None
+                ),
                 "error": self.error,
             }

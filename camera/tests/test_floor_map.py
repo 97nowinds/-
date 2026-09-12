@@ -44,6 +44,25 @@ class FloorMapProjectorTests(unittest.TestCase):
         self.assertAlmostEqual(position["x"], 5.0, places=1)
         self.assertAlmostEqual(position["y"], 4.2, places=1)
 
+    def test_calibration_status_exposes_geometry_trust(self):
+        approximate_config = config()
+        approximate_config["calibrated"] = False
+        approximate_config["calibration"] = {
+            "status": "approximate",
+            "reason": "estimated control points",
+        }
+        approximate = FloorMapProjector(approximate_config)
+        formal = FloorMapProjector(config())
+
+        approximate_status = approximate.localization_status("cam_1")
+        formal_status = formal.localization_status("cam_1")
+
+        self.assertEqual(approximate_status["calibration_status"], "approximate")
+        self.assertFalse(approximate_status["geometry_fusion_allowed"])
+        self.assertIn("estimated control points", approximate_status["degraded_reason"])
+        self.assertEqual(formal_status["calibration_status"], "formal")
+        self.assertTrue(formal_status["geometry_fusion_allowed"])
+
     def test_overlap_zone_has_priority_over_large_room_zone(self):
         self.assertEqual(self.projector.zone_for(5, 3), "Overlap")
         self.assertEqual(self.projector.zone_for(2, 3), "Main")
@@ -70,6 +89,7 @@ class FloorMapProjectorTests(unittest.TestCase):
         self.assertIsNone(
             projector.project("cam_entrance", (20, 10, 30, 70), (100, 100, 3))
         )
+        self.assertFalse(projector.has_projection("cam_entrance"))
 
     def test_entrance_tracking_anchor_marks_person_at_door(self):
         floor_config = config()
@@ -185,7 +205,7 @@ class FloorMapProjectorTests(unittest.TestCase):
         self.assertGreater(smoothed["x"], 3.0)
         self.assertLess(smoothed["x"], 5.0)
 
-    def test_uncalibrated_dual_camera_target_is_one_point_in_overlap(self):
+    def test_uncalibrated_dual_camera_target_uses_one_real_observation(self):
         floor_config = config()
         floor_config["calibrated"] = False
         projector = FloorMapProjector(floor_config)
@@ -197,8 +217,73 @@ class FloorMapProjectorTests(unittest.TestCase):
         people = projector.state(observations, now=10)["people"]
 
         self.assertEqual(len(people), 1)
-        self.assertEqual(people[0]["cameras"], ["cam_1", "cam_2"])
-        self.assertEqual(people[0]["zone"], "Overlap")
+        self.assertEqual(people[0]["cameras"], ["cam_1"])
+        self.assertEqual((people[0]["x"], people[0]["y"]), (1.0, 1.0))
+        self.assertEqual(people[0]["zone"], "Main")
+
+    def test_duplicate_identity_in_one_camera_is_split_into_distinct_people(self):
+        observations = [
+            {
+                "camera_id": "cam_entrance",
+                "local_id": local_id,
+                "track_id": f"person_{local_id}",
+                "global_track_id": f"person_{local_id}",
+                "position": {"x": float(local_id), "y": 3.0},
+                "person_id": "employee_1",
+                "name": "worker",
+                "identity_source": "face",
+                "confidence": 0.9 - local_id * 0.01,
+                "observed_at": 10.0,
+            }
+            for local_id in (1, 2, 3)
+        ]
+
+        people = self.projector.state(observations, now=10.0)["people"]
+
+        self.assertEqual(len(people), 3)
+        self.assertEqual(sum(person["identified"] for person in people), 1)
+        self.assertEqual(len({person["track_id"] for person in people}), 3)
+
+    def test_calibrated_but_inconsistent_camera_positions_are_not_averaged(self):
+        observations = [
+            {
+                "camera_id": "cam_1",
+                "track_id": "person_1",
+                "person_id": "employee_1",
+                "identity_source": "face",
+                "position": {"x": 1.0, "y": 1.0},
+                "observed_at": 10.0,
+            },
+            {
+                "camera_id": "cam_2",
+                "track_id": "person_1",
+                "person_id": "employee_1",
+                "identity_source": "handoff",
+                "position": {"x": 9.0, "y": 5.0},
+                "observed_at": 10.0,
+            },
+        ]
+
+        person = self.projector.state(observations, now=10.0)["people"][0]
+
+        self.assertEqual(person["cameras"], ["cam_1"])
+        self.assertEqual((person["x"], person["y"]), (1.0, 1.0))
+
+    def test_uncalibrated_camera_handoff_resets_position_filter(self):
+        floor_config = config()
+        floor_config["calibrated"] = False
+        projector = FloorMapProjector(floor_config)
+        projector.state(
+            [{"camera_id": "cam_1", "track_id": "person_1", "position": {"x": 1, "y": 1}, "observed_at": 10}],
+            now=10,
+        )
+
+        person = projector.state(
+            [{"camera_id": "cam_2", "track_id": "person_1", "position": {"x": 9, "y": 5}, "observed_at": 10.2}],
+            now=10.2,
+        )["people"][0]
+
+        self.assertEqual((person["x"], person["y"]), (9.0, 5.0))
 
     def test_actual_camera_positions_match_the_reversed_layout(self):
         config_path = Path(__file__).resolve().parents[1] / "config" / "floor_map.json"
