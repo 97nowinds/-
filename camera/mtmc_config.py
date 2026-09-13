@@ -10,12 +10,15 @@ class MTMCConfigError(ValueError):
 
 
 DEFAULT_CONFIG = {
-    "algorithm_version": "mtmc-2.0.0",
+    "algorithm_version": "mtmc-2.0.4",
     "calibration": {
         "formal_required_for_geometry": True,
         "max_stream_skew_seconds": 0.5,
         "fusion_max_distance_m": 2.0,
         "observation_max_age_seconds": 2.0,
+        "max_map_speed_mps": 2.2,
+        "max_motion_gap_seconds": 0.25,
+        "map_position_hold_seconds": 8.0,
     },
     "reid": {
         "gallery_capacity": 12,
@@ -78,6 +81,9 @@ def validate_config(config):
         "calibration.max_stream_skew_seconds": (0.01, 10.0, False),
         "calibration.fusion_max_distance_m": (0.1, 50.0, False),
         "calibration.observation_max_age_seconds": (0.1, 30.0, False),
+        "calibration.max_map_speed_mps": (0.2, 10.0, False),
+        "calibration.max_motion_gap_seconds": (0.05, 2.0, False),
+        "calibration.map_position_hold_seconds": (0.0, 30.0, False),
         "reid.gallery_capacity": (1, 100, True),
         "reid.min_sample_quality": (0.0, 1.0, False),
         "reid.duplicate_similarity": (0.0, 1.0, False),

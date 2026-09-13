@@ -92,6 +92,11 @@ export OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;${LAB_RTSP_TRANSPORT}|stime
 export LAB_FACE_ENGINE="arcface"
 export LAB_FACE_DATA_DIR="${LAB_FACE_DATA_DIR:-$PROJECT_ROOT/camera/data}"
 export LAB_RECORDINGS_DIR="${LAB_RECORDINGS_DIR:-$PROJECT_ROOT/camera/data/recordings}"
+export LAB_FLOOR_MAP_PATH="${LAB_FLOOR_MAP_PATH:-$PROJECT_ROOT/camera/config/floor_map.json}"
+if [[ ! -f "$LAB_FLOOR_MAP_PATH" ]]; then
+    echo "Persistent floor map config not found: $LAB_FLOOR_MAP_PATH" >&2
+    exit 2
+fi
 mkdir -p "$LAB_FACE_DATA_DIR/known_faces"
 mkdir -p "$LAB_RECORDINGS_DIR"
 export LAB_APP_HOST="0.0.0.0"

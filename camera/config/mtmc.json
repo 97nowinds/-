@@ -1,10 +1,13 @@
 {
-  "algorithm_version": "mtmc-2.0.0",
+  "algorithm_version": "mtmc-2.0.4",
   "calibration": {
     "formal_required_for_geometry": true,
     "max_stream_skew_seconds": 0.5,
     "fusion_max_distance_m": 2.0,
-    "observation_max_age_seconds": 2.0
+    "observation_max_age_seconds": 2.0,
+    "max_map_speed_mps": 2.2,
+    "max_motion_gap_seconds": 0.25,
+    "map_position_hold_seconds": 8.0
   },
   "reid": {
     "gallery_capacity": 12,

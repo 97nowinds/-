@@ -2,12 +2,18 @@
   "name": "实验室实时位置图",
   "width_m": 12.0,
   "height_m": 7.0,
+  "projection_domain_margin_normalized": 0.03,
   "calibrated": false,
   "calibration": {
     "status": "approximate",
     "geometry_fusion_allowed": false,
-    "reason": "cam_1/cam_2 use manually estimated homographies; entrance has only a fixed doorway anchor"
+    "reason": "all three cameras use operator-selected approximate homographies; formal survey validation is pending"
   },
+  "tracking_allowed_zone_ids": [
+    "secondary_aisle",
+    "rear_service",
+    "main_aisle"
+  ],
   "slam": {
     "enabled": true,
     "mode": "relative",
@@ -238,44 +244,44 @@
       ],
       "image_points": [
         [
-          0.77091,
-          0.47515
+          0.79704,
+          0.46981
         ],
         [
-          0.70182,
-          0.97293
+          0.65539,
+          0.61264
         ],
         [
-          0.54,
-          0.90828
+          0.5222,
+          0.97346
         ],
         [
-          0.67273,
-          0.54626
+          0.71459,
+          0.98473
         ]
       ],
       "map_points": [
         [
-          10.748,
-          5.574
+          11.415,
+          5.576
         ],
         [
-          1.11,
-          5.645
+          9.494,
+          4.327
         ],
         [
-          3.13,
-          4.373
+          4.817,
+          4.327
         ],
         [
-          8.906,
-          4.408
+          6.32,
+          5.867
         ]
       ]
     },
     "cam_entrance": {
       "label": "Entrance",
-      "localization_mode": "fixed_anchor",
+      "localization_mode": "approximate_homography",
       "position": [
         11.75,
         6.6
@@ -297,6 +303,18 @@
           11.7,
           4.6
         ]
+      ],
+      "image_points": [
+        [0.55742, 0.50351],
+        [0.72345, 0.53289],
+        [0.55817, 0.96294],
+        [0.74073, 0.97629]
+      ],
+      "map_points": [
+        [9.849, 1.767],
+        [11.349, 1.672],
+        [9.777, 4.168],
+        [11.111, 4.263]
       ]
     }
   },
@@ -304,10 +322,24 @@
     "cam_2": {
       "regions": {
         "main_aisle": {
-          "x": 0.47636,
-          "y": 0.35556,
-          "width": 0.32727,
-          "height": 0.64444
+          "points": [
+            [
+              0.61311,
+              0.44726
+            ],
+            [
+              0.83721,
+              0.44726
+            ],
+            [
+              0.7315,
+              1.0
+            ],
+            [
+              0.5074,
+              1.0
+            ]
+          ]
         },
         "overlap": {
           "x": 0.56727,
@@ -318,38 +350,38 @@
       },
       "image_points": [
         [
-          0.77091,
-          0.47515
+          0.79704,
+          0.46981
         ],
         [
-          0.70182,
-          0.97293
+          0.65539,
+          0.61264
         ],
         [
-          0.54,
-          0.90828
+          0.5222,
+          0.97346
         ],
         [
-          0.67273,
-          0.54626
+          0.71459,
+          0.98473
         ]
       ],
       "map_points": [
         [
-          10.748,
-          5.574
+          11.415,
+          5.576
         ],
         [
-          1.11,
-          5.645
+          9.494,
+          4.327
         ],
         [
-          3.13,
-          4.373
+          4.817,
+          4.327
         ],
         [
-          8.906,
-          4.408
+          6.32,
+          5.867
         ]
       ]
     },
@@ -401,15 +433,25 @@
     },
     "cam_entrance": {
       "regions": {
-        "main_aisle": {
-          "x": 0.54545,
-          "y": 0.40216,
-          "width": 0.27061,
-          "height": 0.59784
+        "rear_service": {
+          "x": 0.54691,
+          "y": 0.47813,
+          "width": 0.19908,
+          "height": 0.50083
         }
       },
-      "image_points": [],
-      "map_points": []
+      "image_points": [
+        [0.55742, 0.50351],
+        [0.72345, 0.53289],
+        [0.55817, 0.96294],
+        [0.74073, 0.97629]
+      ],
+      "map_points": [
+        [9.849, 1.767],
+        [11.349, 1.672],
+        [9.777, 4.168],
+        [11.111, 4.263]
+      ]
     }
   }
 }

@@ -47,6 +47,7 @@ const remoteStream = location.hostname.startsWith("100.") ||
 const SVG_NS = "http://www.w3.org/2000/svg";
 const FLOOR_VIEWBOX = {width: 1200, height: 700};
 const floorTrails = new Map();
+const floorTrailLastSeen = new Map();
 let floorMapSignature = "";
 let latestRecording = null;
 let latestCameras = [];
@@ -336,13 +337,27 @@ function updateFloorTrails(floorMap) {
     activeIds.add(person.track_id);
     const history = floorTrails.get(person.track_id) || [];
     const last = history.at(-1);
+    const lastSeenAt = floorTrailLastSeen.get(person.track_id);
+    const breakBefore = Boolean(
+      last && lastSeenAt && now - lastSeenAt > 4500
+    );
     const moved = !last || Math.hypot(person.x - last.x, person.y - last.y) >= 0.08;
-    if (moved) history.push({x: person.x, y: person.y, at: now});
+    if (moved || breakBefore) {
+      history.push({
+        x: person.x,
+        y: person.y,
+        at: now,
+        source: person.position_source_camera,
+        breakBefore,
+      });
+    }
+    floorTrailLastSeen.set(person.track_id, now);
     floorTrails.set(person.track_id, history.filter((point) => now - point.at < 30000).slice(-30));
   }
   for (const [trackId, history] of floorTrails) {
     if (!activeIds.has(trackId) && (!history.length || now - history.at(-1).at > 10000)) {
       floorTrails.delete(trackId);
+      floorTrailLastSeen.delete(trackId);
     }
   }
 }
@@ -359,21 +374,33 @@ function renderFloorMap(floorMap) {
 
   for (const [trackId, history] of floorTrails) {
     if (history.length < 2) continue;
-    const points = history.map((point) => {
-      const mapped = mapPoint(floorMap, [point.x, point.y]);
-      return `${mapped.x},${mapped.y}`;
-    }).join(" ");
     const active = floorMap.people.find((person) => person.track_id === trackId);
-    floorMapTrailsLayer.appendChild(createSvg("polyline", {
-      points,
-      class: `map-trail ${active?.identified ? "identified" : "unknown"}`,
-    }));
+    const segments = [];
+    let segment = [];
+    for (const point of history) {
+      if (point.breakBefore && segment.length) {
+        segments.push(segment);
+        segment = [];
+      }
+      segment.push(point);
+    }
+    if (segment.length) segments.push(segment);
+    for (const pointsInSegment of segments.filter((points) => points.length >= 2)) {
+      const points = pointsInSegment.map((point) => {
+        const mapped = mapPoint(floorMap, [point.x, point.y]);
+        return `${mapped.x},${mapped.y}`;
+      }).join(" ");
+      floorMapTrailsLayer.appendChild(createSvg("polyline", {
+        points,
+        class: `map-trail ${active?.identified ? "identified" : "unknown"}`,
+      }));
+    }
   }
 
   for (const person of floorMap.people) {
     const point = mapPoint(floorMap, [person.x, person.y]);
     const group = createSvg("g", {
-      class: `map-person ${person.identified ? "identified" : "unknown"}`,
+      class: `map-person ${person.identified ? "identified" : "unknown"} ${person.position_estimated ? "held" : ""}`,
       transform: `translate(${point.x} ${point.y})`,
     });
     group.appendChild(createSvg("circle", {r: 42, class: "map-person-halo"}));
@@ -387,7 +414,7 @@ function renderFloorMap(floorMap) {
       <div class="floor-person-row">
         <span class="floor-person-indicator ${person.identified ? "identified" : "unknown"}"></span>
         <strong>${escapeHtml(personLabel(person))}</strong>
-        <span class="floor-person-location">${escapeHtml(["内侧通道", "后端操作区"].includes(person.zone) ? "侧向通道" : person.zone)} · ${escapeHtml(person.cameras.join(" + "))}</span>
+        <span class="floor-person-location">${escapeHtml(["内侧通道", "后端操作区"].includes(person.zone) ? "侧向通道" : person.zone)} · ${escapeHtml(person.cameras.join(" + "))}${person.position_estimated ? ` · 定位保持 ${Number(person.position_age_seconds || 0).toFixed(1)}s` : ""}</span>
         <span class="floor-person-lock ${person.identity_lock_status === "locked" ? "locked" : "visual"}">${person.identity_lock_status === "locked" ? "已锁定" : "视觉追踪"} · ${escapeHtml(person.global_track_id || person.track_id)}</span>
       </div>
     `).join("")

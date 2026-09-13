@@ -23,6 +23,9 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn('id="annotationCanvas"', template)
         self.assertIn("/api/annotation/config", script)
         self.assertIn("/api/annotation/save", script)
+        self.assertIn("completePoints(camera.image_points)", script)
+        self.assertIn("calibration_points_changed: state.referenceDirty", script)
+        self.assertIn("base_revision: state.revision", script)
 
     def test_main_aisle_uses_adjustable_parallelogram(self):
         template = (ROOT / "templates" / "annotate.html").read_text(encoding="utf-8")
@@ -52,6 +55,11 @@ class FrontendSeparationTests(unittest.TestCase):
         source = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
         self.assertIn("window.__LAB_API_BASE__", source)
         self.assertIn("server.api_base = args.api", source)
+
+    def test_cluster_service_uses_persistent_floor_map_config(self):
+        service = (ROOT.parent / "cluster" / "camera_service.slurm").read_text(encoding="utf-8")
+
+        self.assertIn('export LAB_FLOOR_MAP_PATH="${LAB_FLOOR_MAP_PATH:-$PROJECT_ROOT/camera/config/floor_map.json}"', service)
 
     def test_monitoring_page_exposes_fixed_calibration_entry(self):
         template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
@@ -117,6 +125,16 @@ class FrontendSeparationTests(unittest.TestCase):
 
         self.assertIn('"arcface_gallery_required_features"', backend)
         self.assertIn('"arcface_gallery_feature_counts"', backend)
+
+    def test_map_trail_stays_continuous_during_short_localization_hold(self):
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("floorTrailLastSeen", script)
+        self.assertIn("now - lastSeenAt > 4500", script)
+        self.assertNotIn("last.source !== person.position_source_camera", script)
+        self.assertIn("person.position_estimated", script)
+        self.assertIn("定位保持", script)
+        self.assertIn("breakBefore", script)
 
     def test_monitoring_page_has_recording_dialog_and_api_controls(self):
         template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")

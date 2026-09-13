@@ -14,7 +14,7 @@
   const pointStep = document.getElementById("pointStep");
   const pointList = document.getElementById("pointList");
   const status = document.getElementById("status");
-  const state = { config: null, annotations: {}, cameraId: null, draft: null, drag: null, pendingImage: null };
+  const state = { config: null, annotations: {}, cameraId: null, draft: null, drag: null, pendingImage: null, revision: null, referenceDirty: false };
   const colors = { main_aisle: "#4bb4ff", secondary_aisle: "#b18cff", rear_service: "#66d9ef", overlap: "#f0ae5a" };
 
   function setStatus(message, isError) {
@@ -23,14 +23,15 @@
   }
 
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
+  function completePoints(value) { return Array.isArray(value) && value.length === 4; }
 
   function emptyDraft(cameraId) {
     const camera = state.config.cameras[cameraId] || {};
     const saved = state.annotations[cameraId] || {};
     return {
       regions: clone(saved.regions || {}),
-      image_points: clone(saved.image_points || camera.image_points || []),
-      map_points: clone(saved.map_points || camera.map_points || []),
+      image_points: clone(completePoints(camera.image_points) ? camera.image_points : saved.image_points || []),
+      map_points: clone(completePoints(camera.map_points) ? camera.map_points : saved.map_points || []),
     };
   }
 
@@ -185,6 +186,7 @@
     state.cameraId = cameraId;
     state.draft = emptyDraft(cameraId);
     state.drag = null; state.pendingImage = null;
+    state.referenceDirty = false;
     canvas.classList.toggle("editing-polygon", modeSelect.value === "main_aisle" && Boolean(state.draft.regions.main_aisle));
     frame.src = `${API_BASE}/video/${encodeURIComponent(cameraId)}?remote=1`;
     document.getElementById("cameraTitle").textContent = state.config.cameras[cameraId].label || cameraId;
@@ -205,6 +207,7 @@
       if (state.pendingImage !== null) return;
       if (state.draft.image_points.length >= 4) { setStatus("四个画面点已完成；请清除当前标注后重来。", true); return; }
       state.draft.image_points.push([Number(point.x.toFixed(5)), Number(point.y.toFixed(5))]);
+      state.referenceDirty = true;
       state.pendingImage = state.draft.image_points.length - 1;
       setStatus(`已选择画面点 ${state.pendingImage + 1}，请在右侧地图点击对应位置。`, false);
       drawCanvas(); drawMap(); updateSteps();
@@ -261,6 +264,7 @@
     if (state.pendingImage === null || !state.draft) return;
     const point = mapCoordinate(event); const index = state.pendingImage;
     state.draft.map_points[index] = [Number((point.x / 1200 * state.config.width_m).toFixed(3)), Number((point.y / 700 * state.config.height_m).toFixed(3))];
+    state.referenceDirty = true;
     state.pendingImage = null;
     setStatus(`参考点 ${index + 1} 已配对，请继续点击画面设置下一个点。`, false); drawMap(); updateSteps();
   });
@@ -279,17 +283,22 @@
   window.addEventListener("resize", resizeCanvas);
   document.getElementById("clearButton").addEventListener("click", () => {
     if (!state.draft) return;
-    if (modeSelect.value === "reference") { state.draft.image_points = []; state.draft.map_points = []; state.pendingImage = null; }
+    if (modeSelect.value === "reference") { state.draft.image_points = []; state.draft.map_points = []; state.pendingImage = null; state.referenceDirty = true; }
     else delete state.draft.regions[modeSelect.value];
     setStatus("当前标注已清除。", false); drawCanvas(); drawMap(); updateSteps();
   });
   document.getElementById("saveButton").addEventListener("click", async () => {
     if (!state.draft || state.pendingImage !== null) { setStatus("请先完成当前参考点配对。", true); return; }
     try {
-      const response = await fetch(`${API_BASE}/api/annotation/save`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ camera_id: state.cameraId, regions: state.draft.regions, image_points: state.draft.image_points, map_points: state.draft.map_points, activate_calibration: document.getElementById("activateCalibration").checked }) });
+      const response = await fetch(`${API_BASE}/api/annotation/save`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ camera_id: state.cameraId, regions: state.draft.regions, image_points: state.draft.image_points, map_points: state.draft.map_points, calibration_points_changed: state.referenceDirty, base_revision: state.revision, activate_calibration: document.getElementById("activateCalibration").checked }) });
       if (response.status === 404) throw new Error("当前后端未加载标注保存接口，请重启后端启动器后再保存");
       const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || "保存失败");
-      state.annotations[state.cameraId] = clone(state.draft); setStatus(`${result.message} 当前摄像头：${state.cameraId}`, false);
+      state.annotations[state.cameraId] = clone(state.draft);
+      if (state.referenceDirty) {
+        state.config.cameras[state.cameraId].image_points = clone(state.draft.image_points);
+        state.config.cameras[state.cameraId].map_points = clone(state.draft.map_points);
+      }
+      state.referenceDirty = false; state.revision = result.revision; setStatus(`${result.message} 当前摄像头：${state.cameraId}`, false);
     } catch (error) { setStatus(error.message, true); }
   });
 
@@ -309,7 +318,7 @@
         state.annotations = {};
         setStatus("当前后端尚未重启：已用现有地图预览，保存前请重启后端。", false);
       } else {
-        state.config = await response.json(); state.annotations = state.config.annotations || {};
+        state.config = await response.json(); state.annotations = state.config.annotations || {}; state.revision = state.config.revision || null;
       }
       Object.entries(state.config.cameras || {}).forEach(([id, camera]) => cameraSelect.append(new Option(camera.label || id, id)));
       if (!cameraSelect.options.length) throw new Error("没有可用摄像头");

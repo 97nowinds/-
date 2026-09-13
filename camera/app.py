@@ -1,5 +1,6 @@
 import atexit
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -63,7 +64,9 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config" / "cameras.json"
-FLOOR_MAP_PATH = BASE_DIR / "config" / "floor_map.json"
+FLOOR_MAP_PATH = Path(
+    os.environ.get("LAB_FLOOR_MAP_PATH", BASE_DIR / "config" / "floor_map.json")
+).expanduser().resolve()
 MTMC_CONFIG_PATH = BASE_DIR / "config" / "mtmc.json"
 DATA_DIR = BASE_DIR / "data"
 FACE_DATA_DIR = Path(os.environ.get("LAB_FACE_DATA_DIR", DATA_DIR)).expanduser().resolve()
@@ -1773,6 +1776,21 @@ class CameraManager:
             for camera in cameras
             for observation in camera.get("map_observations", [])
         ]
+        active_tracks_by_id = {}
+        for camera in cameras:
+            for track in camera.get("yolo_tracks", []):
+                track_id = track.get("track_id")
+                if not track_id:
+                    continue
+                active = active_tracks_by_id.setdefault(
+                    str(track_id),
+                    {"track_id": str(track_id), "cameras": [], "observed_at": 0.0},
+                )
+                active["cameras"].append(camera["id"])
+                active["observed_at"] = max(
+                    active["observed_at"],
+                    float(camera.get("inference_ended_at") or camera.get("status_published_at") or time.time()),
+                )
         return {
             "cameras": cameras,
             "people": list(face_store.people.values()),
@@ -1820,6 +1838,10 @@ class CameraManager:
                 max_stream_skew_seconds=self.mtmc_config["calibration"]["max_stream_skew_seconds"],
                 observation_max_age_seconds=self.mtmc_config["calibration"]["observation_max_age_seconds"],
                 fusion_max_distance_m=self.mtmc_config["calibration"]["fusion_max_distance_m"],
+                max_map_speed_mps=self.mtmc_config["calibration"]["max_map_speed_mps"],
+                max_motion_gap_seconds=self.mtmc_config["calibration"]["max_motion_gap_seconds"],
+                active_tracks=list(active_tracks_by_id.values()),
+                map_position_hold_seconds=self.mtmc_config["calibration"]["map_position_hold_seconds"],
             ),
         }
 
@@ -2161,8 +2183,18 @@ def _validate_annotation_payload(payload, config):
             raise ValueError(f"{region_type} must stay inside the image")
         clean_regions[region_type] = values
 
-    image_points = payload.get("image_points") or []
-    map_points = payload.get("map_points") or []
+    raw_calibration_changed = payload.get("calibration_points_changed")
+    calibration_points_changed = (
+        bool(raw_calibration_changed)
+        if raw_calibration_changed is not None
+        else bool(payload.get("image_points") or payload.get("map_points"))
+    )
+    if calibration_points_changed:
+        image_points = payload.get("image_points") or []
+        map_points = payload.get("map_points") or []
+    else:
+        image_points = cameras[camera_id].get("image_points") or []
+        map_points = cameras[camera_id].get("map_points") or []
     if image_points or map_points:
         if len(image_points) != 4 or len(map_points) != 4:
             raise ValueError("image_points and map_points must both contain four points")
@@ -2192,6 +2224,7 @@ def _validate_annotation_payload(payload, config):
         "regions": clean_regions,
         "image_points": clean_image_points,
         "map_points": clean_map_points,
+        "calibration_points_changed": calibration_points_changed,
         "activate_calibration": bool(payload.get("activate_calibration", False)),
     }
 
@@ -2215,6 +2248,12 @@ def _save_floor_map_config(config):
     finally:
         if temporary_name and os.path.exists(temporary_name):
             os.unlink(temporary_name)
+
+
+def _floor_map_revision(content):
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    return hashlib.sha256(content).hexdigest()[:16]
 
 
 face_store = FaceIdentityStore(
@@ -2294,18 +2333,24 @@ def api_mtmc_events():
 @app.route("/api/annotation/config")
 def api_annotation_config():
     with ANNOTATION_LOCK:
-        config = json.loads(FLOOR_MAP_PATH.read_text(encoding="utf-8"))
+        content = FLOOR_MAP_PATH.read_text(encoding="utf-8")
+        config = json.loads(content)
     return jsonify(
         {
             "name": config.get("name", "实验室平面图"),
             "width_m": float(config.get("width_m", 0.0)),
             "height_m": float(config.get("height_m", 0.0)),
+            "projection_domain_margin_normalized": float(
+                config.get("projection_domain_margin_normalized", 0.03)
+            ),
             "calibrated": bool(config.get("calibrated", False)),
             "calibration": config.get("calibration", {}),
             "zones": config.get("zones", []),
             "fixtures": config.get("fixtures", []),
             "cameras": config.get("cameras", {}),
             "annotations": config.get("annotations", {}),
+            "revision": _floor_map_revision(content),
+            "persistent": bool(os.environ.get("LAB_FLOOR_MAP_PATH")),
         }
     )
 
@@ -2315,7 +2360,18 @@ def api_annotation_save():
     payload = request.get_json(silent=True) or {}
     try:
         with ANNOTATION_LOCK:
-            config = json.loads(FLOOR_MAP_PATH.read_text(encoding="utf-8"))
+            content = FLOOR_MAP_PATH.read_text(encoding="utf-8")
+            config = json.loads(content)
+            current_revision = _floor_map_revision(content)
+            base_revision = payload.get("base_revision")
+            if base_revision and base_revision != current_revision:
+                return jsonify(
+                    {
+                        "ok": False,
+                        "error": "地图配置已被其他页面或进程更新，请刷新后再保存",
+                        "revision": current_revision,
+                    }
+                ), 409
             annotation = _validate_annotation_payload(payload, config)
             camera_id = annotation["camera_id"]
             config.setdefault("annotations", {})[camera_id] = {
@@ -2323,7 +2379,7 @@ def api_annotation_save():
                 "image_points": annotation["image_points"],
                 "map_points": annotation["map_points"],
             }
-            if annotation["image_points"] and annotation["map_points"]:
+            if annotation["calibration_points_changed"]:
                 config["cameras"][camera_id]["image_points"] = annotation["image_points"]
                 config["cameras"][camera_id]["map_points"] = annotation["map_points"]
             if annotation["activate_calibration"]:
@@ -2341,6 +2397,9 @@ def api_annotation_save():
                 for camera in config.get("cameras", {}).values():
                     camera["localization_mode"] = "formal_homography"
             _save_floor_map_config(config)
+            saved_revision = _floor_map_revision(
+                FLOOR_MAP_PATH.read_text(encoding="utf-8")
+            )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         return jsonify({"ok": False, "error": str(error)}), 400
     return jsonify(
@@ -2351,6 +2410,7 @@ def api_annotation_save():
             "calibrated": bool(config.get("calibrated", False)),
             "calibration_status": config.get("calibration", {}).get("status", "uncalibrated"),
             "message": "标注已保存；重启后端后新的四点映射才会应用",
+            "revision": saved_revision,
         }
     )
 

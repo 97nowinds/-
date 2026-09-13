@@ -122,6 +122,8 @@ h2 { font-size: 16px; }
 .map-person-dot { fill: #58d492; stroke: #eafdf3; stroke-width: 5; }
 .map-person.unknown .map-person-halo { fill: rgba(240, 162, 90, 0.16); }
 .map-person.unknown .map-person-dot { fill: #f0a25a; stroke: #fff1e5; }
+.map-person.held .map-person-halo { fill: rgba(255, 205, 96, 0.10); stroke: #ffcd60; stroke-width: 3; stroke-dasharray: 10 8; }
+.map-person.held .map-person-dot { opacity: 0.72; }
 .map-person-label { fill: #f5f7f9; paint-order: stroke; stroke: #101317; stroke-width: 8; font-size: 34px; font-weight: 700; letter-spacing: 0; pointer-events: none; }
 .floor-map-legend { display: flex; flex-wrap: wrap; gap: 12px; padding: 9px 12px; border-top: 1px solid #2d343c; border-bottom: 1px solid #2d343c; color: #8f9aa5; font-size: 11px; }
 .floor-map-legend span { display: inline-flex; align-items: center; gap: 5px; }

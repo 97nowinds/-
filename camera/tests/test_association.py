@@ -46,6 +46,20 @@ class BatchAssociationTests(unittest.TestCase):
         self.assertEqual(len(assigned), 2)
         self.assertEqual(len(set(assigned)), 2)
 
+    def test_bidirectional_transition_accepts_both_camera_orders(self):
+        forward, _ = self.associator.associate(
+            [self.observation(10, [1, 0], camera="cam_2", now=2)],
+            [self.target("person_1", [1, 0], camera="cam_1", seen=1)],
+        )
+        reverse, _ = self.associator.associate(
+            [self.observation(10, [1, 0], camera="cam_1", now=2)],
+            [self.target("person_1", [1, 0], camera="cam_2", seen=1)],
+        )
+
+        self.assertTrue(forward[0]["accepted"])
+        self.assertTrue(reverse[0]["accepted"])
+        self.assertEqual(forward[0]["global_id"], reverse[0]["global_id"])
+
     def test_similar_clothing_stays_pending_when_margin_is_ambiguous(self):
         decisions, _ = self.associator.associate(
             [self.observation(10, [1, 0.01])],
