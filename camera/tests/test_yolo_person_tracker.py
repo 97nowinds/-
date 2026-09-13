@@ -360,6 +360,25 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         self.assertEqual(coordinator.local_bindings[("cam_1", 3)], merged)
         self.assertEqual(coordinator.local_bindings[("cam_2", 8)], merged)
 
+    def test_merge_rejects_two_active_owners_in_the_same_camera(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        first = coordinator._new_global(1, "cam_2", None, {"x": 2, "y": 5})
+        second = coordinator._new_global(1, "cam_2", None, {"x": 8, "y": 5})
+        coordinator.local_bindings[("cam_2", 11)] = first
+        coordinator.local_bindings[("cam_2", 12)] = second
+        coordinator.active_local_ids_by_camera["cam_2"] = {11, 12}
+
+        merged = coordinator._merge(first, second)
+
+        self.assertIsNone(merged)
+        self.assertEqual(
+            coordinator.last_merge_rejection_reason,
+            "active_same_camera_owner_conflict",
+        )
+        self.assertEqual(coordinator.local_bindings[("cam_2", 11)], first)
+        self.assertEqual(coordinator.local_bindings[("cam_2", 12)], second)
+        self.assertNotIn(second, coordinator.redirects)
+
     def test_directed_transition_rehydrates_entrance_identity_without_map_position(self):
         coordinator = self.coordinator(
             self.TransitionFloorMap(), ttl_seconds=2.0, similarity_threshold=0.70

@@ -52,6 +52,7 @@ class FloorMapProjector:
         self.tracking_zones = [zones_by_id[zone_id] for zone_id in self.tracking_allowed_zone_ids]
         self.transforms = {}
         self.image_domains = {}
+        self.tracking_image_regions = {}
         self._projection_status = {}
         self._kalman_filters = {}
         self._kalman_seen_at = {}
@@ -60,6 +61,10 @@ class FloorMapProjector:
         self._last_mapped_people = {}
         self._filter_lock = threading.RLock()
         for camera_id, camera in config.get("cameras", {}).items():
+            annotation = config.get("annotations", {}).get(camera_id, {})
+            self.tracking_image_regions[camera_id] = self._tracking_regions(
+                annotation.get("regions", {})
+            )
             image_value = camera.get("image_points")
             map_value = camera.get("map_points")
             if not image_value and not map_value:
@@ -84,6 +89,64 @@ class FloorMapProjector:
         if points.shape != (4, 2) or not np.isfinite(points).all():
             raise FloorMapError(f"{name} contains invalid coordinates")
         return points
+
+    @staticmethod
+    def _tracking_regions(regions):
+        """Return normalized polygons that are valid places for a person footpoint."""
+        polygons = []
+        if not isinstance(regions, dict):
+            return polygons
+        for region_type in ("main_aisle", "secondary_aisle", "rear_service"):
+            region = regions.get(region_type)
+            if not isinstance(region, dict):
+                continue
+            points = region.get("points")
+            if isinstance(points, list) and len(points) >= 3:
+                polygon = np.asarray(points, dtype=np.float32)
+            else:
+                try:
+                    x = float(region["x"])
+                    y = float(region["y"])
+                    width = float(region["width"])
+                    height = float(region["height"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                polygon = np.asarray(
+                    [[x, y], [x + width, y], [x + width, y + height], [x, y + height]],
+                    dtype=np.float32,
+                )
+            if polygon.ndim == 2 and polygon.shape[1] == 2 and np.isfinite(polygon).all():
+                polygons.append(polygon)
+        return polygons
+
+    def track_footpoint_allowed(self, camera_id, box, frame_shape):
+        """Reject tracks outside both the calibrated image domain and annotated aisles.
+
+        Cameras without either kind of image-space constraint remain unrestricted so
+        entrance-camera and older configurations keep their previous behaviour.
+        """
+        if box is None:
+            return False
+        frame_height, frame_width = frame_shape[:2]
+        if frame_width <= 0 or frame_height <= 0:
+            return False
+        x, y, width, height = box
+        footpoint = (
+            float(x + width * 0.5) / float(frame_width),
+            float(y + height) / float(frame_height),
+        )
+        domain = self.image_domains.get(camera_id)
+        if domain is not None:
+            distance = cv2.pointPolygonTest(domain, footpoint, True)
+            if distance < -self.projection_domain_margin:
+                return False
+        regions = self.tracking_image_regions.get(camera_id, [])
+        if regions and not any(
+            cv2.pointPolygonTest(region, footpoint, True) >= -self.projection_domain_margin
+            for region in regions
+        ):
+            return False
+        return True
 
     def project(self, camera_id, box, frame_shape):
         transform = self.transforms.get(camera_id)
@@ -636,6 +699,7 @@ class FloorMapProjector:
         )
         valid = []
         identity_owners = {}
+        visual_owners = {}
         for raw in observations:
             if not raw or raw.get("position") is None:
                 continue
@@ -652,6 +716,11 @@ class FloorMapProjector:
                 identity_owners.setdefault(
                     (observation.get("camera_id"), person_id), []
                 ).append(observation)
+            visual_id = observation.get("track_id")
+            if visual_id:
+                visual_owners.setdefault(
+                    (observation.get("camera_id"), str(visual_id)), set()
+                ).add(observation.get("local_id"))
 
         identity_winners = {
             key: max(
@@ -692,11 +761,18 @@ class FloorMapProjector:
                 )
                 person_id = None
             fallback_key = observation.get("track_id") or "unknown"
-            if winner is not None and person_id is None:
+            visual_owner_conflict = len(
+                visual_owners.get(
+                    (observation.get("camera_id"), str(fallback_key)), set()
+                )
+            ) > 1
+            if (winner is not None and person_id is None) or visual_owner_conflict:
                 fallback_key = (
                     f"{fallback_key}:{observation.get('camera_id')}:"
                     f"{observation.get('local_id', 'unknown')}"
                 )
+            if visual_owner_conflict:
+                observation["visual_owner_conflict"] = True
             key = person_id or fallback_key or f"unknown:{observation['camera_id']}"
             grouped.setdefault(key, []).append(observation)
 
@@ -796,7 +872,10 @@ class FloorMapProjector:
                     "raw_position_step_m": position["raw_step_m"],
                     "walkability_adjusted": position["walkability_adjusted"],
                     "corridor_routed": position["corridor_routed"],
-                    "association_conflict": len(selected) < len(matches),
+                    "association_conflict": bool(
+                        len(selected) < len(matches)
+                        or any(match.get("visual_owner_conflict") for match in matches)
+                    ),
                     "observed_at": max(match["observed_at"] for match in matches),
                     "position_estimated": False,
                     "localization_state": "measured",

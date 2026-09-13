@@ -1,6 +1,10 @@
 import argparse
+import json
+import os
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from hardware_serial import EnvironmentSerialMonitor, discover_hardware_port
 
 
 ROOT = Path(__file__).resolve().parent
@@ -17,12 +21,19 @@ class FrontendHandler(SimpleHTTPRequestHandler):
     def _send_html(self, path):
         html = path.read_text(encoding="utf-8")
         api_base = self.server.api_base.replace("\\", "\\\\").replace('"', '\\"')
-        bootstrap = f'<script>window.__LAB_API_BASE__ = "{api_base}";</script>'
+        bootstrap = (
+            f'<script>window.__LAB_API_BASE__ = "{api_base}"; '
+            'window.__LAB_HARDWARE_URL__ = "/api/environment";</script>'
+        )
         html = html.replace("</head>", f"  {bootstrap}\n  </head>", 1)
         self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_GET(self):
         route = self.path.split("?", 1)[0]
+        if route == "/api/environment":
+            data = json.dumps(self.server.environment.status(), ensure_ascii=False).encode("utf-8")
+            self._send_bytes(data, "application/json; charset=utf-8")
+            return
         if route == "/":
             self._send_html(TEMPLATE)
             return
@@ -71,7 +82,22 @@ def main():
     print(f"Frontend: http://127.0.0.1:{args.port}/?api={args.api}")
     server = ThreadingHTTPServer((args.host, args.port), FrontendHandler)
     server.api_base = args.api.rstrip("/")
-    server.serve_forever()
+    configured_port = os.environ.get("LAB_HARDWARE_PORT", "").strip()
+    auto_detect = os.environ.get("LAB_HARDWARE_AUTO", "1").strip().lower() not in {
+        "0", "false", "no", "off"
+    }
+    server.environment = EnvironmentSerialMonitor(
+        port=configured_port or (discover_hardware_port() if auto_detect else None),
+        baudrate=int(os.environ.get("LAB_HARDWARE_BAUD", "115200")),
+        stale_seconds=float(os.environ.get("LAB_HARDWARE_STALE_SECONDS", "30")),
+    )
+    server.environment.start()
+    print(f"Hardware: {server.environment.port or 'not detected'}")
+    try:
+        server.serve_forever()
+    finally:
+        server.environment.stop()
+        server.server_close()
 
 
 if __name__ == "__main__":

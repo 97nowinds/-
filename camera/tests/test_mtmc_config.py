@@ -13,7 +13,7 @@ class MTMCConfigTests(unittest.TestCase):
             path.write_text(json.dumps({"reid": {"gallery_capacity": 7}}), encoding="utf-8")
             config = load_mtmc_config(path)
         self.assertEqual(config["reid"]["gallery_capacity"], 7)
-        self.assertEqual(config["algorithm_version"], "mtmc-2.0.4")
+        self.assertEqual(config["algorithm_version"], "mtmc-2.0.6")
         self.assertEqual(config["calibration"]["map_position_hold_seconds"], 8.0)
         self.assertEqual(config["calibration"]["max_motion_gap_seconds"], 0.25)
 

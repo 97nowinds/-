@@ -81,6 +81,62 @@ class FloorMapProjectorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "projection_domain_margin_normalized"):
             FloorMapProjector(floor_config)
 
+    def test_track_footpoint_rejects_detection_outside_calibration_domain(self):
+        floor_config = config()
+        floor_config["cameras"]["cam_1"]["image_points"] = [
+            [0.4, 0.4], [0.6, 0.4], [0.4, 0.8], [0.6, 0.8]
+        ]
+        projector = FloorMapProjector(floor_config)
+
+        self.assertTrue(
+            projector.track_footpoint_allowed("cam_1", (45, 30, 10, 30), (100, 100, 3))
+        )
+        self.assertFalse(
+            projector.track_footpoint_allowed("cam_1", (5, 10, 10, 30), (100, 100, 3))
+        )
+
+    def test_track_footpoint_uses_annotated_aisle_without_homography(self):
+        floor_config = config()
+        floor_config["cameras"]["cam_entrance"] = {
+            "label": "Entrance",
+            "position": [10, 5],
+            "fov": [[10, 5], [8, 4], [10, 4]],
+        }
+        floor_config["annotations"] = {
+            "cam_entrance": {
+                "regions": {
+                    "rear_service": {"x": 0.4, "y": 0.2, "width": 0.4, "height": 0.7}
+                }
+            }
+        }
+        projector = FloorMapProjector(floor_config)
+
+        self.assertTrue(
+            projector.track_footpoint_allowed(
+                "cam_entrance", (45, 20, 10, 50), (100, 100, 3)
+            )
+        )
+        self.assertFalse(
+            projector.track_footpoint_allowed(
+                "cam_entrance", (5, 20, 10, 50), (100, 100, 3)
+            )
+        )
+
+    def test_track_footpoint_keeps_legacy_unconstrained_camera(self):
+        floor_config = config()
+        floor_config["cameras"]["cam_entrance"] = {
+            "label": "Entrance",
+            "position": [10, 5],
+            "fov": [[10, 5], [8, 4], [10, 4]],
+        }
+        projector = FloorMapProjector(floor_config)
+
+        self.assertTrue(
+            projector.track_footpoint_allowed(
+                "cam_entrance", (5, 10, 10, 30), (100, 100, 3)
+            )
+        )
+
     def test_calibration_status_exposes_geometry_trust(self):
         approximate_config = config()
         approximate_config["calibrated"] = False
@@ -333,6 +389,27 @@ class FloorMapProjectorTests(unittest.TestCase):
         self.assertEqual(len(people), 3)
         self.assertEqual(sum(person["identified"] for person in people), 1)
         self.assertEqual(len({person["track_id"] for person in people}), 3)
+
+    def test_duplicate_visual_global_id_in_one_camera_is_defensively_split(self):
+        observations = [
+            {
+                "camera_id": "cam_2",
+                "local_id": local_id,
+                "track_id": "person_1",
+                "global_track_id": "person_1",
+                "position": {"x": x, "y": 5.0},
+                "confidence": 0.9,
+                "observed_at": 10.0,
+            }
+            for local_id, x in ((11, 2.0), (12, 8.0))
+        ]
+
+        people = self.projector.state(observations, now=10.0)["people"]
+
+        self.assertEqual(len(people), 2)
+        self.assertEqual(len({person["track_id"] for person in people}), 2)
+        self.assertTrue(all(person["association_conflict"] for person in people))
+        self.assertEqual(sorted(round(person["x"], 1) for person in people), [2.0, 8.0])
 
     def test_calibrated_but_inconsistent_camera_positions_are_not_averaged(self):
         observations = [

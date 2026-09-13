@@ -9,3 +9,4 @@ ultralytics==8.4.121
 lap==0.5.13
 insightface==1.0.1
 onnxruntime==1.19.2
+pyserial==3.5

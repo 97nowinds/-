@@ -4,6 +4,15 @@ const serviceState = document.querySelector("#serviceState");
 const cameraSummary = document.querySelector("#cameraSummary");
 const identitySummary = document.querySelector("#identitySummary");
 const handoffSummary = document.querySelector("#handoffSummary");
+const environmentDevice = document.querySelector("#environmentDevice");
+const environmentStatus = document.querySelector("#environmentStatus");
+const temperatureValue = document.querySelector("#temperatureValue");
+const temperatureState = document.querySelector("#temperatureState");
+const humidityValue = document.querySelector("#humidityValue");
+const humidityState = document.querySelector("#humidityState");
+const flameCard = document.querySelector("#flameCard");
+const flameValue = document.querySelector("#flameValue");
+const flameState = document.querySelector("#flameState");
 const floorMapSvg = document.querySelector("#floorMapSvg");
 const floorMapStatic = document.querySelector("#floorMapStatic");
 const floorMapTrailsLayer = document.querySelector("#floorMapTrails");
@@ -36,6 +45,7 @@ const API_BASE = (
   new URLSearchParams(location.search).get("api") ||
   location.origin
 ).replace(/\/$/, "");
+const HARDWARE_URL = window.__LAB_HARDWARE_URL__ || null;
 const faceCaptureLink = document.querySelector("#faceCaptureLink");
 if (faceCaptureLink) faceCaptureLink.href = `/faces?api=${encodeURIComponent(API_BASE)}`;
 const calibrationLink = document.querySelector("#calibrationLink");
@@ -197,9 +207,16 @@ function floorMapLabel(item) {
 }
 
 async function fetchState() {
-  const response = await fetch(`${API_BASE}/api/state`, {cache: "no-store"});
+  const [response, hardwareResponse] = await Promise.all([
+    fetch(`${API_BASE}/api/state`, {cache: "no-store"}),
+    HARDWARE_URL
+      ? fetch(HARDWARE_URL, {cache: "no-store"}).catch(() => null)
+      : Promise.resolve(null),
+  ]);
   if (!response.ok) throw new Error("状态接口不可用");
-  return response.json();
+  const state = await response.json();
+  if (hardwareResponse?.ok) state.environment = await hardwareResponse.json();
+  return state;
 }
 
 function escapeHtml(value) {
@@ -447,6 +464,39 @@ function renderPeopleList(people) {
     : `<div class="empty">暂无注册人员</div>`;
 }
 
+function renderEnvironment(environment = {}) {
+  const statusLabels = {
+    disabled: "未配置",
+    disconnected: "等待连接",
+    connected: "串口已连接",
+    online: "在线",
+    alarm: "火情告警",
+    stale: "数据超时",
+    error: "连接异常",
+  };
+  const temperature = Number(environment.temperature);
+  const humidity = Number(environment.humidity);
+  const hasTemperature = environment.temperature != null && Number.isFinite(temperature);
+  const hasHumidity = environment.humidity != null && Number.isFinite(humidity);
+  environmentDevice.textContent = environment.port
+    ? `${environment.device_id || "HAFS-STM32"} · ${environment.port} · ${environment.protocol || "等待报文"}`
+    : environment.device_id || "HAFS 硬件未配置";
+  environmentStatus.textContent = statusLabels[environment.status] || environment.status || "未知";
+  environmentStatus.className = `environment-status ${environment.status || "disabled"}`;
+  temperatureValue.textContent = hasTemperature ? `${temperature.toFixed(1)} ℃` : "--.- ℃";
+  humidityValue.textContent = hasHumidity ? `${humidity.toFixed(1)} %` : "--.- %";
+  const dhtText = environment.dht_valid ? "DHT 校验正常" : "DHT 数据无效或未收到";
+  temperatureState.textContent = dhtText;
+  humidityState.textContent = dhtText;
+  flameCard.classList.toggle("alarm", Boolean(environment.flame_alarm));
+  flameValue.textContent = environment.flame_alarm ? "危险" : environment.last_seen_at ? "安全" : "未知";
+  flameState.textContent = environment.flame_alarm
+    ? "现场蜂鸣器与 LED 已触发"
+    : environment.age_seconds == null
+      ? "等待硬件状态"
+      : `${environment.age_seconds.toFixed(1)} 秒前更新`;
+}
+
 function renderInitial(state) {
   videoGrid.innerHTML = state.cameras.map((camera) => `
     <article class="camera-card" data-camera-id="${escapeHtml(camera.id)}">
@@ -485,6 +535,7 @@ function update(state) {
     : "等待重叠区继承";
   renderFloorMap(state.floor_map);
   renderRecording(state.recording, state.cameras);
+  renderEnvironment(state.environment);
 
   for (const camera of state.cameras) {
     const card = document.querySelector(`[data-camera-id="${CSS.escape(camera.id)}"]`);

@@ -10,7 +10,7 @@ class MTMCConfigError(ValueError):
 
 
 DEFAULT_CONFIG = {
-    "algorithm_version": "mtmc-2.0.4",
+    "algorithm_version": "mtmc-2.0.6",
     "calibration": {
         "formal_required_for_geometry": True,
         "max_stream_skew_seconds": 0.5,

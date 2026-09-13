@@ -223,6 +223,7 @@ class CrossCameraTrackCoordinator:
         self.active_local_ids_by_camera = {}
         self.stream_timestamps = {}
         self.association_reservations = {}
+        self.last_merge_rejection_reason = None
         self.recent_associations = deque(maxlen=300)
         self.event_store = event_store
         self.camera_roles = dict(camera_roles or {})
@@ -609,6 +610,7 @@ class CrossCameraTrackCoordinator:
         )
 
     def _merge(self, first_id, second_id, prefer=None, unix_time=None):
+        self.last_merge_rejection_reason = None
         if prefer in (first_id, second_id):
             keep_id = prefer
             remove_id = second_id if prefer == first_id else first_id
@@ -621,7 +623,27 @@ class CrossCameraTrackCoordinator:
         keep_person = (keep_identity or {}).get("identity", {}).get("person_id")
         remove_person = (remove_identity or {}).get("identity", {}).get("person_id")
         if keep_person and remove_person and keep_person != remove_person:
+            self.last_merge_rejection_reason = "different_known_identities_never_merge"
             return None
+        # Final invariant: merging must never make two live ByteTrack owners in
+        # the same camera share one global ID. This remains authoritative even
+        # if an earlier Re-ID decision or a late merge was over-confident.
+        active_owners = {}
+        for global_id in (keep_id, remove_id):
+            owners = defaultdict(set)
+            for (bound_camera, local_id), bound_id in self.local_bindings.items():
+                if bound_id != global_id:
+                    continue
+                if local_id in self.active_local_ids_by_camera.get(bound_camera, set()):
+                    owners[bound_camera].add(local_id)
+            active_owners[global_id] = owners
+        for camera_id in set(active_owners[keep_id]) & set(active_owners[remove_id]):
+            if len(
+                active_owners[keep_id][camera_id]
+                | active_owners[remove_id][camera_id]
+            ) > 1:
+                self.last_merge_rejection_reason = "active_same_camera_owner_conflict"
+                return None
         removed = self.global_tracks.pop(remove_id, None)
         if removed and keep_id not in self.global_tracks:
             self.global_tracks[keep_id] = removed
@@ -966,7 +988,8 @@ class CrossCameraTrackCoordinator:
                                 **decision,
                                 "accepted": False,
                                 "confidence": "low",
-                                "reason": "different_known_identities_never_merge",
+                                "reason": self.last_merge_rejection_reason
+                                or "merge_invariant_rejected",
                             }
                     if decision.get("accepted"):
                         self.association_reservations[global_id] = monotonic_time

@@ -123,7 +123,7 @@
       ctx.strokeStyle = colors[type] || "#fff";
       ctx.lineWidth = 2;
       ctx.setLineDash(type === "overlap" ? [8, 5] : []);
-      const points = type === "main_aisle" ? regionPoints(region) : null;
+      const points = regionPoints(region);
       if (points) drawPolygonRegion(type, points, width, height);
       else {
         ctx.fillRect(region.x * width, region.y * height, region.width * width, region.height * height);

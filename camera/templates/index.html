@@ -40,6 +40,33 @@
         </article>
       </section>
 
+      <section class="environment-panel" aria-labelledby="environmentTitle">
+        <header>
+          <div>
+            <h2 id="environmentTitle">环境与火情监测</h2>
+            <span id="environmentDevice">HAFS 硬件未配置</span>
+          </div>
+          <strong id="environmentStatus" class="environment-status disabled">未接入</strong>
+        </header>
+        <div class="environment-grid">
+          <article>
+            <span>温度</span>
+            <strong id="temperatureValue">--.- ℃</strong>
+            <small id="temperatureState">等待 DHT 数据</small>
+          </article>
+          <article>
+            <span>湿度</span>
+            <strong id="humidityValue">--.- %</strong>
+            <small id="humidityState">等待 DHT 数据</small>
+          </article>
+          <article id="flameCard" class="flame-card">
+            <span>火焰触点</span>
+            <strong id="flameValue">未知</strong>
+            <small id="flameState">等待硬件状态</small>
+          </article>
+        </div>
+      </section>
+
       <section class="monitoring-layout">
         <section class="video-grid" id="videoGrid"></section>
         <aside class="floor-map-panel">

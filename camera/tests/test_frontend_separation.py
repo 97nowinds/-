@@ -7,14 +7,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FrontendSeparationTests(unittest.TestCase):
-    def test_frontend_server_only_serves_static_surface(self):
+    def test_frontend_server_serves_static_surface_and_local_hardware_bridge(self):
         source = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
         self.assertIn("class FrontendHandler", source)
         self.assertIn("/static/", source)
         self.assertIn("/annotate", source)
         self.assertIn("/faces", source)
         self.assertIn("/recordings", source)
-        self.assertNotIn("/api/", source)
+        self.assertIn('route == "/api/environment"', source)
         self.assertNotIn("VideoCapture", source)
 
     def test_annotation_surface_exists(self):
@@ -34,7 +34,8 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn("主通道（平行四边形）", template)
         self.assertIn("drawPolygonRegion", script)
         self.assertIn("moveParallelogramHandle", script)
-        self.assertIn('region_type == "main_aisle" and "points" in region', app_source)
+        self.assertIn('if "points" in region', app_source)
+        self.assertIn('if region_type == "main_aisle"', app_source)
         self.assertIn("must form a parallelogram", app_source)
 
     def test_face_registration_surface_exists(self):
@@ -51,9 +52,24 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn("${API_BASE}/api/state", source)
         self.assertIn("${API_BASE}/video/", source)
 
+    def test_monitoring_page_exposes_hardware_environment_state(self):
+        template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        backend = (ROOT / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn('id="environmentStatus"', template)
+        self.assertIn('id="temperatureValue"', template)
+        self.assertIn('id="humidityValue"', template)
+        self.assertIn('id="flameValue"', template)
+        self.assertIn("renderEnvironment(state.environment)", script)
+        self.assertIn("__LAB_HARDWARE_URL__", script)
+        self.assertIn('"environment": self.environment.status()', backend)
+        self.assertIn('@app.route("/api/environment/ingest", methods=["POST"])', backend)
+
     def test_frontend_server_injects_configured_backend(self):
         source = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
         self.assertIn("window.__LAB_API_BASE__", source)
+        self.assertIn("window.__LAB_HARDWARE_URL__", source)
         self.assertIn("server.api_base = args.api", source)
 
     def test_cluster_service_uses_persistent_floor_map_config(self):
@@ -112,13 +128,14 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertLessEqual(cam1["yolo_frame_stride"], 3)
         self.assertGreaterEqual(cam1["yolo_image_size"], 768)
 
-    def test_recorded_route_transitions_allow_validated_bidirectional_overlap(self):
+    def test_approximate_map_disables_simultaneous_overlap_identity_merge(self):
         floor_map = json.loads((ROOT / "config" / "floor_map.json").read_text(encoding="utf-8"))
         transitions = floor_map["camera_transitions"]
 
+        self.assertEqual(floor_map["calibration"]["status"], "approximate")
         self.assertEqual(len(transitions), 3)
         self.assertTrue(all(item["bidirectional"] for item in transitions))
-        self.assertTrue(all(item["simultaneous_overlap_validated"] for item in transitions))
+        self.assertFalse(any(item["simultaneous_overlap_validated"] for item in transitions))
 
     def test_state_reports_arcface_gallery_completion_counts(self):
         backend = (ROOT / "app.py").read_text(encoding="utf-8")

@@ -103,6 +103,33 @@ class AnnotationValidationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertIn("更新", response.get_json()["error"])
 
+    def test_accepts_perspective_secondary_aisle_quadrilateral(self):
+        points = [[0.38, 0.95], [0.66, 0.92], [0.75, 0.39], [0.67, 0.34]]
+
+        result = _validate_annotation_payload(
+            {
+                "camera_id": "cam_1",
+                "regions": {"secondary_aisle": {"points": points}},
+            },
+            self.config,
+        )
+
+        self.assertEqual(result["regions"]["secondary_aisle"]["points"], points)
+
+    def test_rejects_self_crossing_secondary_aisle_quadrilateral(self):
+        with self.assertRaisesRegex(ValueError, "convex quadrilateral"):
+            _validate_annotation_payload(
+                {
+                    "camera_id": "cam_1",
+                    "regions": {
+                        "secondary_aisle": {
+                            "points": [[0.2, 0.2], [0.8, 0.8], [0.8, 0.2], [0.2, 0.8]]
+                        }
+                    },
+                },
+                self.config,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

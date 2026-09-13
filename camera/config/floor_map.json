@@ -30,7 +30,7 @@
       "to": "cam_1",
       "max_gap_seconds": 20,
       "bidirectional": true,
-      "simultaneous_overlap_validated": true,
+      "simultaneous_overlap_validated": false,
       "spatial_handoff_max_age_seconds": 3,
       "spatial_handoff_max_distance_m": 12.0,
       "spatial_handoff_similarity_threshold": 0.35
@@ -40,7 +40,7 @@
       "to": "cam_2",
       "max_gap_seconds": 20,
       "bidirectional": true,
-      "simultaneous_overlap_validated": true,
+      "simultaneous_overlap_validated": false,
       "spatial_handoff_max_age_seconds": 3,
       "spatial_handoff_max_distance_m": 2.5,
       "spatial_handoff_similarity_threshold": 0.35
@@ -50,7 +50,7 @@
       "to": "cam_2",
       "max_gap_seconds": 8,
       "bidirectional": true,
-      "simultaneous_overlap_validated": true
+      "simultaneous_overlap_validated": false
     }
   ],
   "zones": [
@@ -388,10 +388,24 @@
     "cam_1": {
       "regions": {
         "secondary_aisle": {
-          "x": 0.39818,
-          "y": 0.26182,
-          "width": 0.37455,
-          "height": 0.71758
+          "points": [
+            [
+              0.38,
+              0.9503
+            ],
+            [
+              0.65818,
+              0.92444
+            ],
+            [
+              0.75273,
+              0.38788
+            ],
+            [
+              0.67455,
+              0.34263
+            ]
+          ]
         }
       },
       "image_points": [

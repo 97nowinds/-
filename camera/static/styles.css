@@ -77,6 +77,22 @@ h2 { font-size: 16px; }
 .primary-action { background: #176a47; border-color: #23835b !important; }
 .danger-action { background: #7a302a; border-color: #984038 !important; }
 
+.environment-panel { margin: 14px 0; overflow: hidden; border: 1px solid #2d343c; border-radius: 7px; background: #171b20; }
+.environment-panel > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 14px; border-bottom: 1px solid #2d343c; }
+.environment-panel > header div { display: grid; gap: 4px; }
+.environment-panel > header span { color: #84909c; font-size: 11px; }
+.environment-status { padding: 5px 9px; border-radius: 5px; color: #aebac6; background: #29313a; font-size: 12px; }
+.environment-status.online, .environment-status.connected { color: #86e9ad; background: #173d2b; }
+.environment-status.alarm, .environment-status.error { color: #ffaaa5; background: #512426; }
+.environment-status.stale, .environment-status.disconnected { color: #ffd181; background: #4b3519; }
+.environment-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.environment-grid article { display: grid; gap: 7px; min-height: 96px; padding: 13px 15px; border-right: 1px solid #2d343c; }
+.environment-grid article:last-child { border-right: 0; }
+.environment-grid span, .environment-grid small { color: #84909c; font-size: 11px; }
+.environment-grid strong { font: 700 22px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.environment-grid .flame-card.alarm { background: #321b1d; }
+.environment-grid .flame-card.alarm strong { color: #ff756e; }
+
 .monitoring-layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(320px, 0.82fr); align-items: start; gap: 14px; }
 .video-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .camera-card { overflow: hidden; border: 1px solid #2d343c; border-radius: 7px; background: #171b20; }
@@ -242,9 +258,11 @@ h2 { font-size: 16px; }
 
 @media (max-width: 720px) {
   .app-shell { padding: 10px; }
-  .video-grid, .summary-grid { grid-template-columns: 1fr; }
+  .video-grid, .summary-grid, .environment-grid { grid-template-columns: 1fr; }
   .summary-grid article { border-right: 0; border-bottom: 1px solid #2d343c; }
   .summary-grid article:last-child { border-bottom: 0; }
+  .environment-grid article { border-right: 0; border-bottom: 1px solid #2d343c; }
+  .environment-grid article:last-child { border-bottom: 0; }
   .floor-map-panel { width: 100%; }
   .topbar { align-items: flex-start; }
   .topbar-actions { flex-wrap: wrap; justify-content: flex-end; }

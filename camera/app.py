@@ -27,6 +27,7 @@ try:
         registration_pose_plan,
     )
     from floor_map import FloorMapProjector
+    from hardware_serial import EnvironmentSerialMonitor, discover_hardware_port
     from identity_handoff import IdentityHandoff
     from motion_person_detector import MotionPersonDetector
     from mtmc_config import load_mtmc_config, public_config
@@ -303,6 +304,7 @@ class CameraWorker:
         self.last_slam_at = 0.0
         self.slam_state = self.slam.status_payload()
         self.yolo_inference_ms = None
+        self.roi_rejected_tracks = 0
         self.identity = None
         self.identity_track_id = None
         self.identity_votes = deque(maxlen=7)
@@ -1122,6 +1124,20 @@ class CameraWorker:
                 item["local_id"]: item["track_id"] for item in cached_tracks
             }
 
+        # A local tracker can follow people-like shapes on benches or equipment.
+        # Keep identity and MTMC state limited to the camera's annotated walkable
+        # image region; the four-point projection domain is the stricter boundary
+        # when one exists.
+        unfiltered_track_count = len(tracks)
+        tracks = [
+            track
+            for track in tracks
+            if self.floor_map.track_footpoint_allowed(
+                self.camera["id"], track.get("box"), frame.shape
+            )
+        ]
+        self.roi_rejected_tracks = unfiltered_track_count - len(tracks)
+
         # A confirmed identity belongs to the active ByteTrack target. Keep
         # that name while the target moves, but clear it when the ID is gone.
         active_local_ids = {int(item["track_id"]) for item in tracks}
@@ -1669,6 +1685,7 @@ class CameraWorker:
             "identities": identities,
             "tracking": tracking,
             "tracked_people": len(yolo_tracks),
+            "roi_rejected_tracks": self.roi_rejected_tracks,
             "yolo_tracks": yolo_tracks,
             "tracker_engine": "YOLOv8n + ByteTrack",
             "face_detector": self.face_detector_backend,
@@ -1746,6 +1763,21 @@ class CameraManager:
         )
         camera_ids = [camera["id"] for camera in cameras]
         self.recorder = DatasetRecorder(RECORDINGS_DIR, camera_ids)
+        configured_hardware_port = os.environ.get("LAB_HARDWARE_PORT", "").strip()
+        hardware_auto_detect = os.environ.get("LAB_HARDWARE_AUTO", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        hardware_port = configured_hardware_port or (
+            discover_hardware_port() if hardware_auto_detect else None
+        )
+        self.environment = EnvironmentSerialMonitor(
+            port=hardware_port,
+            baudrate=int(os.environ.get("LAB_HARDWARE_BAUD", "115200")),
+            stale_seconds=float(os.environ.get("LAB_HARDWARE_STALE_SECONDS", "30")),
+        )
         self.workers = {
             camera["id"]: CameraWorker(
                 camera,
@@ -1763,8 +1795,10 @@ class CameraManager:
             worker.replay_start_monotonic = replay_start_monotonic
             worker.replay_start_unix = replay_start_unix
             worker.start()
+        self.environment.start()
 
     def stop(self):
+        self.environment.stop()
         for worker in self.workers.values():
             worker.stop()
         self.recorder.stop_if_active()
@@ -1793,6 +1827,7 @@ class CameraManager:
                 )
         return {
             "cameras": cameras,
+            "environment": self.environment.status(),
             "people": list(face_store.people.values()),
             "recording": self.recorder.status(),
             "processing": {
@@ -2140,31 +2175,29 @@ def _validate_annotation_payload(payload, config):
             raise ValueError(f"unsupported region type: {region_type}")
         if not isinstance(region, dict):
             raise ValueError(f"{region_type} must be an object")
-        if region_type == "main_aisle" and "points" in region:
+        if "points" in region:
             points = region.get("points")
             if not isinstance(points, list) or len(points) != 4:
-                raise ValueError("main_aisle.points must contain four points")
+                raise ValueError(f"{region_type}.points must contain four points")
             clean_points = [
                 _validate_annotation_point(
-                    point, "main_aisle.points", normalized=True
+                    point, f"{region_type}.points", normalized=True
                 )
                 for point in points
             ]
-            # Opposite diagonals of a parallelogram share one midpoint.
-            diagonal_error = np.linalg.norm(
-                np.asarray(clean_points[0]) + np.asarray(clean_points[2])
-                - np.asarray(clean_points[1]) - np.asarray(clean_points[3])
-            )
-            if diagonal_error > 0.002:
-                raise ValueError("main_aisle.points must form a parallelogram")
-            area = abs(
-                np.cross(
-                    np.asarray(clean_points[1]) - np.asarray(clean_points[0]),
-                    np.asarray(clean_points[3]) - np.asarray(clean_points[0]),
+            polygon = np.asarray(clean_points, dtype=np.float32)
+            if not cv2.isContourConvex(polygon):
+                raise ValueError(f"{region_type}.points must form a convex quadrilateral")
+            area = abs(float(cv2.contourArea(polygon)))
+            if region_type == "main_aisle":
+                # Opposite diagonals of a parallelogram share one midpoint.
+                diagonal_error = np.linalg.norm(
+                    polygon[0] + polygon[2] - polygon[1] - polygon[3]
                 )
-            )
+                if diagonal_error > 0.002:
+                    raise ValueError("main_aisle.points must form a parallelogram")
             if area < 0.0004:
-                raise ValueError("main_aisle parallelogram is too small")
+                raise ValueError(f"{region_type} quadrilateral is too small")
             clean_regions[region_type] = {"points": clean_points}
             continue
         values = {}
@@ -2313,6 +2346,14 @@ def video(camera_id):
 @app.route("/api/state")
 def api_state():
     return jsonify(camera_manager.state())
+
+
+@app.route("/api/environment/ingest", methods=["POST"])
+def api_environment_ingest():
+    try:
+        return jsonify(camera_manager.environment.ingest(request.get_json(silent=True) or {}))
+    except (TypeError, ValueError) as error:
+        return jsonify({"error": str(error)}), 400
 
 
 @app.route("/api/mtmc/events")
