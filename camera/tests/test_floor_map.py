@@ -81,6 +81,50 @@ class FloorMapProjectorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "projection_domain_margin_normalized"):
             FloorMapProjector(floor_config)
 
+    def test_camera_projection_domain_margin_is_validated(self):
+        floor_config = config()
+        floor_config["cameras"]["cam_1"][
+            "projection_domain_margin_normalized"
+        ] = -0.01
+
+        with self.assertRaisesRegex(
+            ValueError, "cam_1.projection_domain_margin_normalized"
+        ):
+            FloorMapProjector(floor_config)
+
+    def test_camera_projection_domain_margin_accepts_clipped_aisle_track(self):
+        floor_config = config()
+        floor_config["cameras"]["cam_1"]["image_points"] = [
+            [0.38, 0.9503],
+            [0.65818, 0.92444],
+            [0.75273, 0.38788],
+            [0.67455, 0.34263],
+        ]
+        floor_config["cameras"]["cam_1"]["map_points"] = [
+            [8.551, 5.088],
+            [8.48, 4.381],
+            [1.287, 4.593],
+            [1.252, 5.229],
+        ]
+        # Recorded cam_1 frame 771: the detector box is clipped by the bottom
+        # of the image even though its horizontal center remains in the aisle.
+        clipped_box = (377, 22, 203, 407)
+
+        strict = FloorMapProjector(floor_config)
+        self.assertFalse(
+            strict.track_footpoint_allowed("cam_1", clipped_box, (432, 768, 3))
+        )
+        self.assertIsNone(strict.project("cam_1", clipped_box, (432, 768, 3)))
+
+        floor_config["cameras"]["cam_1"][
+            "projection_domain_margin_normalized"
+        ] = 0.066
+        tolerant = FloorMapProjector(floor_config)
+        self.assertTrue(
+            tolerant.track_footpoint_allowed("cam_1", clipped_box, (432, 768, 3))
+        )
+        self.assertIsNotNone(tolerant.project("cam_1", clipped_box, (432, 768, 3)))
+
     def test_track_footpoint_rejects_detection_outside_calibration_domain(self):
         floor_config = config()
         floor_config["cameras"]["cam_1"]["image_points"] = [
@@ -411,6 +455,41 @@ class FloorMapProjectorTests(unittest.TestCase):
         self.assertTrue(all(person["association_conflict"] for person in people))
         self.assertEqual(sorted(round(person["x"], 1) for person in people), [2.0, 8.0])
 
+    def test_provisional_track_remains_visible_but_is_not_counted(self):
+        observations = [
+            {
+                "camera_id": "cam_1",
+                "local_id": 1,
+                "track_id": "person_1",
+                "position": {"x": 2.0, "y": 2.0},
+                "confidence": 0.9,
+                "counted": True,
+                "count_status": "confirmed",
+                "observed_at": 10.0,
+            },
+            {
+                "camera_id": "cam_2",
+                "local_id": 7,
+                "track_id": "person_2",
+                "position": {"x": 8.0, "y": 4.0},
+                "confidence": 0.8,
+                "counted": False,
+                "count_status": "provisional",
+                "observed_at": 10.0,
+            },
+        ]
+
+        state = self.projector.state(observations, now=10.0)
+
+        self.assertEqual(len(state["people"]), 2)
+        self.assertEqual(state["visual_track_count"], 2)
+        self.assertEqual(state["counted_people"], 1)
+        self.assertEqual(state["provisional_people"], 1)
+        provisional = next(
+            person for person in state["people"] if person["track_id"] == "person_2"
+        )
+        self.assertFalse(provisional["counted"])
+
     def test_calibrated_but_inconsistent_camera_positions_are_not_averaged(self):
         observations = [
             {
@@ -649,6 +728,23 @@ class FloorMapProjectorTests(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertIsNotNone(second)
         self.assertNotEqual(first, second)
+
+    def test_actual_cam_1_live_reference_projects_to_main_aisle(self):
+        config_path = Path(__file__).resolve().parents[1] / "config" / "floor_map.json"
+        projector = FloorMapProjector.from_path(config_path)
+
+        # Operator-confirmed live reference on 2026-09-14: the tracked person's
+        # footpoint was in the main aisle, not the secondary aisle.
+        position = projector.project("cam_1", (477, 51, 82, 166), (432, 768, 3))
+        main_aisle = next(
+            zone for zone in projector.config["zones"] if zone["id"] == "main_aisle"
+        )
+
+        self.assertIsNotNone(position)
+        self.assertGreaterEqual(position["y"], main_aisle["y"])
+        self.assertLessEqual(
+            position["y"], main_aisle["y"] + main_aisle["height"]
+        )
 
 
 if __name__ == "__main__":

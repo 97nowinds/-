@@ -361,7 +361,11 @@ class CrossCameraTrackCoordinator:
             "position": position,
             "box": None,
             "local_id": local_id,
+            "first_seen": now,
             "last_seen": now,
+            "observation_count": 0,
+            "association_confirmed": False,
+            "count_confirmed": False,
             "in_overlap": self._is_overlap(position, camera_id),
         }
         if gallery is not None:
@@ -644,9 +648,26 @@ class CrossCameraTrackCoordinator:
             ) > 1:
                 self.last_merge_rejection_reason = "active_same_camera_owner_conflict"
                 return None
+        kept = self.global_tracks.get(keep_id)
         removed = self.global_tracks.pop(remove_id, None)
-        if removed and keep_id not in self.global_tracks:
+        if removed and kept is None:
             self.global_tracks[keep_id] = removed
+            kept = removed
+        elif removed and kept is not None:
+            kept["first_seen"] = min(
+                float(kept.get("first_seen", kept.get("last_seen", 0.0))),
+                float(removed.get("first_seen", removed.get("last_seen", 0.0))),
+            )
+            kept["observation_count"] = int(kept.get("observation_count", 0)) + int(
+                removed.get("observation_count", 0)
+            )
+            kept["association_confirmed"] = bool(
+                kept.get("association_confirmed")
+                or removed.get("association_confirmed")
+            )
+            kept["count_confirmed"] = bool(
+                kept.get("count_confirmed") or removed.get("count_confirmed")
+            )
         removed_identity = self.global_identities.pop(remove_id, None)
         if removed_identity:
             current = self.global_identities.get(keep_id)
@@ -956,6 +977,12 @@ class CrossCameraTrackCoordinator:
                 stream_skew_seconds=stream_skew_seconds,
             )
             for evaluation in evaluations:
+                # Persist cross-camera evidence, not the expected same-camera
+                # owner conflicts produced on every normal tracking frame.
+                # The latter can evict useful handoff events from the bounded
+                # diagnostic history without adding association information.
+                if evaluation.get("source_camera") == evaluation.get("target_camera"):
+                    continue
                 self._record_event(
                     "associate",
                     **evaluation,
@@ -974,6 +1001,8 @@ class CrossCameraTrackCoordinator:
                 candidate_id = decision.get("candidate_global_id")
                 if decision.get("accepted") and candidate_id in self.global_tracks:
                     global_id = candidate_id
+                    self.global_tracks[global_id]["association_confirmed"] = True
+                    self.global_tracks[global_id]["count_confirmed"] = True
                     if previous_id in self.global_tracks and previous_id != candidate_id:
                         merged_id = self._merge(
                             previous_id,
@@ -991,7 +1020,13 @@ class CrossCameraTrackCoordinator:
                                 "reason": self.last_merge_rejection_reason
                                 or "merge_invariant_rejected",
                             }
-                    if decision.get("accepted"):
+                    # A same-camera reacquisition is already protected by the
+                    # active-local-owner invariant. Reserving it here can hide
+                    # the target from another camera exactly during a handoff.
+                    if (
+                        decision.get("accepted")
+                        and decision.get("source_camera") != camera_id
+                    ):
                         self.association_reservations[global_id] = monotonic_time
                 elif decision.get("confidence") == "medium" and candidate_id:
                     if previous_id in self.global_tracks:
@@ -1034,7 +1069,11 @@ class CrossCameraTrackCoordinator:
                 results[observation.local_id] = global_id
                 recorded = {**decision, "global_id": global_id}
                 self.recent_associations.append(recorded)
-                self._record_event("associate", **recorded, unix_time=unix_time)
+                # Keep per-track diagnostics current in memory, but do not
+                # persist routine continuity frames for an already-bound local
+                # track when there was no association candidate to evaluate.
+                if candidate_id is not None or previous_id is None:
+                    self._record_event("associate", **recorded, unix_time=unix_time)
 
             for item in prepared:
                 global_id = results[item["local_id"]]
@@ -1056,7 +1095,157 @@ class CrossCameraTrackCoordinator:
                         "in_overlap": self._is_overlap(item["position"], camera_id),
                     }
                 )
+                target["observation_count"] = int(target.get("observation_count", 0)) + 1
             return results
+
+    def _count_duplicate_groups(self):
+        """Group only near-certain cross-camera duplicates for counting.
+
+        This does not merge identities or bindings. It only prevents two active
+        views of the same person from inflating the public occupancy count while
+        conservative MTMC rules keep their global IDs separate.
+        """
+        active_cameras = defaultdict(set)
+        for (camera_id, local_id), bound_id in self.local_bindings.items():
+            if local_id in self.active_local_ids_by_camera.get(camera_id, set()):
+                active_cameras[bound_id].add(camera_id)
+        active_ids = sorted(
+            (global_id for global_id in active_cameras if global_id in self.global_tracks),
+            key=self._number,
+        )
+        parent = {global_id: global_id for global_id in active_ids}
+        edge_scores = {}
+
+        def find(global_id):
+            while parent[global_id] != global_id:
+                parent[global_id] = parent[parent[global_id]]
+                global_id = parent[global_id]
+            return global_id
+
+        def union(first_id, second_id):
+            first_root, second_root = find(first_id), find(second_id)
+            if first_root != second_root:
+                parent[second_root] = first_root
+
+        threshold = float(
+            self.mtmc_config["counting"]["duplicate_reid_similarity"]
+        )
+        for index, first_id in enumerate(active_ids):
+            first_gallery = self.global_galleries.get(first_id)
+            if first_gallery is None:
+                continue
+            for second_id in active_ids[index + 1 :]:
+                if not any(
+                    self._transition_gap(first_camera, second_camera) is not None
+                    for first_camera in active_cameras[first_id]
+                    for second_camera in active_cameras[second_id]
+                    if first_camera != second_camera
+                ):
+                    continue
+                first_person = (
+                    self.global_identities.get(first_id, {})
+                    .get("identity", {})
+                    .get("person_id")
+                )
+                second_person = (
+                    self.global_identities.get(second_id, {})
+                    .get("identity", {})
+                    .get("person_id")
+                )
+                if first_person and second_person and first_person != second_person:
+                    continue
+                comparison = first_gallery.compare(self.global_galleries.get(second_id))
+                score = comparison.get("score")
+                if score is None or float(score) < threshold:
+                    continue
+                union(first_id, second_id)
+                edge_scores[(first_id, second_id)] = float(score)
+
+        members_by_root = defaultdict(list)
+        for global_id in active_ids:
+            members_by_root[find(global_id)].append(global_id)
+        groups = []
+        for members in members_by_root.values():
+            if len(members) < 2:
+                continue
+            representative = min(
+                members,
+                key=lambda item: (
+                    float(
+                        self.global_tracks[item].get(
+                            "first_seen", self.global_tracks[item].get("last_seen", 0.0)
+                        )
+                    ),
+                    self._number(item),
+                ),
+            )
+            scores = [
+                score
+                for pair, score in edge_scores.items()
+                if pair[0] in members and pair[1] in members
+            ]
+            groups.append(
+                {
+                    "representative_global_id": representative,
+                    "member_global_ids": sorted(members, key=self._number),
+                    "reid_score": round(max(scores), 6) if scores else None,
+                    "threshold": threshold,
+                    "reason": "count_only_cross_camera_duplicate",
+                }
+            )
+        return groups
+
+    def _count_state(self, global_id):
+        target = self.global_tracks.get(global_id)
+        if target is None:
+            return {
+                "counted": False,
+                "count_status": "expired",
+                "track_age_seconds": 0.0,
+                "observation_count": 0,
+            }
+        first_seen = float(target.get("first_seen", target.get("last_seen", 0.0)))
+        last_seen = float(target.get("last_seen", first_seen))
+        age_seconds = max(0.0, last_seen - first_seen)
+        observation_count = int(target.get("observation_count", 0))
+        identified = global_id in self.global_identities
+        stable = bool(
+            age_seconds >= float(self.mtmc_config["counting"]["confirmation_seconds"])
+            and observation_count
+            >= int(self.mtmc_config["counting"]["minimum_observations"])
+        )
+        if identified or target.get("association_confirmed") or stable:
+            target["count_confirmed"] = True
+        counted = bool(target.get("count_confirmed"))
+        duplicate_of = None
+        duplicate_score = None
+        for group in self._count_duplicate_groups():
+            if global_id not in group["member_global_ids"]:
+                continue
+            representative = group["representative_global_id"]
+            if global_id != representative:
+                counted = False
+                duplicate_of = representative
+                duplicate_score = group["reid_score"]
+            break
+        if identified:
+            status = "identified"
+        elif duplicate_of is not None:
+            status = "duplicate_suppressed"
+        elif counted:
+            status = "confirmed"
+        elif global_id in self.pending:
+            status = "pending_association"
+        else:
+            status = "provisional"
+        return {
+            "counted": counted,
+            "count_status": status,
+            "track_age_seconds": round(age_seconds, 3),
+            "observation_count": observation_count,
+            "count_duplicate_of": duplicate_of,
+            "count_duplicate_reid_score": duplicate_score,
+        }
 
     def track_diagnostics(self, camera_id, local_id):
         key = (camera_id, int(local_id))
@@ -1078,6 +1267,7 @@ class CrossCameraTrackCoordinator:
                 "confidence": (recent or {}).get("confidence", "existing"),
                 "final_match_score": (recent or {}).get("final_score"),
                 "pending": global_id in self.pending,
+                **self._count_state(global_id),
             }
 
     def diagnostics(self):
@@ -1089,6 +1279,7 @@ class CrossCameraTrackCoordinator:
                 "pending_associations": len(self.pending),
                 "batch_window_reservations": len(self.association_reservations),
                 "redirects": dict(self.redirects),
+                "counting_duplicate_groups": self._count_duplicate_groups(),
                 "recent_associations": list(self.recent_associations)[-30:],
                 "event_summary": self.event_store.summary() if self.event_store else None,
             }
@@ -1221,6 +1412,8 @@ class CrossCameraTrackCoordinator:
                     "in_overlap": current_overlap,
                 }
             )
+            target.setdefault("first_seen", now)
+            target["observation_count"] = int(target.get("observation_count", 0)) + 1
             return global_id
 
     def forget_camera(self, camera_id):

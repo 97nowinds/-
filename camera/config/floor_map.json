@@ -40,7 +40,8 @@
       "to": "cam_2",
       "max_gap_seconds": 20,
       "bidirectional": true,
-      "simultaneous_overlap_validated": false,
+      "simultaneous_overlap_validated": true,
+      "simultaneous_reid_threshold": 0.95,
       "spatial_handoff_max_age_seconds": 3,
       "spatial_handoff_max_distance_m": 2.5,
       "spatial_handoff_similarity_threshold": 0.35
@@ -158,6 +159,7 @@
     "cam_1": {
       "label": "Cam1",
       "localization_mode": "approximate_homography",
+      "projection_domain_margin_normalized": 0.066,
       "position": [
         11.75,
         0.25
@@ -201,19 +203,19 @@
       "map_points": [
         [
           8.551,
-          2.088
+          5.088
         ],
         [
           8.48,
-          1.381
+          4.381
         ],
         [
           1.287,
-          1.593
+          4.593
         ],
         [
           1.252,
-          2.229
+          5.229
         ]
       ]
     },
@@ -429,19 +431,19 @@
       "map_points": [
         [
           8.551,
-          2.088
+          5.088
         ],
         [
           8.48,
-          1.381
+          4.381
         ],
         [
           1.287,
-          1.593
+          4.593
         ],
         [
           1.252,
-          2.229
+          5.229
         ]
       ]
     },

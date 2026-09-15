@@ -15,6 +15,7 @@
     "name": "Hikvision Camera 2",
     "role": "tracking",
     "face_recognition": false,
+    "yolo_frame_stride": 3,
     "source_env": "LAB_CAM_2_RTSP"
   },
   {

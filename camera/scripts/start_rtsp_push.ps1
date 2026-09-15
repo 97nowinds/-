@@ -14,6 +14,8 @@ param(
     [ValidateSet("tcp", "udp")]
     [string]$RtspTransport = "tcp",
     [int]$RestartSeconds = 5,
+    [int]$PublisherConnectGraceSeconds = 15,
+    [int]$PublisherMissLimit = 3,
     [switch]$PromptInConsole
 )
 
@@ -36,7 +38,10 @@ $ffmpeg = Find-FfmpegPath
 
 $passwordPointers = @()
 $processes = @{}
+$processStartedAt = @{}
+$publisherMisses = @{}
 $remotePassword = ""
+$remotePort = ([Uri]$RemoteBaseUrl).Port
 
 function Read-SecureStringInWindow([string]$Prompt) {
     if ($PromptInConsole) {
@@ -101,7 +106,15 @@ function Add-Credentials([string]$url, [string]$username, [string]$password) {
 function Start-Push([string]$name, [string]$sourceUrl, [string]$destinationUrl) {
     $argumentLine = "-hide_banner -loglevel error -nostdin -rtsp_transport $RtspTransport -fflags nobuffer -flags low_delay -i `"$sourceUrl`" -map 0:v:0 -map 0:a? -c:v copy -c:a copy -f rtsp -rtsp_transport tcp `"$destinationUrl`""
     $processes[$name] = Start-Process -FilePath $ffmpeg -ArgumentList $argumentLine -WindowStyle Hidden -PassThru
+    $processStartedAt[$name] = [DateTime]::UtcNow
+    $publisherMisses[$name] = 0
     Write-Host "$name push process started (PID $($processes[$name].Id))" -ForegroundColor Green
+}
+
+function Test-PublisherConnection([Diagnostics.Process]$process) {
+    if (-not $process -or $process.HasExited) { return $false }
+    $connections = Get-NetTCPConnection -OwningProcess $process.Id -State Established -ErrorAction SilentlyContinue
+    return [bool]($connections | Where-Object { $_.RemotePort -eq $remotePort } | Select-Object -First 1)
 }
 
 $password1 = Read-SecureStringInWindow "Password for Cam1 user '$Camera1Username'"
@@ -157,6 +170,22 @@ try {
                 if ($name -eq "Cam1") { Start-Push $name $source1 $remoteCam1 }
                 if ($name -eq "Cam2") { Start-Push $name $source2 $remoteCam2 }
                 if ($name -eq "Entrance") { Start-Push $name $sourceEntrance $remoteEntrance }
+            }
+            elseif (([DateTime]::UtcNow - $processStartedAt[$name]).TotalSeconds -ge $PublisherConnectGraceSeconds) {
+                if (Test-PublisherConnection $process) {
+                    $publisherMisses[$name] = 0
+                }
+                else {
+                    $publisherMisses[$name]++
+                    if ($publisherMisses[$name] -ge $PublisherMissLimit) {
+                        Write-Host "$name push process is alive but no longer publishing; forcing restart." -ForegroundColor Yellow
+                        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                        Start-Sleep -Seconds $RestartSeconds
+                        if ($name -eq "Cam1") { Start-Push $name $source1 $remoteCam1 }
+                        if ($name -eq "Cam2") { Start-Push $name $source2 $remoteCam2 }
+                        if ($name -eq "Entrance") { Start-Push $name $sourceEntrance $remoteEntrance }
+                    }
+                }
             }
         }
         Start-Sleep -Seconds 2

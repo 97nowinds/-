@@ -13,9 +13,12 @@ class MTMCConfigTests(unittest.TestCase):
             path.write_text(json.dumps({"reid": {"gallery_capacity": 7}}), encoding="utf-8")
             config = load_mtmc_config(path)
         self.assertEqual(config["reid"]["gallery_capacity"], 7)
-        self.assertEqual(config["algorithm_version"], "mtmc-2.0.6")
+        self.assertEqual(config["algorithm_version"], "mtmc-2.1.1")
         self.assertEqual(config["calibration"]["map_position_hold_seconds"], 8.0)
         self.assertEqual(config["calibration"]["max_motion_gap_seconds"], 0.25)
+        self.assertEqual(config["counting"]["confirmation_seconds"], 1.5)
+        self.assertEqual(config["counting"]["minimum_observations"], 3)
+        self.assertEqual(config["counting"]["duplicate_reid_similarity"], 0.97)
 
     def test_rejects_invalid_threshold_order(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -52,6 +55,16 @@ class MTMCConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(MTMCConfigError, "map_position_hold_seconds"):
+                load_mtmc_config(path)
+
+    def test_rejects_invalid_count_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mtmc.json"
+            path.write_text(
+                json.dumps({"counting": {"minimum_observations": 0}}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(MTMCConfigError, "minimum_observations"):
                 load_mtmc_config(path)
 
 

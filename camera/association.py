@@ -117,6 +117,14 @@ class BatchAssociator:
         self.calibration = config["calibration"]
         self.transitions = list(transitions or [])
         self.calibration_status = calibration_status
+        for transition in self.transitions:
+            if "simultaneous_reid_threshold" not in transition:
+                continue
+            threshold = float(transition["simultaneous_reid_threshold"])
+            if not 0.0 <= threshold <= 1.0:
+                raise ValueError(
+                    "camera transition simultaneous_reid_threshold must be between 0 and 1"
+                )
 
     def _transition(self, source, target):
         if source == target:
@@ -189,11 +197,14 @@ class BatchAssociator:
                 "reid_details": reid_details,
                 "time_gap_seconds": age,
             }
+        simultaneous_reid_threshold = float(
+            transition.get("simultaneous_reid_threshold", self.reid["high_similarity"])
+        )
         if (
             simultaneous
             and self.calibration_status != "formal"
             and validated_overlap
-            and reid_score < self.reid["high_similarity"]
+            and reid_score < simultaneous_reid_threshold
         ):
             return {
                 **evaluation,
@@ -203,6 +214,7 @@ class BatchAssociator:
                 "reid_details": reid_details,
                 "time_gap_seconds": age,
                 "simultaneous_overlap_validated": True,
+                "simultaneous_reid_threshold": simultaneous_reid_threshold,
             }
         components = {"reid": float(np.clip(reid_score, 0.0, 1.0))}
         components["time"] = float(np.clip(1.0 - age / max(max_gap, 1e-6), 0.0, 1.0))

@@ -46,6 +46,15 @@ class FakeFeatureExtractor:
         return feature / norm if norm > 0 else None
 
 
+class RecordingEventStore:
+    def __init__(self):
+        self.events = []
+
+    def record(self, event, **fields):
+        self.events.append({"event": event, **fields})
+        return self.events[-1]
+
+
 class YoloPersonTrackerTests(unittest.TestCase):
     def test_tracks_person_class_with_persistent_bytetrack(self):
         tracker = YoloPersonTracker("model.pt", model_factory=FakeModel)
@@ -148,6 +157,50 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
     def coordinator(self, floor_map, **kwargs):
         return CrossCameraTrackCoordinator(FakeFeatureExtractor(), floor_map, **kwargs)
 
+    def test_routine_bound_track_frames_do_not_flood_persistent_events(self):
+        event_store = RecordingEventStore()
+        coordinator = self.coordinator(
+            self.UncalibratedFloorMap(), event_store=event_store
+        )
+        frame = np.full((100, 160, 3), 120, dtype=np.uint8)
+        track = {"track_id": 1, "box": (20, 10, 40, 80), "position": None}
+
+        coordinator.update_batch(
+            "cam_1", [track], frame, monotonic_time=1.0, unix_time=100.0
+        )
+        initial_events = list(event_store.events)
+        coordinator.update_batch(
+            "cam_1", [track], frame, monotonic_time=1.1, unix_time=100.1
+        )
+
+        self.assertEqual(event_store.events, initial_events)
+        self.assertEqual(
+            [event["event"] for event in initial_events], ["create", "associate"]
+        )
+
+    def test_short_visual_track_is_not_counted_until_stable(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.full((100, 160, 3), 120, dtype=np.uint8)
+        track = {"track_id": 1, "box": (20, 10, 40, 80), "position": None}
+
+        coordinator.update_batch(
+            "cam_1", [track], frame, monotonic_time=1.0, unix_time=100.0
+        )
+        provisional = coordinator.track_diagnostics("cam_1", 1)
+        coordinator.update_batch(
+            "cam_1", [track], frame, monotonic_time=1.8, unix_time=100.8
+        )
+        coordinator.update_batch(
+            "cam_1", [track], frame, monotonic_time=2.6, unix_time=101.6
+        )
+        confirmed = coordinator.track_diagnostics("cam_1", 1)
+
+        self.assertFalse(provisional["counted"])
+        self.assertEqual(provisional["count_status"], "provisional")
+        self.assertTrue(confirmed["counted"])
+        self.assertEqual(confirmed["count_status"], "confirmed")
+        self.assertEqual(confirmed["observation_count"], 3)
+
     def test_batch_update_is_one_to_one_and_order_independent(self):
         floor_map = self.TransitionFloorMap()
 
@@ -219,6 +272,83 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         self.assertEqual(merged, source)
         self.assertEqual(coordinator.redirects[simultaneous], source)
 
+    def test_near_certain_cross_camera_duplicate_is_not_double_counted(self):
+        coordinator = self.coordinator(self.TransitionFloorMap())
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        frame[20:80, 30:70] = (20, 80, 180)
+        track = [{"track_id": 1, "box": (30, 20, 40, 60), "position": None}]
+
+        for now in (1.0, 1.8, 2.6):
+            coordinator.update_batch(
+                "cam_entrance", track, frame, monotonic_time=now, unix_time=99 + now
+            )
+        source = coordinator.track_diagnostics("cam_entrance", 1)
+        for now in (2.7, 3.5, 4.3):
+            coordinator.update_batch(
+                "cam_1", track, frame, monotonic_time=now, unix_time=99 + now
+            )
+        duplicate = coordinator.track_diagnostics("cam_1", 1)
+
+        self.assertTrue(source["counted"])
+        self.assertFalse(duplicate["counted"])
+        self.assertEqual(duplicate["count_status"], "duplicate_suppressed")
+        self.assertEqual(duplicate["count_duplicate_of"], source["global_id"])
+        self.assertGreaterEqual(duplicate["count_duplicate_reid_score"], 0.97)
+        groups = coordinator.diagnostics()["counting_duplicate_groups"]
+        self.assertEqual(len(groups), 1)
+        self.assertNotIn("appearance", groups[0])
+
+    def test_distinct_cross_camera_people_are_both_counted(self):
+        coordinator = self.coordinator(self.TransitionFloorMap())
+        source_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        source_frame[20:80, 30:70] = (20, 80, 180)
+        target_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        target_frame[20:80, 30:70] = (180, 80, 20)
+        track = [{"track_id": 1, "box": (30, 20, 40, 60), "position": None}]
+
+        for now in (1.0, 1.8, 2.6):
+            coordinator.update_batch(
+                "cam_entrance", track, source_frame, monotonic_time=now
+            )
+        for now in (2.7, 3.5, 4.3):
+            coordinator.update_batch("cam_1", track, target_frame, monotonic_time=now)
+
+        self.assertTrue(coordinator.track_diagnostics("cam_entrance", 1)["counted"])
+        self.assertTrue(coordinator.track_diagnostics("cam_1", 1)["counted"])
+        self.assertEqual(coordinator.diagnostics()["counting_duplicate_groups"], [])
+
+    def test_same_camera_reacquisition_does_not_block_late_cross_camera_merge(self):
+        coordinator = self.coordinator(self.TransitionFloorMap())
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        frame[20:80, 30:70] = (20, 80, 180)
+        track = [{"track_id": 1, "box": (30, 20, 40, 60), "position": None}]
+
+        source = coordinator.update_batch(
+            "cam_entrance", track, frame, monotonic_time=1.0, unix_time=100.0
+        )[1]
+        coordinator.forget_local("cam_entrance", 1)
+        recovered = coordinator.update_batch(
+            "cam_entrance", track, frame, monotonic_time=1.2, unix_time=100.2
+        )[1]
+
+        self.assertEqual(recovered, source)
+        self.assertNotIn(source, coordinator.association_reservations)
+
+        simultaneous = coordinator.update_batch(
+            "cam_1", track, frame, monotonic_time=1.3, unix_time=100.3
+        )[1]
+        self.assertNotEqual(simultaneous, source)
+        coordinator.update_batch(
+            "cam_entrance", [], frame, active_local_ids=set(),
+            monotonic_time=1.4, unix_time=100.4,
+        )
+        merged = coordinator.update_batch(
+            "cam_1", track, frame, monotonic_time=2.0, unix_time=101.0
+        )[1]
+
+        self.assertEqual(merged, source)
+        self.assertEqual(coordinator.redirects[simultaneous], source)
+
     def test_validated_simultaneous_overlap_preserves_oldest_global_id(self):
         coordinator = self.coordinator(self.ValidatedOverlapFloorMap())
         frame = np.zeros((100, 100, 3), dtype=np.uint8)
@@ -234,6 +364,7 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
 
         self.assertEqual(simultaneous, oldest)
         self.assertNotIn(oldest, coordinator.redirects)
+        self.assertTrue(coordinator.track_diagnostics("cam_1", 1)["counted"])
 
     def test_same_appearance_in_overlap_keeps_global_id(self):
         coordinator = self.coordinator(self.FloorMap(), similarity_threshold=0.70)

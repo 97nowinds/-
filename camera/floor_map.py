@@ -37,6 +37,7 @@ class FloorMapProjector:
             raise FloorMapError(
                 "projection_domain_margin_normalized must be between 0 and 0.25"
             )
+        self.camera_projection_domain_margins = {}
         zones = config.get("zones", [])
         zones_by_id = {zone.get("id"): zone for zone in zones if zone.get("id")}
         allowed_zone_ids = config.get("tracking_allowed_zone_ids", [])
@@ -61,6 +62,17 @@ class FloorMapProjector:
         self._last_mapped_people = {}
         self._filter_lock = threading.RLock()
         for camera_id, camera in config.get("cameras", {}).items():
+            camera_margin = float(
+                camera.get(
+                    "projection_domain_margin_normalized",
+                    self.projection_domain_margin,
+                )
+            )
+            if not 0.0 <= camera_margin <= 0.25:
+                raise FloorMapError(
+                    f"{camera_id}.projection_domain_margin_normalized must be between 0 and 0.25"
+                )
+            self.camera_projection_domain_margins[camera_id] = camera_margin
             annotation = config.get("annotations", {}).get(camera_id, {})
             self.tracking_image_regions[camera_id] = self._tracking_regions(
                 annotation.get("regions", {})
@@ -136,13 +148,16 @@ class FloorMapProjector:
             float(y + height) / float(frame_height),
         )
         domain = self.image_domains.get(camera_id)
+        margin = self.camera_projection_domain_margins.get(
+            camera_id, self.projection_domain_margin
+        )
         if domain is not None:
             distance = cv2.pointPolygonTest(domain, footpoint, True)
-            if distance < -self.projection_domain_margin:
+            if distance < -margin:
                 return False
         regions = self.tracking_image_regions.get(camera_id, [])
         if regions and not any(
-            cv2.pointPolygonTest(region, footpoint, True) >= -self.projection_domain_margin
+            cv2.pointPolygonTest(region, footpoint, True) >= -margin
             for region in regions
         ):
             return False
@@ -171,7 +186,10 @@ class FloorMapProjector:
         signed_distance = cv2.pointPolygonTest(
             self.image_domains[camera_id], (float(foot_x), float(foot_y)), True
         )
-        if signed_distance < -self.projection_domain_margin:
+        margin = self.camera_projection_domain_margins.get(
+            camera_id, self.projection_domain_margin
+        )
+        if signed_distance < -margin:
             self._projection_status[camera_id] = {
                 "quality": "low",
                 "reason": "footpoint outside calibrated image domain",
@@ -857,6 +875,21 @@ class FloorMapProjector:
                     "person_number": best.get("person_number"),
                     "name": best.get("name") or "未注册",
                     "identified": bool(best.get("person_id")),
+                    "counted": bool(
+                        best.get("person_id")
+                        or any(match.get("counted", True) for match in matches)
+                    ),
+                    "count_status": (
+                        "identified"
+                        if best.get("person_id")
+                        else "confirmed"
+                        if any(match.get("counted", True) for match in matches)
+                        else best.get("count_status") or "provisional"
+                    ),
+                    "count_duplicate_of": best.get("count_duplicate_of"),
+                    "count_duplicate_reid_score": best.get(
+                        "count_duplicate_reid_score"
+                    ),
                     "identity_source": best.get("identity_source") or "visual",
                     "identity_lock_status": (
                         best.get("identity_lock_status")
@@ -953,6 +986,13 @@ class FloorMapProjector:
             else None
         )
         public["people"] = people
+        public["counted_people"] = sum(
+            1 for person in people if person.get("counted", True)
+        )
+        public["provisional_people"] = sum(
+            1 for person in people if not person.get("counted", True)
+        )
+        public["visual_track_count"] = len(people)
         public["map_position_hold_seconds"] = float(map_position_hold_seconds)
         public["max_motion_gap_seconds"] = float(max_motion_gap_seconds)
         return public

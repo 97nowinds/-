@@ -10,7 +10,7 @@ class MTMCConfigError(ValueError):
 
 
 DEFAULT_CONFIG = {
-    "algorithm_version": "mtmc-2.0.6",
+    "algorithm_version": "mtmc-2.1.1",
     "calibration": {
         "formal_required_for_geometry": True,
         "max_stream_skew_seconds": 0.5,
@@ -38,6 +38,11 @@ DEFAULT_CONFIG = {
         "high_confidence_score": 0.78,
         "medium_confidence_score": 0.62,
         "weights": {"reid": 0.65, "time": 0.20, "geometry": 0.10, "motion": 0.05},
+    },
+    "counting": {
+        "confirmation_seconds": 1.5,
+        "minimum_observations": 3,
+        "duplicate_reid_similarity": 0.97,
     },
     "events": {
         "path": "runtime/mtmc_events.jsonl",
@@ -98,6 +103,9 @@ def validate_config(config):
         "association.pending_ttl_seconds": (0.1, 60.0, False),
         "association.high_confidence_score": (0.0, 1.0, False),
         "association.medium_confidence_score": (0.0, 1.0, False),
+        "counting.confirmation_seconds": (0.0, 30.0, False),
+        "counting.minimum_observations": (1, 100, True),
+        "counting.duplicate_reid_similarity": (0.0, 1.0, False),
         "events.memory_limit": (10, 10000, True),
         "events.retention_days": (1, 3650, True),
     }

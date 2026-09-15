@@ -154,6 +154,28 @@ class BatchAssociationTests(unittest.TestCase):
         self.assertFalse(decisions[0]["accepted"])
         self.assertEqual(evaluations[0]["reason"], "validated_overlap_reid_below_high")
 
+    def test_validated_overlap_can_require_stricter_simultaneous_reid(self):
+        transitions = [
+            {
+                "from": "cam_entrance",
+                "to": "cam_2",
+                "max_gap_seconds": 20,
+                "bidirectional": True,
+                "simultaneous_overlap_validated": True,
+                "simultaneous_reid_threshold": 0.95,
+            }
+        ]
+        associator = BatchAssociator(self.config, transitions, "approximate")
+        observation = self.observation(10, [0.9, 0.43589], camera="cam_entrance", now=2)
+        target = self.target("person_1", [1, 0], camera="cam_2", seen=2)
+        target.active_camera_ids = {"cam_2"}
+
+        decisions, evaluations = associator.associate([observation], [target])
+
+        self.assertFalse(decisions[0]["accepted"])
+        self.assertEqual(evaluations[0]["reason"], "validated_overlap_reid_below_high")
+        self.assertEqual(evaluations[0]["simultaneous_reid_threshold"], 0.95)
+
 
 if __name__ == "__main__":
     unittest.main()

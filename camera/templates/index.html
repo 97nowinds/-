@@ -3,15 +3,20 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>双海康人脸识别追踪</title>
+    <title>实验室智能安全监测大屏</title>
     <link rel="stylesheet" href="/static/styles.css">
   </head>
   <body>
-    <main class="app-shell">
-      <header class="topbar">
-        <div>
-          <h1>双海康人脸识别追踪</h1>
-          <p>人脸确认 · 侧脸/背身持续跟踪 · 跨摄像头身份继承</p>
+    <main class="app-shell dashboard-shell">
+      <header class="topbar display-topbar">
+        <div class="display-clock" aria-label="当前时间">
+          <strong id="dashboardTime">--:--:--</strong>
+          <span id="dashboardDate">----年--月--日</span>
+        </div>
+        <div class="display-title">
+          <span>LABORATORY INTELLIGENT MONITORING</span>
+          <h1>实验室智能安全监测大屏</h1>
+          <p>人员识别 · 跨镜追踪 · 仪器交互 · 环境安全</p>
         </div>
         <div class="topbar-actions">
           <button id="recordingControlButton" class="tool-link recording-launch" type="button">
@@ -25,57 +30,30 @@
         </div>
       </header>
 
-      <section class="summary-grid">
-        <article>
-          <span>摄像头状态</span>
-          <strong id="cameraSummary">检查中</strong>
-        </article>
-        <article>
-          <span>当前注册身份</span>
-          <strong id="identitySummary">尚未确认</strong>
-        </article>
-        <article>
-          <span>跨镜头状态</span>
-          <strong id="handoffSummary">等待目标</strong>
-        </article>
-      </section>
+      <section class="dashboard-layout">
+        <div class="display-main">
+          <section class="display-panel monitoring-panel">
+            <header class="display-panel-header">
+              <div>
+                <span class="panel-index">01</span>
+                <h2>实时监控画面</h2>
+              </div>
+              <span class="panel-caption">REAL-TIME MONITORING</span>
+            </header>
+            <section class="video-grid" id="videoGrid"></section>
+          </section>
 
-      <section class="environment-panel" aria-labelledby="environmentTitle">
-        <header>
-          <div>
-            <h2 id="environmentTitle">环境与火情监测</h2>
-            <span id="environmentDevice">HAFS 硬件未配置</span>
-          </div>
-          <strong id="environmentStatus" class="environment-status disabled">未接入</strong>
-        </header>
-        <div class="environment-grid">
-          <article>
-            <span>温度</span>
-            <strong id="temperatureValue">--.- ℃</strong>
-            <small id="temperatureState">等待 DHT 数据</small>
-          </article>
-          <article>
-            <span>湿度</span>
-            <strong id="humidityValue">--.- %</strong>
-            <small id="humidityState">等待 DHT 数据</small>
-          </article>
-          <article id="flameCard" class="flame-card">
-            <span>火焰触点</span>
-            <strong id="flameValue">未知</strong>
-            <small id="flameState">等待硬件状态</small>
-          </article>
-        </div>
-      </section>
-
-      <section class="monitoring-layout">
-        <section class="video-grid" id="videoGrid"></section>
-        <aside class="floor-map-panel">
+          <aside class="floor-map-panel display-panel">
           <header>
             <div>
+              <span class="panel-index">02</span>
               <h2>实验室实时位置</h2>
-              <span id="floorMapMode">示意映射</span>
+              <span class="panel-caption">LIVE POSITION MAP</span>
             </div>
-            <strong id="floorMapCount">0 人</strong>
+            <div class="map-header-status">
+              <span id="floorMapMode">示意映射</span>
+              <strong id="floorMapCount">0 人</strong>
+            </div>
           </header>
           <div class="floor-map-viewport">
             <svg id="floorMapSvg" viewBox="0 0 1200 700" role="img" aria-label="实验室人员实时位置俯视图">
@@ -92,16 +70,80 @@
           <div id="floorMapPeopleList" class="floor-map-people-list">
             <span class="empty">当前没有活动目标</span>
           </div>
+          </aside>
+        </div>
+
+        <aside class="information-rail" aria-label="综合信息提示">
+          <section class="summary-grid display-panel">
+            <header class="rail-panel-header">
+              <h2>运行概览</h2>
+              <span>SYSTEM OVERVIEW</span>
+            </header>
+            <article>
+              <span>摄像头状态</span>
+              <strong id="cameraSummary">检查中</strong>
+            </article>
+            <article>
+              <span>当前识别身份</span>
+              <strong id="identitySummary">尚未确认</strong>
+            </article>
+            <article>
+              <span>跨镜头状态</span>
+              <strong id="handoffSummary">等待目标</strong>
+            </article>
+          </section>
+
+          <section class="environment-panel display-panel" aria-labelledby="environmentTitle">
+            <header>
+              <div>
+                <h2 id="environmentTitle">环境与火情监测</h2>
+                <span id="environmentDevice">HAFS 硬件未配置</span>
+              </div>
+              <strong id="environmentStatus" class="environment-status disabled">未接入</strong>
+            </header>
+            <div class="environment-grid">
+              <article>
+                <span>温度</span>
+                <strong id="temperatureValue">--.- ℃</strong>
+                <small id="temperatureState">等待 DHT 数据</small>
+              </article>
+              <article>
+                <span>湿度</span>
+                <strong id="humidityValue">--.- %</strong>
+                <small id="humidityState">等待 DHT 数据</small>
+              </article>
+              <article id="flameCard" class="flame-card">
+                <span>火焰触点</span>
+                <strong id="flameValue">未知</strong>
+                <small id="flameState">等待硬件状态</small>
+              </article>
+            </div>
+          </section>
+
+          <section class="event-panel display-panel">
+            <header class="rail-panel-header">
+              <h2>信息提示</h2>
+              <span>LIVE NOTIFICATIONS</span>
+            </header>
+            <div id="eventFeed" class="event-feed" aria-live="polite">
+              <div class="event-placeholder">等待实时状态数据</div>
+            </div>
+          </section>
+
+          <section class="people-panel display-panel">
+            <header>
+              <h2>已注册人员</h2>
+              <span>原有样本库</span>
+            </header>
+            <div id="peopleList" class="people-list"></div>
+          </section>
         </aside>
       </section>
 
-      <section class="people-panel">
-        <header>
-          <h2>已注册人员</h2>
-          <span>使用原有样本库</span>
-        </header>
-        <div id="peopleList" class="people-list"></div>
-      </section>
+      <footer class="display-footer">
+        <span>AI VISION SAFETY PLATFORM</span>
+        <span>实时数据展示 · 数据刷新周期 200ms</span>
+      </footer>
     </main>
 
     <dialog id="recordingDialog" class="recording-dialog" aria-labelledby="recordingDialogTitle">

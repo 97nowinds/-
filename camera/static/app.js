@@ -20,6 +20,9 @@ const floorMapPeopleLayer = document.querySelector("#floorMapPeople");
 const floorMapMode = document.querySelector("#floorMapMode");
 const floorMapCount = document.querySelector("#floorMapCount");
 const floorMapPeopleList = document.querySelector("#floorMapPeopleList");
+const dashboardTime = document.querySelector("#dashboardTime");
+const dashboardDate = document.querySelector("#dashboardDate");
+const eventFeed = document.querySelector("#eventFeed");
 const recordingControlButton = document.querySelector("#recordingControlButton");
 const recordingControlLabel = document.querySelector("#recordingControlLabel");
 const recordingDialog = document.querySelector("#recordingDialog");
@@ -62,6 +65,29 @@ let floorMapSignature = "";
 let latestRecording = null;
 let latestCameras = [];
 let recordingMutationPending = false;
+
+function updateDashboardClock() {
+  const now = new Date();
+  if (dashboardTime) {
+    dashboardTime.textContent = now.toLocaleTimeString("zh-CN", {
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  }
+  if (dashboardDate) {
+    dashboardDate.textContent = now.toLocaleDateString("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      weekday: "short",
+    });
+  }
+}
+
+updateDashboardClock();
+window.setInterval(updateDashboardClock, 1000);
 
 function formatElapsed(seconds) {
   const total = Math.max(0, Math.floor(Number(seconds) || 0));
@@ -339,9 +365,10 @@ function renderFloorPlan(floorMap) {
 }
 
 function personLabel(person) {
+  if (person.count_status === "duplicate_suppressed") return "疑似重复（不计数）";
+  if (person.counted === false) return "待确认（不计数）";
   if (!person.identified) {
-    const match = String(person.track_id || "").match(/^person_(\d+)$/);
-    return match ? `目标 ${match[1]}（未注册）` : "未注册";
+    return "未注册目标";
   }
   const number = person.person_number ? `${person.person_number}号 ` : "";
   return `${number}${person.name || "已确认"}`;
@@ -385,7 +412,10 @@ function renderFloorMap(floorMap) {
   updateFloorTrails(floorMap);
   floorMapMode.textContent = floorMap.calibrated ? "四点标定" : "示意映射";
   floorMapMode.className = floorMap.calibrated ? "calibrated" : "schematic";
-  floorMapCount.textContent = `${floorMap.people.length} 人`;
+  const countedPeople = Number.isFinite(Number(floorMap.counted_people))
+    ? Number(floorMap.counted_people)
+    : floorMap.people.filter((person) => person.counted !== false).length;
+  floorMapCount.textContent = `${countedPeople} 人`;
   floorMapPeopleLayer.replaceChildren();
   floorMapTrailsLayer.replaceChildren();
 
@@ -432,7 +462,7 @@ function renderFloorMap(floorMap) {
         <span class="floor-person-indicator ${person.identified ? "identified" : "unknown"}"></span>
         <strong>${escapeHtml(personLabel(person))}</strong>
         <span class="floor-person-location">${escapeHtml(["内侧通道", "后端操作区"].includes(person.zone) ? "侧向通道" : person.zone)} · ${escapeHtml(person.cameras.join(" + "))}${person.position_estimated ? ` · 定位保持 ${Number(person.position_age_seconds || 0).toFixed(1)}s` : ""}</span>
-        <span class="floor-person-lock ${person.identity_lock_status === "locked" ? "locked" : "visual"}">${person.identity_lock_status === "locked" ? "已锁定" : "视觉追踪"} · ${escapeHtml(person.global_track_id || person.track_id)}</span>
+        <span class="floor-person-lock ${person.identity_lock_status === "locked" ? "locked" : "visual"}">${person.identity_lock_status === "locked" ? "已锁定" : person.count_status === "duplicate_suppressed" ? "跨摄疑似重复 · 不计数" : person.counted === false ? "临时候选 · 不计数" : "视觉追踪"}</span>
       </div>
     `).join("")
     : `<span class="empty">当前没有活动目标</span>`;
@@ -445,7 +475,7 @@ function modeText(camera) {
       return "ArcFace 模型未就绪";
     }
     return camera.tracking
-      ? `${camera.role === "entrance_identity" ? "门口识别" : "YOLO 追踪"} · ${camera.tracked_people || 0} 人`
+      ? `${camera.role === "entrance_identity" ? "门口识别" : "YOLO 追踪"} · ${camera.counted_people ?? camera.tracked_people ?? 0} 人`
       : "YOLO 等待人员进入";
   }
   return ["handoff", "overlap_handoff", "transition_handoff"].includes(camera.identity.identity_source)
@@ -497,6 +527,71 @@ function renderEnvironment(environment = {}) {
       : `${environment.age_seconds.toFixed(1)} 秒前更新`;
 }
 
+function renderEventFeed(state) {
+  if (!eventFeed) return;
+  const now = new Date().toLocaleTimeString("zh-CN", {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  const rows = [];
+  const environment = state.environment || {};
+  const activePeople = state.floor_map?.people || [];
+
+  if (environment.flame_alarm) {
+    rows.push({time: now, text: "检测到火焰触点告警，请立即核查", tag: "环境告警", tone: "alarm"});
+  }
+
+  for (const camera of state.cameras || []) {
+    if (camera.status !== "running") {
+      rows.push({time: now, text: `${camera.name || camera.id} 当前状态：${camera.status}`, tag: "设备提示", tone: "warning"});
+      continue;
+    }
+    if (camera.identity) {
+      rows.push({time: now, text: `${camera.name || camera.id} 已识别 ${identityText(camera.identity)}`, tag: "人员识别", tone: "normal"});
+    }
+  }
+
+  const handoffCamera = (state.cameras || []).find((camera) =>
+    ["handoff", "overlap_handoff", "transition_handoff"].includes(camera.identity?.identity_source),
+  );
+  if (handoffCamera) {
+    rows.push({
+      time: now,
+      text: `${handoffCamera.identity.handoff_from_camera} → ${handoffCamera.id} 身份继承完成`,
+      tag: "跨镜追踪",
+      tone: "normal",
+    });
+  }
+
+  const rawInteractions = state.interaction_events || state.instrument_interaction?.events || state.interactions || [];
+  for (const interaction of Array.isArray(rawInteractions) ? rawInteractions.slice(0, 3) : []) {
+    rows.push({
+      time: String(interaction.time || interaction.timestamp || now).slice(-8),
+      text: interaction.message || interaction.description || interaction.event || "检测到仪器交互",
+      tag: "仪器交互",
+      tone: interaction.level === "alarm" ? "alarm" : "normal",
+    });
+  }
+
+  if (!rows.length) {
+    rows.push(
+      {time: now, text: `${state.cameras?.length || 0} 路监控状态持续检测中`, tag: "系统运行", tone: "normal"},
+      {time: now, text: activePeople.length ? `实验室内当前检测到 ${activePeople.length} 人` : "当前区域未检测到活动目标", tag: "区域状态", tone: "normal"},
+      {time: now, text: "仪器交互信息区域已预留", tag: "仪器交互", tone: "normal"},
+    );
+  }
+
+  eventFeed.innerHTML = rows.slice(0, 7).map((row) => `
+    <div class="event-row ${escapeHtml(row.tone)}">
+      <time>${escapeHtml(row.time)}</time>
+      <strong>${escapeHtml(row.text)}</strong>
+      <span>${escapeHtml(row.tag)}</span>
+    </div>
+  `).join("");
+}
+
 function renderInitial(state) {
   videoGrid.innerHTML = state.cameras.map((camera) => `
     <article class="camera-card" data-camera-id="${escapeHtml(camera.id)}">
@@ -536,6 +631,7 @@ function update(state) {
   renderFloorMap(state.floor_map);
   renderRecording(state.recording, state.cameras);
   renderEnvironment(state.environment);
+  renderEventFeed(state);
 
   for (const camera of state.cameras) {
     const card = document.querySelector(`[data-camera-id="${CSS.escape(camera.id)}"]`);

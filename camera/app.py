@@ -1095,6 +1095,19 @@ class CameraWorker:
                 item["local_id"]: item["track_id"] for item in cached_tracks
             }
 
+        # Filter the detector result before deciding whether the previous
+        # trustworthy tracks should be held. A transient bench/equipment false
+        # positive must not suppress the short occlusion hold for a real person.
+        unfiltered_track_count = len(tracks)
+        tracks = [
+            track
+            for track in tracks
+            if self.floor_map.track_footpoint_allowed(
+                self.camera["id"], track.get("box"), frame.shape
+            )
+        ]
+        self.roi_rejected_tracks = unfiltered_track_count - len(tracks)
+
         # A detector can miss a person for one inference cycle because of blur,
         # occlusion, or RTSP jitter. Keep the last ByteTrack boxes briefly so
         # the map trajectory remains continuous; a stale target is still
@@ -1123,20 +1136,6 @@ class CameraWorker:
             cached_global_ids = {
                 item["local_id"]: item["track_id"] for item in cached_tracks
             }
-
-        # A local tracker can follow people-like shapes on benches or equipment.
-        # Keep identity and MTMC state limited to the camera's annotated walkable
-        # image region; the four-point projection domain is the stricter boundary
-        # when one exists.
-        unfiltered_track_count = len(tracks)
-        tracks = [
-            track
-            for track in tracks
-            if self.floor_map.track_footpoint_allowed(
-                self.camera["id"], track.get("box"), frame.shape
-            )
-        ]
-        self.roi_rejected_tracks = unfiltered_track_count - len(tracks)
 
         # A confirmed identity belongs to the active ByteTrack target. Keep
         # that name while the target moves, but clear it when the ID is gone.
@@ -1218,6 +1217,9 @@ class CameraWorker:
             track_identity = (
                 self.track_identities.get(local_id)
             )
+            mtmc_diagnostics = self.coordinator.track_diagnostics(
+                self.camera["id"], local_id
+            )
 
             if len(trail) >= 2:
                 cv2.polylines(
@@ -1239,7 +1241,11 @@ class CameraWorker:
                 )
                 label_color = (80, 220, 130)
             else:
-                display_label = f"PERSON {global_number}"
+                display_label = (
+                    "UNREGISTERED"
+                    if mtmc_diagnostics["counted"]
+                    else "PENDING"
+                )
                 label_color = color
             cv2.putText(
                 display,
@@ -1267,6 +1273,13 @@ class CameraWorker:
                         "name": track_identity.get("name") if track_identity else None,
                         "identity_source": track_identity.get("identity_source", "face") if track_identity else "yolo_handoff",
                         "confidence": track["confidence"],
+                        "counted": mtmc_diagnostics["counted"],
+                        "count_status": mtmc_diagnostics["count_status"],
+                        "count_duplicate_of": mtmc_diagnostics["count_duplicate_of"],
+                        "count_duplicate_reid_score": mtmc_diagnostics[
+                            "count_duplicate_reid_score"
+                        ],
+                        "track_age_seconds": mtmc_diagnostics["track_age_seconds"],
                         "observed_at": frame_unix_time,
                         "observed_monotonic": now,
                         "timestamp_source": (
@@ -1274,9 +1287,6 @@ class CameraWorker:
                         ),
                     }
                 )
-            mtmc_diagnostics = self.coordinator.track_diagnostics(
-                self.camera["id"], local_id
-            )
             published_tracks.append(
                 {
                     "track_id": global_id,
@@ -1287,6 +1297,14 @@ class CameraWorker:
                     "association_confidence": mtmc_diagnostics["confidence"],
                     "association_score": mtmc_diagnostics["final_match_score"],
                     "association_pending": mtmc_diagnostics["pending"],
+                    "counted": mtmc_diagnostics["counted"],
+                    "count_status": mtmc_diagnostics["count_status"],
+                    "count_duplicate_of": mtmc_diagnostics["count_duplicate_of"],
+                    "count_duplicate_reid_score": mtmc_diagnostics[
+                        "count_duplicate_reid_score"
+                    ],
+                    "track_age_seconds": mtmc_diagnostics["track_age_seconds"],
+                    "observation_count": mtmc_diagnostics["observation_count"],
                 }
             )
 
@@ -1685,6 +1703,12 @@ class CameraWorker:
             "identities": identities,
             "tracking": tracking,
             "tracked_people": len(yolo_tracks),
+            "counted_people": sum(
+                1 for track in yolo_tracks if track.get("counted", True)
+            ),
+            "provisional_people": sum(
+                1 for track in yolo_tracks if not track.get("counted", True)
+            ),
             "roi_rejected_tracks": self.roi_rejected_tracks,
             "yolo_tracks": yolo_tracks,
             "tracker_engine": "YOLOv8n + ByteTrack",
@@ -1742,8 +1766,11 @@ class CameraManager:
         self.floor_map = FloorMapProjector.from_path(FLOOR_MAP_PATH)
         self.mtmc_config = load_mtmc_config(MTMC_CONFIG_PATH)
         event_config = self.mtmc_config["events"]
+        event_path = Path(
+            os.environ.get("LAB_MTMC_EVENT_PATH", BASE_DIR / event_config["path"])
+        ).expanduser().resolve()
         self.event_store = AssociationEventStore(
-            BASE_DIR / event_config["path"],
+            event_path,
             memory_limit=event_config["memory_limit"],
             retention_days=event_config["retention_days"],
         )

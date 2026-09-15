@@ -52,6 +52,16 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn("${API_BASE}/api/state", source)
         self.assertIn("${API_BASE}/video/", source)
 
+    def test_provisional_tracks_are_visible_but_excluded_from_people_count(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("floorMap.counted_people", source)
+        self.assertIn('person.counted === false', source)
+        self.assertIn("待确认（不计数）", source)
+        self.assertIn("临时候选 · 不计数", source)
+        self.assertIn("跨摄疑似重复 · 不计数", source)
+        self.assertNotIn("目标 ${match[1]}（未注册）", source)
+
     def test_monitoring_page_exposes_hardware_environment_state(self):
         template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
         script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
@@ -76,6 +86,14 @@ class FrontendSeparationTests(unittest.TestCase):
         service = (ROOT.parent / "cluster" / "camera_service.slurm").read_text(encoding="utf-8")
 
         self.assertIn('export LAB_FLOOR_MAP_PATH="${LAB_FLOOR_MAP_PATH:-$PROJECT_ROOT/camera/config/floor_map.json}"', service)
+        self.assertIn('export LAB_MTMC_EVENT_PATH="${LAB_MTMC_EVENT_PATH:-$PROJECT_ROOT/camera/runtime/mtmc_events.jsonl}"', service)
+
+    def test_rtsp_push_watchdog_detects_a_stuck_publisher(self):
+        script = (ROOT / "scripts" / "start_rtsp_push.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Test-PublisherConnection", script)
+        self.assertIn("alive but no longer publishing; forcing restart", script)
+        self.assertIn("Get-NetTCPConnection -OwningProcess", script)
 
     def test_monitoring_page_exposes_fixed_calibration_entry(self):
         template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
@@ -128,14 +146,36 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertLessEqual(cam1["yolo_frame_stride"], 3)
         self.assertGreaterEqual(cam1["yolo_image_size"], 768)
 
-    def test_approximate_map_disables_simultaneous_overlap_identity_merge(self):
+    def test_cam2_detection_rate_is_sufficient_for_main_aisle_handoffs(self):
+        cameras = json.loads((ROOT / "config" / "cameras.json").read_text(encoding="utf-8"))
+        cam2 = next(camera for camera in cameras if camera["id"] == "cam_2")
+
+        self.assertLessEqual(cam2["yolo_frame_stride"], 3)
+
+    def test_roi_filter_runs_before_short_track_hold_decision(self):
+        backend = (ROOT / "app.py").read_text(encoding="utf-8")
+
+        self.assertLess(
+            backend.index("unfiltered_track_count = len(tracks)"),
+            backend.index("hold_cached_tracks = bool("),
+        )
+
+    def test_approximate_map_only_enables_observed_entrance_cam2_overlap(self):
         floor_map = json.loads((ROOT / "config" / "floor_map.json").read_text(encoding="utf-8"))
         transitions = floor_map["camera_transitions"]
 
         self.assertEqual(floor_map["calibration"]["status"], "approximate")
         self.assertEqual(len(transitions), 3)
         self.assertTrue(all(item["bidirectional"] for item in transitions))
-        self.assertFalse(any(item["simultaneous_overlap_validated"] for item in transitions))
+        validated = [
+            item for item in transitions if item["simultaneous_overlap_validated"]
+        ]
+        self.assertEqual(len(validated), 1)
+        self.assertEqual(
+            {validated[0]["from"], validated[0]["to"]},
+            {"cam_entrance", "cam_2"},
+        )
+        self.assertEqual(validated[0]["simultaneous_reid_threshold"], 0.95)
 
     def test_state_reports_arcface_gallery_completion_counts(self):
         backend = (ROOT / "app.py").read_text(encoding="utf-8")
