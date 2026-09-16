@@ -51,6 +51,7 @@ PNG 使用固定版式：
 - 每路画面必须记录自身的 `frame_captured_at`，不能把网页截图时间冒充摄像头采集时间。
 - 默认允许画面与地图状态相差不超过 2 秒；超过时仍可保存，但 JSON 标记 `synchronized: false`，PNG 显示“时间未对齐”。
 - 行为结果设置有效期，默认 5 秒。过期行为显示“动作未知”，不能沿用上一分钟的动作。
+- 仪器交互分析帧默认每秒 4 帧（可配置），前端结果仍每秒查询一次；综合证据截图仍每分钟保存一次。
 - 单路摄像头失败不阻断整包保存：对应区域显示“画面不可用”，JSON 记录失败原因。
 
 ## 4. 结构化数据契约
@@ -116,6 +117,10 @@ PNG 使用固定版式：
 GET /api/activity/state?at=2026-09-14T15:03:00.217%2B08:00
 ```
 
+当前成员接口实现使用 `GET /api/interaction-results/latest`，并支持 `?camera_id=cam_2`。返回结果使用 `camera_id + snapshot_id + track_id` 关联原始帧；实时显示时还必须检查 `expires_at`，过期后立即移除绿色框和仪器名称。
+
+本机前端通过同源 `/api/interaction-results/latest` 代理访问成员接口，Bearer Token 只保存在服务端进程环境中，不进入浏览器脚本、URL、日志或 Git。成员接口不可用时代理返回空结果和明确的降级状态，不阻断摄像头、地图、环境硬件或录像功能。
+
 最少返回：
 
 - `person_id` 或 `track_id`；
@@ -172,7 +177,7 @@ GET  /api/snapshots/latest
 
 ```json
 {
-  "schema_version": "hooker-handoff-1.0",
+  "schema_version": "lab-handoff-1.1",
   "event_id": "snapshot.ready:20260914T150300+0800",
   "event_type": "snapshot.ready",
   "occurred_at": "2026-09-14T15:03:01.102+08:00",
@@ -229,6 +234,10 @@ GET  /api/handoffs/{event_id}
 
 在上述契约确认前只实现 `HookerAdapter` 接口和本地假实现，不向未知地址发送任何真实实验室数据。
 
+当前已实现的 `MemberServiceClient` 默认不会自动投递。`scripts/test_member_connection.py` 只允许构造固定的无人物 `connection.test`，用于验证 `/health`、重复 `event_id` 幂等回执和空 interaction results；真实人物、姓名、人脸、位置、画面或 embedding 均不属于该联调负载。
+
+已确认的图片传输契约：对方按 `image_url` 主动拉取 JPEG；地址必须直接返回 `200` 和 `Content-Type: image/jpeg`，不允许重定向。图片至少保留 30 秒，对方使用精确 IP:端口白名单、8 MiB 限制和 3 秒超时。时间字段统一为 `captured_at`。
+
 ## 8. 实施架构
 
 推荐新增 `SnapshotCoordinator`，运行在能够同时访问以下资源的本机服务中：
@@ -237,6 +246,7 @@ GET  /api/handoffs/{event_id}
 - 三路监控帧：现有 `/video/<camera_id>`，实施时最好新增单帧 JPEG 接口 `/api/cameras/<camera_id>/snapshot`；
 - 本机环境硬件：当前 `http://127.0.0.1:5173/api/environment`；
 - 未来行为接口：`/api/activity/state`。
+- 成员仪器交互接口：`GET /api/interaction-results/latest`，前端每秒查询一次。
 
 合成工作不依赖浏览器窗口是否打开。前端页面可增加“最近截图”“立即截图”和“截图健康状态”，但定时保存由后台服务完成。浏览器全页截图只作为视觉回归测试，不作为正式证据生成方式。
 

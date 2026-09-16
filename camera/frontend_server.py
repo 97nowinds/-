@@ -1,10 +1,18 @@
 import argparse
+import base64
 import json
 import os
+import re
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from hardware_serial import EnvironmentSerialMonitor, discover_hardware_port
+from member_integration import (
+    MemberIntegrationConfigError,
+    MemberIntegrationTransportError,
+    MemberServiceClient,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -13,6 +21,17 @@ ANNOTATE_TEMPLATE = ROOT / "templates" / "annotate.html"
 FACES_TEMPLATE = ROOT / "templates" / "faces.html"
 RECORDINGS_TEMPLATE = ROOT / "templates" / "recordings.html"
 STATIC = ROOT / "static"
+
+# Contains no camera content or people. This lets the handoff consumer verify
+# its allowlist, MIME checks and download path before real frames are shared.
+HANDOFF_TEST_JPEG = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U"
+    "HRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgN"
+    "DRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy"
+    "MjIyMjL/wAARCAAkAEADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEA"
+    "EAAAAAAAAAAAAAAAAAAAAA/8QAFgEBAQEAAAAAAAAAAAAAAAAAAAID/8QAFBEBAAAAAAAA"
+    "AAAAAAAAAAAAAP/aAAwDAQACEQMRAD8Ai4DRAAAAAAAAAAAAAAAAAAAAAAD/2Q=="
+)
 
 
 class FrontendHandler(SimpleHTTPRequestHandler):
@@ -29,10 +48,24 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_GET(self):
-        route = self.path.split("?", 1)[0]
+        parsed = urlsplit(self.path)
+        route = parsed.path
+        if route == "/api/handoff/test.jpg":
+            self._send_bytes(
+                HANDOFF_TEST_JPEG,
+                "image/jpeg",
+                cache_control="public, max-age=30",
+            )
+            return
         if route == "/api/environment":
             data = json.dumps(self.server.environment.status(), ensure_ascii=False).encode("utf-8")
             self._send_bytes(data, "application/json; charset=utf-8")
+            return
+        if route == "/api/integration/status":
+            self._send_json(self.server.member_integration_status)
+            return
+        if route == "/api/interaction-results/latest":
+            self._proxy_interaction_results(parsed.query)
             return
         if route == "/":
             self._send_html(TEMPLATE)
@@ -58,14 +91,44 @@ class FrontendHandler(SimpleHTTPRequestHandler):
                 return
         self.send_error(404, "frontend resource not found")
 
+    def _proxy_interaction_results(self, query):
+        client = self.server.member_client
+        if client is None:
+            self._send_json(
+                {
+                    "results": [],
+                    "integration": {"configured": False, "status": "disabled"},
+                },
+                status=503,
+            )
+            return
+        camera_id = parse_qs(query).get("camera_id", [None])[0]
+        if camera_id is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", camera_id):
+            self._send_json({"error": "invalid camera_id"}, status=400)
+            return
+        try:
+            response = client.latest_interactions(camera_id)
+        except MemberIntegrationTransportError as error:
+            self._send_json(
+                {"results": [], "integration": {"status": "unavailable", "error": str(error)}},
+                status=502,
+            )
+            return
+        self._send_json(response.body, status=response.status)
+
     def _send_file(self, path, content_type):
         self._send_bytes(path.read_bytes(), content_type)
 
-    def _send_bytes(self, data, content_type):
-        self.send_response(200)
+    def _send_json(self, payload, status=200):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._send_bytes(data, "application/json; charset=utf-8", status=status)
+
+    def _send_bytes(self, data, content_type, cache_control="no-store", status=200):
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache_control)
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
 
@@ -91,8 +154,25 @@ def main():
         baudrate=int(os.environ.get("LAB_HARDWARE_BAUD", "115200")),
         stale_seconds=float(os.environ.get("LAB_HARDWARE_STALE_SECONDS", "30")),
     )
+    member_url = os.environ.get("LAB_MEMBER_SERVICE_URL", "").strip()
+    member_token = os.environ.get("LAB_MEMBER_SERVICE_TOKEN", "").strip()
+    server.member_client = None
+    server.member_integration_status = {"configured": False, "status": "disabled"}
+    if member_url or member_token:
+        try:
+            server.member_client = MemberServiceClient.from_environment()
+        except (MemberIntegrationConfigError, ValueError) as error:
+            raise SystemExit(f"Member integration configuration error: {error}") from error
+        server.member_integration_status = {
+            **server.member_client.public_config,
+            "status": "configured",
+        }
     server.environment.start()
     print(f"Hardware: {server.environment.port or 'not detected'}")
+    print(
+        "Member integration: "
+        + (server.member_client.base_url if server.member_client else "disabled")
+    )
     try:
         server.serve_forever()
     finally:

@@ -305,6 +305,8 @@ class CameraWorker:
         self.slam_state = self.slam.status_payload()
         self.yolo_inference_ms = None
         self.roi_rejected_tracks = 0
+        self.localization_estimated_tracks = 0
+        self.localization_unavailable_tracks = 0
         self.identity = None
         self.identity_track_id = None
         self.identity_votes = deque(maxlen=7)
@@ -1028,15 +1030,30 @@ class CameraWorker:
         return self.floor_map.is_walkable(position)
 
     def project_box(self, box, frame_shape):
-        """Project a person's foot point, preferring the active visual SLAM pose."""
-        x, y, width, height = box
-        foot = ((x + width * 0.5), (y + height))
-        slam_position = self.slam.project_pixel(
-            foot, monotonic_time=self.current_frame_monotonic
+        return self.locate_box(box, frame_shape)["position"]
+
+    def locate_box(self, box, frame_shape):
+        """Locate a person while keeping hidden feet separate from detection."""
+        location = self.floor_map.project_track(
+            self.camera["id"], box, frame_shape
         )
-        if slam_position is not None:
-            return self.floor_map.clamp_position(slam_position)
-        return self.floor_map.project(self.camera["id"], box, frame_shape)
+        anchor = location.get("image_anchor")
+        if location.get("position") is not None and not location.get("estimated") and anchor:
+            foot = (
+                float(anchor["x"]) * frame_shape[1],
+                float(anchor["y"]) * frame_shape[0],
+            )
+            slam_position = self.slam.project_pixel(
+                foot, monotonic_time=self.current_frame_monotonic
+            )
+            if slam_position is not None:
+                location = {
+                    **location,
+                    "position": self.floor_map.clamp_position(slam_position),
+                    "quality": self.slam_state.get("quality") or location.get("quality"),
+                    "reason": self.slam_state.get("reason") or location.get("reason"),
+                }
+        return location
 
     @staticmethod
     def yolo_color(track_id):
@@ -1095,18 +1112,11 @@ class CameraWorker:
                 item["local_id"]: item["track_id"] for item in cached_tracks
             }
 
-        # Filter the detector result before deciding whether the previous
-        # trustworthy tracks should be held. A transient bench/equipment false
-        # positive must not suppress the short occlusion hold for a real person.
-        unfiltered_track_count = len(tracks)
-        tracks = [
-            track
-            for track in tracks
-            if self.floor_map.track_footpoint_allowed(
-                self.camera["id"], track.get("box"), frame.shape
-            )
-        ]
-        self.roi_rejected_tracks = unfiltered_track_count - len(tracks)
+        # Person detection and floor localization are intentionally separate.
+        # A valid YOLO/ByteTrack person must remain visible even when their feet
+        # are clipped by the frame or hidden behind a bench.  Map localization
+        # is handled later and may be marked estimated or unavailable.
+        self.roi_rejected_tracks = 0
 
         # A detector can miss a person for one inference cycle because of blur,
         # occlusion, or RTSP jitter. Keep the last ByteTrack boxes briefly so
@@ -1152,6 +1162,8 @@ class CameraWorker:
         face_result = None
         face_box = None
         prepared_tracks = []
+        self.localization_estimated_tracks = 0
+        self.localization_unavailable_tracks = 0
         for track in tracks:
             local_id = track["track_id"]
             x, y, width, height = track["box"]
@@ -1160,22 +1172,31 @@ class CameraWorker:
             width = max(1, min(width, frame.shape[1] - x))
             height = max(1, min(height, frame.shape[0] - y))
             box = (x, y, width, height)
-            foot = (x + width // 2, y + height)
+            location = self.locate_box(box, frame.shape)
             # A fixed tracking anchor is only meaningful for one person at a
             # doorway. Publishing that same coordinate for a crowd makes the
             # map falsely collapse multiple workers into one point.
-            position = (
-                None
-                if len(tracks) > 1
-                and not self.floor_map.has_projection(self.camera["id"])
-                else self.project_box(box, frame.shape)
-            )
+            if len(tracks) > 1 and not self.floor_map.has_projection(self.camera["id"]):
+                location = {
+                    **location,
+                    "position": None,
+                    "estimated": False,
+                    "quality": "unavailable",
+                    "reason": "fixed anchor disabled while multiple people are visible",
+                }
+            position = location.get("position")
+            if location.get("estimated") and position is not None:
+                self.localization_estimated_tracks += 1
+            elif position is None:
+                self.localization_unavailable_tracks += 1
             prepared_tracks.append(
                 {
                     **track,
                     "track_id": local_id,
                     "box": box,
                     "position": position,
+                    "position_estimated": bool(location.get("estimated")),
+                    "localization": location,
                 }
             )
         if should_infer and not hold_cached_tracks:
@@ -1195,7 +1216,20 @@ class CameraWorker:
             local_id = track["track_id"]
             x, y, width, height = track["box"]
             box = track["box"]
-            foot = (x + width // 2, y + height)
+            location = track["localization"]
+            image_anchor = location.get("image_anchor")
+            foot = (
+                (
+                    int(round(float(image_anchor["x"]) * frame.shape[1])),
+                    int(round(float(image_anchor["y"]) * frame.shape[0])),
+                )
+                if image_anchor
+                else (x + width // 2, y + height)
+            )
+            foot = (
+                int(np.clip(foot[0], 0, frame.shape[1] - 1)),
+                int(np.clip(foot[1], 0, frame.shape[0] - 1)),
+            )
             position = track["position"]
             global_id = batch_global_ids[local_id]
             global_ids_by_local_id[local_id] = global_id
@@ -1230,7 +1264,14 @@ class CameraWorker:
                     3,
                     cv2.LINE_AA,
                 )
-            cv2.circle(display, foot, 5, color, -1, cv2.LINE_AA)
+            cv2.circle(
+                display,
+                foot,
+                6 if location.get("estimated") else 5,
+                color,
+                2 if location.get("estimated") else -1,
+                cv2.LINE_AA,
+            )
             cv2.rectangle(display, (x, y), (x + width, y + height), color, 3)
             if track_identity:
                 person_number = track_identity.get("person_number")
@@ -1285,6 +1326,10 @@ class CameraWorker:
                         "timestamp_source": (
                             "recording_replay" if self.replay_enabled else "host_receive"
                         ),
+                        "position_estimated": bool(location.get("estimated")),
+                        "localization_quality": location.get("quality"),
+                        "localization_reason": location.get("reason"),
+                        "footpoint_visible": bool(location.get("footpoint_visible")),
                     }
                 )
             published_tracks.append(
@@ -1305,6 +1350,10 @@ class CameraWorker:
                     ],
                     "track_age_seconds": mtmc_diagnostics["track_age_seconds"],
                     "observation_count": mtmc_diagnostics["observation_count"],
+                    "position_estimated": bool(location.get("estimated")),
+                    "localization_quality": location.get("quality"),
+                    "localization_reason": location.get("reason"),
+                    "footpoint_visible": bool(location.get("footpoint_visible")),
                 }
             )
 
@@ -1658,6 +1707,17 @@ class CameraWorker:
         confidence = max(
             (track["confidence"] for track in yolo_tracks), default=0.0
         )
+        localization_estimated_tracks = sum(
+            1
+            for track in yolo_tracks
+            if track.get("position_estimated")
+            and track.get("localization_quality") != "unavailable"
+        )
+        localization_unavailable_tracks = sum(
+            1
+            for track in yolo_tracks
+            if track.get("localization_quality") == "unavailable"
+        )
         stream_skew = self.coordinator.stream_skew_seconds(now_monotonic)
         max_skew = self.coordinator.mtmc_config["calibration"]["max_stream_skew_seconds"]
         localization = self.floor_map.localization_status(
@@ -1710,6 +1770,8 @@ class CameraWorker:
                 1 for track in yolo_tracks if not track.get("counted", True)
             ),
             "roi_rejected_tracks": self.roi_rejected_tracks,
+            "localization_estimated_tracks": localization_estimated_tracks,
+            "localization_unavailable_tracks": localization_unavailable_tracks,
             "yolo_tracks": yolo_tracks,
             "tracker_engine": "YOLOv8n + ByteTrack",
             "face_detector": self.face_detector_backend,

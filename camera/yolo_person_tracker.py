@@ -890,6 +890,7 @@ class CrossCameraTrackCoordinator:
                     "local_id": local_id,
                     "box": box,
                     "position": position,
+                    "geometry_trusted": not bool(track.get("position_estimated")),
                     "direction": direction,
                     "gallery": gallery,
                     "appearance": appearance,
@@ -943,7 +944,10 @@ class CrossCameraTrackCoordinator:
                     appearance=item["appearance"],
                     position=item["position"],
                     direction=item["direction"],
-                    geometry_trusted=self._camera_geometry_allowed(camera_id),
+                    geometry_trusted=(
+                        self._camera_geometry_allowed(camera_id)
+                        and item["geometry_trusted"]
+                    ),
                 )
                 observations.append(observation)
                 observation_by_key[(camera_id, item["local_id"])] = item
@@ -967,7 +971,10 @@ class CrossCameraTrackCoordinator:
                             .get("identity", {})
                             .get("person_id")
                         ),
-                        geometry_trusted=self._camera_geometry_allowed(target["camera_id"]),
+                        geometry_trusted=(
+                            self._camera_geometry_allowed(target["camera_id"])
+                            and target.get("geometry_trusted", True)
+                        ),
                         source_local_id=target.get("local_id"),
                     )
                 )
@@ -1088,6 +1095,7 @@ class CrossCameraTrackCoordinator:
                         "camera_id": camera_id,
                         "appearance": appearance,
                         "position": item["position"],
+                        "geometry_trusted": item["geometry_trusted"],
                         "box": item["box"],
                         "local_id": item["local_id"],
                         "direction": item["direction"],

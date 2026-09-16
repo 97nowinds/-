@@ -37,6 +37,13 @@ class FloorMapProjector:
             raise FloorMapError(
                 "projection_domain_margin_normalized must be between 0 and 0.25"
             )
+        self.footpoint_inference_max_distance = float(
+            config.get("footpoint_inference_max_distance_normalized", 0.18)
+        )
+        if not 0.0 <= self.footpoint_inference_max_distance <= 0.5:
+            raise FloorMapError(
+                "footpoint_inference_max_distance_normalized must be between 0 and 0.5"
+            )
         self.camera_projection_domain_margins = {}
         zones = config.get("zones", [])
         zones_by_id = {zone.get("id"): zone for zone in zones if zone.get("id")}
@@ -162,6 +169,195 @@ class FloorMapProjector:
         ):
             return False
         return True
+
+    def _localization_polygons(self, camera_id):
+        """Return image-space polygons where a visible foot can be calibrated."""
+        domain = self.image_domains.get(camera_id)
+        regions = self.tracking_image_regions.get(camera_id, [])
+        if domain is None:
+            return [np.asarray(region, dtype=np.float32) for region in regions]
+        if not regions:
+            return [np.asarray(domain, dtype=np.float32)]
+        intersections = []
+        domain_hull = cv2.convexHull(np.asarray(domain, dtype=np.float32)).reshape(-1, 2)
+        for region in regions:
+            region_hull = cv2.convexHull(np.asarray(region, dtype=np.float32)).reshape(-1, 2)
+            area, polygon = cv2.intersectConvexConvex(domain_hull, region_hull)
+            if area > 1e-8 and polygon is not None and len(polygon) >= 3:
+                intersections.append(polygon.reshape(-1, 2))
+        return intersections or [domain_hull]
+
+    @staticmethod
+    def _nearest_point_on_polygon(point, polygon):
+        point = np.asarray(point, dtype=np.float64)
+        polygon = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
+        if cv2.pointPolygonTest(
+            polygon.astype(np.float32), tuple(point.astype(float)), False
+        ) >= 0:
+            return point, 0.0
+        nearest = None
+        nearest_distance = float("inf")
+        for index, start in enumerate(polygon):
+            end = polygon[(index + 1) % len(polygon)]
+            segment = end - start
+            denominator = float(np.dot(segment, segment))
+            ratio = 0.0 if denominator <= 1e-12 else float(
+                np.clip(np.dot(point - start, segment) / denominator, 0.0, 1.0)
+            )
+            candidate = start + ratio * segment
+            distance = float(np.linalg.norm(candidate - point))
+            if distance < nearest_distance:
+                nearest = candidate
+                nearest_distance = distance
+        return nearest, nearest_distance
+
+    @staticmethod
+    def _box_intersects_polygon(box, frame_shape, polygon):
+        frame_height, frame_width = frame_shape[:2]
+        x, y, width, height = box
+        left = float(np.clip(x / frame_width, 0.0, 1.0))
+        top = float(np.clip(y / frame_height, 0.0, 1.0))
+        right = float(np.clip((x + width) / frame_width, 0.0, 1.0))
+        bottom = float(np.clip((y + height) / frame_height, 0.0, 1.0))
+        if right <= left or bottom <= top:
+            return False
+        rectangle = np.asarray(
+            [[left, top], [right, top], [right, bottom], [left, bottom]],
+            dtype=np.float32,
+        )
+        area, _ = cv2.intersectConvexConvex(
+            rectangle, cv2.convexHull(np.asarray(polygon, dtype=np.float32)).reshape(-1, 2)
+        )
+        return area > 1e-8
+
+    def project_track(self, camera_id, box, frame_shape):
+        """Project a track without making foot visibility a detection gate.
+
+        A normal visible foot uses the existing homography.  When the detector
+        box is clipped or occluded but overlaps a calibrated aisle, the anchor
+        is moved to the nearest valid aisle point.  The caller receives an
+        explicit low-confidence estimate instead of losing the person track.
+        """
+        if box is None:
+            return {
+                "position": None,
+                "estimated": False,
+                "quality": "unavailable",
+                "reason": "missing person box",
+                "image_anchor": None,
+                "footpoint_visible": False,
+            }
+        frame_height, frame_width = frame_shape[:2]
+        if frame_width <= 0 or frame_height <= 0:
+            return {
+                "position": None,
+                "estimated": False,
+                "quality": "unavailable",
+                "reason": "invalid frame dimensions",
+                "image_anchor": None,
+                "footpoint_visible": False,
+            }
+        x, y, width, height = box
+        raw_foot = np.asarray(
+            [(x + width * 0.5) / frame_width, (y + height) / frame_height],
+            dtype=np.float64,
+        )
+        footpoint_visible = bool(raw_foot[1] < 0.985)
+        polygons = self._localization_polygons(camera_id)
+        margin = self.camera_projection_domain_margins.get(
+            camera_id, self.projection_domain_margin
+        )
+        inside_localization_region = not polygons or any(
+            cv2.pointPolygonTest(
+                np.asarray(polygon, dtype=np.float32),
+                tuple(raw_foot.astype(float)),
+                True,
+            )
+            >= -margin
+            for polygon in polygons
+        )
+        position = self.project(camera_id, box, frame_shape)
+        recent = self._projection_status.get(camera_id, {})
+        if position is not None and inside_localization_region:
+            estimated = not bool(recent.get("inside_domain", True))
+            return {
+                "position": position,
+                "estimated": estimated,
+                "quality": "low" if estimated else recent.get("quality", "medium"),
+                "reason": recent.get("reason"),
+                "image_anchor": {"x": float(raw_foot[0]), "y": float(raw_foot[1])},
+                "footpoint_visible": footpoint_visible,
+            }
+
+        transform = self.transforms.get(camera_id)
+        if transform is None or not polygons:
+            # Preserve fixed anchors and cameras without a per-pixel map.
+            fallback = self.project(camera_id, box, frame_shape)
+            return {
+                "position": fallback,
+                "estimated": fallback is not None,
+                "quality": "low" if fallback is not None else "unavailable",
+                "reason": "fixed camera anchor" if fallback is not None else "no floor transform",
+                "image_anchor": None,
+                "footpoint_visible": footpoint_visible,
+            }
+
+        candidates = []
+        for polygon in polygons:
+            anchor, distance = self._nearest_point_on_polygon(raw_foot, polygon)
+            if anchor is not None:
+                candidates.append((distance, anchor, polygon))
+        if not candidates:
+            return {
+                "position": None,
+                "estimated": False,
+                "quality": "unavailable",
+                "reason": "no valid aisle anchor",
+                "image_anchor": None,
+                "footpoint_visible": footpoint_visible,
+            }
+        distance, anchor, polygon = min(candidates, key=lambda item: item[0])
+        overlaps_aisle = self._box_intersects_polygon(box, frame_shape, polygon)
+        if distance > self.footpoint_inference_max_distance or not overlaps_aisle:
+            return {
+                "position": None,
+                "estimated": False,
+                "quality": "unavailable",
+                "reason": "person box does not overlap a calibrated aisle",
+                "image_anchor": None,
+                "footpoint_visible": footpoint_visible,
+            }
+        # Move a tiny amount toward the polygon centre so floating point noise
+        # cannot leave the inferred anchor just outside the valid domain.
+        centroid = np.mean(np.asarray(polygon, dtype=np.float64), axis=0)
+        anchor = anchor * 0.999 + centroid * 0.001
+        source = np.asarray([[[anchor[0], anchor[1]]]], dtype=np.float32)
+        mapped = cv2.perspectiveTransform(source, transform)[0, 0]
+        if not np.isfinite(mapped).all():
+            return {
+                "position": None,
+                "estimated": False,
+                "quality": "unavailable",
+                "reason": "inferred homography result is invalid",
+                "image_anchor": None,
+                "footpoint_visible": footpoint_visible,
+            }
+        self._projection_status[camera_id] = {
+            "quality": "low",
+            "reason": "footpoint inferred from overlapping calibrated aisle",
+            "inside_domain": True,
+            "distance_normalized": round(float(distance), 4),
+            "estimated": True,
+            "updated_monotonic": time.monotonic(),
+        }
+        return {
+            "position": self.clamp_position({"x": float(mapped[0]), "y": float(mapped[1])}),
+            "estimated": True,
+            "quality": "low",
+            "reason": "footpoint inferred from overlapping calibrated aisle",
+            "image_anchor": {"x": float(anchor[0]), "y": float(anchor[1])},
+            "footpoint_visible": footpoint_visible,
+        }
 
     def project(self, camera_id, box, frame_shape):
         transform = self.transforms.get(camera_id)
@@ -664,10 +860,14 @@ class FloorMapProjector:
     def _observation_weight(observation):
         source = observation.get("identity_source")
         if source == "face":
-            return 1.0
-        if source in {"handoff", "overlap_handoff", "transition_handoff"}:
-            return 0.8
-        return 0.55
+            weight = 1.0
+        elif source in {"handoff", "overlap_handoff", "transition_handoff"}:
+            weight = 0.8
+        else:
+            weight = 0.55
+        if observation.get("position_estimated"):
+            weight *= 0.35
+        return weight
 
     def public_config(self):
         cameras = {}
@@ -686,6 +886,7 @@ class FloorMapProjector:
             "geometry_fusion_allowed": self.geometry_fusion_allowed,
             "calibration_reason": self.calibration_reason,
             "projection_domain_margin_normalized": self.projection_domain_margin,
+            "footpoint_inference_max_distance_normalized": self.footpoint_inference_max_distance,
             "tracking_allowed_zone_ids": self.tracking_allowed_zone_ids,
             "zones": self.config.get("zones", []),
             "fixtures": self.config.get("fixtures", []),
@@ -910,8 +1111,13 @@ class FloorMapProjector:
                         or any(match.get("visual_owner_conflict") for match in matches)
                     ),
                     "observed_at": max(match["observed_at"] for match in matches),
-                    "position_estimated": False,
-                    "localization_state": "measured",
+                    "position_estimated": bool(best.get("position_estimated")),
+                    "localization_state": (
+                        "estimated" if best.get("position_estimated") else "measured"
+                    ),
+                    "localization_quality": best.get("localization_quality"),
+                    "localization_reason": best.get("localization_reason"),
+                    "footpoint_visible": best.get("footpoint_visible"),
                     "position_age_seconds": 0.0,
                 }
             )

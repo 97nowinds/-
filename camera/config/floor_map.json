@@ -3,6 +3,7 @@
   "width_m": 12.0,
   "height_m": 7.0,
   "projection_domain_margin_normalized": 0.03,
+  "footpoint_inference_max_distance_normalized": 0.18,
   "calibrated": false,
   "calibration": {
     "status": "approximate",

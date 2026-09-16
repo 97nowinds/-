@@ -125,6 +125,117 @@ class FloorMapProjectorTests(unittest.TestCase):
         )
         self.assertIsNotNone(tolerant.project("cam_1", clipped_box, (432, 768, 3)))
 
+    def test_hidden_foot_is_inferred_from_overlapping_calibrated_aisle(self):
+        floor_config = config()
+        floor_config["footpoint_inference_max_distance_normalized"] = 0.25
+        floor_config["cameras"]["cam_1"]["image_points"] = [
+            [0.5, 0.4], [0.75, 0.4], [0.5, 0.9], [0.75, 0.9]
+        ]
+        floor_config["annotations"] = {
+            "cam_1": {
+                "regions": {
+                    "main_aisle": {
+                        "x": 0.5,
+                        "y": 0.4,
+                        "width": 0.25,
+                        "height": 0.5,
+                    }
+                }
+            }
+        }
+        projector = FloorMapProjector(floor_config)
+
+        # The box overlaps the aisle but its bottom-centre/nominal foot is
+        # outside it, matching a close person clipped by the image boundary.
+        result = projector.project_track(
+            "cam_1", (30, 20, 35, 80), (100, 100, 3)
+        )
+
+        self.assertIsNotNone(result["position"])
+        self.assertTrue(result["estimated"])
+        self.assertFalse(result["footpoint_visible"])
+        self.assertEqual(result["quality"], "low")
+        self.assertIn("inferred", result["reason"])
+        self.assertGreaterEqual(result["image_anchor"]["x"], 0.49)
+        self.assertLessEqual(result["image_anchor"]["y"], 0.91)
+
+    def test_person_far_from_calibrated_aisle_keeps_track_without_map_position(self):
+        floor_config = config()
+        floor_config["cameras"]["cam_1"]["image_points"] = [
+            [0.5, 0.4], [0.75, 0.4], [0.5, 0.9], [0.75, 0.9]
+        ]
+        floor_config["annotations"] = {
+            "cam_1": {
+                "regions": {
+                    "main_aisle": {
+                        "x": 0.5,
+                        "y": 0.4,
+                        "width": 0.25,
+                        "height": 0.5,
+                    }
+                }
+            }
+        }
+        projector = FloorMapProjector(floor_config)
+
+        result = projector.project_track(
+            "cam_1", (0, 10, 10, 90), (100, 100, 3)
+        )
+
+        self.assertIsNone(result["position"])
+        self.assertEqual(result["quality"], "unavailable")
+        self.assertIn("does not overlap", result["reason"])
+
+    def test_homography_point_outside_annotated_aisle_is_not_treated_as_measured(self):
+        floor_config = config()
+        floor_config["footpoint_inference_max_distance_normalized"] = 0.25
+        floor_config["annotations"] = {
+            "cam_1": {
+                "regions": {
+                    "main_aisle": {
+                        "x": 0.5,
+                        "y": 0.4,
+                        "width": 0.25,
+                        "height": 0.5,
+                    }
+                }
+            }
+        }
+        projector = FloorMapProjector(floor_config)
+
+        result = projector.project_track(
+            "cam_1", (25, 20, 30, 70), (100, 100, 3)
+        )
+
+        self.assertIsNotNone(result["position"])
+        self.assertTrue(result["estimated"])
+        self.assertEqual(result["quality"], "low")
+
+    def test_floor_state_marks_inferred_footpoint_as_estimated(self):
+        state = self.projector.state(
+            [
+                {
+                    "camera_id": "cam_1",
+                    "track_id": "global_1",
+                    "local_id": 1,
+                    "position": {"x": 5.0, "y": 3.0},
+                    "observed_at": 100.0,
+                    "identity_source": "visual",
+                    "position_estimated": True,
+                    "localization_quality": "low",
+                    "localization_reason": "footpoint inferred",
+                    "footpoint_visible": False,
+                }
+            ],
+            now=100.0,
+        )
+
+        person = state["people"][0]
+        self.assertTrue(person["position_estimated"])
+        self.assertEqual(person["localization_state"], "estimated")
+        self.assertEqual(person["localization_quality"], "low")
+        self.assertFalse(person["footpoint_visible"])
+
     def test_track_footpoint_rejects_detection_outside_calibration_domain(self):
         floor_config = config()
         floor_config["cameras"]["cam_1"]["image_points"] = [

@@ -82,6 +82,24 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn("window.__LAB_HARDWARE_URL__", source)
         self.assertIn("server.api_base = args.api", source)
 
+    def test_frontend_server_exposes_safe_handoff_test_jpeg(self):
+        source = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('route == "/api/handoff/test.jpg"', source)
+        self.assertIn('"image/jpeg"', source)
+        self.assertIn('cache_control="public, max-age=30"', source)
+        self.assertIn('"X-Content-Type-Options", "nosniff"', source)
+
+    def test_member_interaction_is_proxied_without_exposing_bearer_token(self):
+        server = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('route == "/api/interaction-results/latest"', server)
+        self.assertIn("MemberServiceClient.from_environment()", server)
+        self.assertNotIn("LAB_MEMBER_SERVICE_TOKEN", script)
+        self.assertIn('INTERACTION_URL = "/api/interaction-results/latest"', script)
+        self.assertIn("now - interactionLastFetchMs < 1000", script)
+
     def test_cluster_service_uses_persistent_floor_map_config(self):
         service = (ROOT.parent / "cluster" / "camera_service.slurm").read_text(encoding="utf-8")
 
@@ -152,13 +170,23 @@ class FrontendSeparationTests(unittest.TestCase):
 
         self.assertLessEqual(cam2["yolo_frame_stride"], 3)
 
-    def test_roi_filter_runs_before_short_track_hold_decision(self):
+    def test_person_detection_is_not_discarded_when_footpoint_is_unavailable(self):
         backend = (ROOT / "app.py").read_text(encoding="utf-8")
 
-        self.assertLess(
-            backend.index("unfiltered_track_count = len(tracks)"),
-            backend.index("hold_cached_tracks = bool("),
-        )
+        self.assertIn("Person detection and floor localization are intentionally separate", backend)
+        self.assertIn('"localization_estimated_tracks"', backend)
+        self.assertIn('"localization_unavailable_tracks"', backend)
+        self.assertIn("for track in yolo_tracks", backend)
+        self.assertNotIn("if self.floor_map.track_footpoint_allowed(\n", backend)
+        self.assertIn("location = self.locate_box(box, frame.shape)", backend)
+        self.assertIn("cv2.rectangle(display, (x, y), (x + width, y + height), color, 3)", backend)
+
+    def test_map_ui_distinguishes_hidden_foot_estimate_from_stale_hold(self):
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('person.localization_state === "held"', script)
+        self.assertIn('" · 脚点估算"', script)
+        self.assertIn('? "estimated"', script)
 
     def test_approximate_map_only_enables_observed_entrance_cam2_overlap(self):
         floor_map = json.loads((ROOT / "config" / "floor_map.json").read_text(encoding="utf-8"))

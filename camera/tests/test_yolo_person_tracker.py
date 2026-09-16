@@ -178,6 +178,23 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
             [event["event"] for event in initial_events], ["create", "associate"]
         )
 
+    def test_inferred_footpoint_is_not_stored_as_trusted_geometry(self):
+        coordinator = self.coordinator(self.FloorMap())
+        frame = np.full((100, 160, 3), 120, dtype=np.uint8)
+        track = {
+            "track_id": 1,
+            "box": (20, 10, 40, 80),
+            "position": {"x": 5.0, "y": 4.5},
+            "position_estimated": True,
+        }
+
+        result = coordinator.update_batch(
+            "cam_1", [track], frame, monotonic_time=1.0, unix_time=100.0
+        )
+
+        global_id = result[1]
+        self.assertFalse(coordinator.global_tracks[global_id]["geometry_trusted"])
+
     def test_short_visual_track_is_not_counted_until_stable(self):
         coordinator = self.coordinator(self.UncalibratedFloorMap())
         frame = np.full((100, 160, 3), 120, dtype=np.uint8)

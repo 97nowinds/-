@@ -181,15 +181,15 @@ cam_entrance ArcFace 注册身份
 
 跨通道移动按这些矩形区域的真实连通关系路由。副通道和主通道不直接相邻，因此两者之间的坐标迁移必须依次经过副通道与侧向通道的交口、侧向通道、侧向通道与主通道的交口；不会再用穿过中央实验区的欧氏直线后突然吸附到另一条通道。人物状态中的 `corridor_routed` 可用于确认本次更新是否启用了连通路径约束。测量中断后恢复时，`calibration.max_motion_gap_seconds` 限制单次位置更新可以使用的时间跨度，避免保持点在切换摄像头后瞬移到新观测位置。
 
-单应性只在四个图像控制点围成的区域内可信。`projection_domain_margin_normalized` 为检测框脚点预留少量边缘抖动容差；超出该范围的点不会继续外推并吸附到另一条通道，而是停止发布该路原始地图观察。最近一次判断通过 `localization.recent_projection` 暴露，域外点会给出 `footpoint outside calibrated image domain`，避免把“没有可靠坐标”伪装成一条平滑但错误的轨迹。
+单应性只在四个图像控制点围成的区域内可信。`projection_domain_margin_normalized` 为可见脚点预留少量边缘抖动容差。人物检测不再依赖脚点：只要 YOLO/ByteTrack 检出人物，就保留 local/global ID 并立即绘制完整检测框；脚被画面边缘、实验台或设备遮住不会让人物从监控画面和人数候选中消失。
 
-摄像头标注页中的主通道、副通道和侧向通道现在也是实时跟踪 ROI，而不再只是可视化参考。YOLO/ByteTrack 目标的脚点必须位于标注通道内；存在四点单应性时还必须位于四点围成的有效域内。通道外目标不会进入身份、跨摄关联或地图状态，`roi_rejected_tracks` 会报告最近一轮被排除的数量。重叠区只描述交接证据，不会单独扩大允许跟踪范围；没有通道标注和四点映射的旧配置保持不限制，以兼容入口摄像头。
+摄像头标注页中的主通道、副通道和侧向通道只约束地图定位，不再作为人物检测的硬过滤 ROI。脚点落在可信域内时正常投影；脚点不可见或落在域外、但人物框仍与已标定通道相交时，系统会把定位锚点吸附到最近的有效通道边界，按 `footpoint_inference_max_distance_normalized` 限制最大反推距离，并公开 `position_estimated: true`、`localization_state: estimated`、`localization_quality: low` 和原因。前端显示“脚点估算”，这只是近似位置，不能作为高置信度几何关联证据。人物框与任何标定通道都不相交时仍保留视频跟踪，只暂不发布地图坐标。
 
 通道区域同时支持旧式矩形和四点透视多边形。cam_1 使用与其地面参考点一致的凸四边形限制有效人脚点；其地图控制点依据现场主通道位置整体校正，避免画面中的主通道人物被投影到副通道。主通道编辑仍保持平行四边形约束，避免编辑时产生畸形区域。
 
-cam_1 对贴近画面下边缘、人体框被图像裁切的合法通道目标使用相机级 `projection_domain_margin_normalized: 0.066`。该值来自 `base01/20260912_191517` 录像中按生产整数框计算的最不利合法脚点（所需容差约 `0.0651`），并低于目标进入左侧设备区时所需的 `0.0834`。该容差同时作用于跟踪 ROI 和地图投影，避免检测已经通过但地图坐标仍被拒绝；中央实验区与沿墙设备区仍在四点域之外，不会因此开放。
+cam_1 对贴近画面下边缘、人体框被图像裁切的合法通道目标仍保留相机级 `projection_domain_margin_normalized: 0.066`；更大缺口使用统一脚点反推而不是继续放宽原始单应性。`localization_estimated_tracks` 和 `localization_unavailable_tracks` 分别报告本轮估算坐标和只有人物框、没有地图坐标的目标数，兼容字段 `roi_rejected_tracks` 不再用于删除人物轨迹。
 
-ROI 过滤发生在短时轨迹保持判断之前。如果某轮 YOLO 只返回通道外的设备误检，系统会把它视为“本轮没有可信新目标”，继续短时保留上一条通道内轨迹，而不会释放 local/global ID。同摄像头 ID 重连也不会占用跨摄关联窗口的 reservation，避免在真实交接瞬间遮蔽另一路候选。持久化诊断仅保留实际创建、跨摄候选、关联、合并和重定向；正常连续帧产生的同摄像头 owner 冲突不会写入历史，避免关键交接证据被事件噪声挤出查询窗口。集群脚本通过 `LAB_MTMC_EVENT_PATH` 将 JSONL 写入共享项目的 `camera/runtime`，作业重启后仍可查询保留期内的历史，但不会恢复已过期的实时轨迹。
+同摄像头 ID 重连不会占用跨摄关联窗口的 reservation，避免在真实交接瞬间遮蔽另一路候选。持久化诊断仅保留实际创建、跨摄候选、关联、合并和重定向；正常连续帧产生的同摄像头 owner 冲突不会写入历史，避免关键交接证据被事件噪声挤出查询窗口。集群脚本通过 `LAB_MTMC_EVENT_PATH` 将 JSONL 写入共享项目的 `camera/runtime`，作业重启后仍可查询保留期内的历史，但不会恢复已过期的实时轨迹。
 
 现场已确认 `cam_2` 与 `cam_entrance` 在主通道转向侧向通道处存在真实同时可见区。该摄像头对允许在近似标定状态下进行同时关联，但要求轨迹级 ReID 不低于 `0.95`，并继续应用一对一分配和 match margin；其余未经现场验证的摄像头对仍禁止近似坐标下的同时合并。
 
@@ -278,6 +278,26 @@ http://127.0.0.1:5173/recordings?api=http://127.0.0.1:15000
 
 `--session` 会读取 `info.json` 和各路 `*_timestamps.csv`，校验标注帧确实存在，并把 recorder 的 host_receive 时间补入只有帧号的标注。输出机器可读 JSON 和人可读 Markdown，包含跨摄交接成功率、错误身份继承率、漏交接率、ID switches、IDF1，以及按摄像头对、人数、遮挡和注册状态分组的结果。本工具没有把自定义指标称为 HOTA；当前未固定并接入标准 HOTA 依赖。空标注会明确输出“尚无真实评测数据”，不会生成虚假成绩。
 
+## 成员接口接入
+
+成员接收服务使用 `lab-handoff-1.1`、Bearer 鉴权和 `event_id` 幂等语义。Token 只能通过服务端环境变量传入，不能放进浏览器参数、JavaScript、配置 JSON、日志或 Git：
+
+```powershell
+$env:LAB_MEMBER_SERVICE_URL = "http://192.168.31.189:8765"
+$env:LAB_MEMBER_SERVICE_TOKEN = "<成员签发的当前有效 Token>"
+$env:LAB_MEMBER_SERVICE_TIMEOUT_SECONDS = "3"
+```
+
+启动观察页后，本地 `GET /api/interaction-results/latest` 会在服务端携带鉴权请求成员接口；浏览器每秒读取一次这个同源代理。可以通过 `GET /api/integration/status` 查看是否配置成功，该接口永远不会返回 Token。成员服务断开只会清空本轮仪器交互结果，不会阻断摄像头、地图、环境监测或录像。
+
+双方首次联调时只运行无人物测试：
+
+```powershell
+python .\scripts\test_member_connection.py --event-id "connection.test:<双方约定的固定 ID>"
+```
+
+该脚本依次检查 `/health`，将同一 `connection.test` 投递两次，比较 `receipt_id`，再查询全局和 `cam_2` 的 `interaction-results/latest`。输出包含各请求的 HTTP 状态和完整 JSON 响应，但不会输出 Authorization 请求头。一次性 Token 测试结束后必须撤销；当前实现默认不自动发送任何真实人物、姓名、人脸、位置、监控画面或生物特征。
+
 ## 当前已知限制
 
 - 当前地图不是正式标定；三路虽都有逐像素近似映射，但四点有效域以外会主动停止发布坐标，几何仅供显示。
@@ -285,6 +305,7 @@ http://127.0.0.1:5173/recordings?api=http://127.0.0.1:15000
 - `host_receive` 能衡量主机接收偏差，不能替代摄像头硬件同步或设备时间戳。
 - 相似实验服、长时间完全遮挡和跨摄盲区仍可能使目标保持匿名或产生 ID switch；策略优先避免错误认人。
 - 事件只持久化关联历史，不持久化实时 tracker 状态；服务重启后会创建新的实时轨迹。
+- 成员接口目前只完成无人物连接、幂等与结果读取契约；真实数据投递仍需双方确认字段级授权、最小化范围、保留期限和撤销机制后才能启用。
 - 尚无现场人工 ground truth，因此不能声称真实准确率已经提升。
 
 ## 现场验收清单

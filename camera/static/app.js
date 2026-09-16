@@ -49,6 +49,7 @@ const API_BASE = (
   location.origin
 ).replace(/\/$/, "");
 const HARDWARE_URL = window.__LAB_HARDWARE_URL__ || null;
+const INTERACTION_URL = "/api/interaction-results/latest";
 const faceCaptureLink = document.querySelector("#faceCaptureLink");
 if (faceCaptureLink) faceCaptureLink.href = `/faces?api=${encodeURIComponent(API_BASE)}`;
 const calibrationLink = document.querySelector("#calibrationLink");
@@ -65,6 +66,12 @@ let floorMapSignature = "";
 let latestRecording = null;
 let latestCameras = [];
 let recordingMutationPending = false;
+let peopleListSignature = "";
+let floorPeopleListSignature = "";
+let eventFeedSignature = "";
+let latestInteractionEvents = [];
+let interactionFetchPending = false;
+let interactionLastFetchMs = 0;
 
 function updateDashboardClock() {
   const now = new Date();
@@ -242,7 +249,26 @@ async function fetchState() {
   if (!response.ok) throw new Error("状态接口不可用");
   const state = await response.json();
   if (hardwareResponse?.ok) state.environment = await hardwareResponse.json();
+  state.interaction_events = latestInteractionEvents;
   return state;
+}
+
+function refreshInteractionResults() {
+  const now = Date.now();
+  if (interactionFetchPending || now - interactionLastFetchMs < 1000) return;
+  interactionFetchPending = true;
+  interactionLastFetchMs = now;
+  fetch(INTERACTION_URL, {cache: "no-store"})
+    .then((response) => response.ok ? response.json() : Promise.reject(new Error("interaction unavailable")))
+    .then((payload) => {
+      latestInteractionEvents = Array.isArray(payload) ? payload : Array.isArray(payload?.results) ? payload.results : [];
+    })
+    .catch(() => {
+      latestInteractionEvents = [];
+    })
+    .finally(() => {
+      interactionFetchPending = false;
+    });
 }
 
 function escapeHtml(value) {
@@ -446,8 +472,13 @@ function renderFloorMap(floorMap) {
 
   for (const person of floorMap.people) {
     const point = mapPoint(floorMap, [person.x, person.y]);
+    const estimatedPositionClass = person.localization_state === "held"
+      ? "held"
+      : person.position_estimated
+        ? "estimated"
+        : "";
     const group = createSvg("g", {
-      class: `map-person ${person.identified ? "identified" : "unknown"} ${person.position_estimated ? "held" : ""}`,
+      class: `map-person ${person.identified ? "identified" : "unknown"} ${estimatedPositionClass}`,
       transform: `translate(${point.x} ${point.y})`,
     });
     group.appendChild(createSvg("circle", {r: 42, class: "map-person-halo"}));
@@ -456,12 +487,24 @@ function renderFloorMap(floorMap) {
     floorMapPeopleLayer.appendChild(group);
   }
 
+  const nextFloorPeopleListSignature = JSON.stringify(floorMap.people.map((person) => [
+    person.track_id,
+    personLabel(person),
+    person.zone,
+    person.cameras,
+    Boolean(person.position_estimated),
+    person.identity_lock_status,
+    person.count_status,
+    person.counted,
+  ]));
+  if (nextFloorPeopleListSignature === floorPeopleListSignature) return;
+  floorPeopleListSignature = nextFloorPeopleListSignature;
   floorMapPeopleList.innerHTML = floorMap.people.length
     ? floorMap.people.map((person) => `
       <div class="floor-person-row">
         <span class="floor-person-indicator ${person.identified ? "identified" : "unknown"}"></span>
         <strong>${escapeHtml(personLabel(person))}</strong>
-        <span class="floor-person-location">${escapeHtml(["内侧通道", "后端操作区"].includes(person.zone) ? "侧向通道" : person.zone)} · ${escapeHtml(person.cameras.join(" + "))}${person.position_estimated ? ` · 定位保持 ${Number(person.position_age_seconds || 0).toFixed(1)}s` : ""}</span>
+        <span class="floor-person-location">${escapeHtml(["内侧通道", "后端操作区"].includes(person.zone) ? "侧向通道" : person.zone)} · ${escapeHtml(person.cameras.join(" + "))}${person.localization_state === "held" ? " · 定位保持" : person.position_estimated ? " · 脚点估算" : ""}</span>
         <span class="floor-person-lock ${person.identity_lock_status === "locked" ? "locked" : "visual"}">${person.identity_lock_status === "locked" ? "已锁定" : person.count_status === "duplicate_suppressed" ? "跨摄疑似重复 · 不计数" : person.counted === false ? "临时候选 · 不计数" : "视觉追踪"}</span>
       </div>
     `).join("")
@@ -484,6 +527,14 @@ function modeText(camera) {
 }
 
 function renderPeopleList(people) {
+  const nextSignature = JSON.stringify(people.map((person) => [
+    person.id,
+    person.label,
+    person.name,
+    person.sample_count,
+  ]));
+  if (nextSignature === peopleListSignature) return;
+  peopleListSignature = nextSignature;
   peopleList.innerHTML = people.length
     ? people.map((person) => `
       <div class="person-row">
@@ -579,11 +630,30 @@ function renderEventFeed(state) {
     rows.push(
       {time: now, text: `${state.cameras?.length || 0} 路监控状态持续检测中`, tag: "系统运行", tone: "normal"},
       {time: now, text: activePeople.length ? `实验室内当前检测到 ${activePeople.length} 人` : "当前区域未检测到活动目标", tag: "区域状态", tone: "normal"},
-      {time: now, text: "仪器交互信息区域已预留", tag: "仪器交互", tone: "normal"},
+      {time: now, text: "仪器交互信息通道已就绪", tag: "仪器交互", tone: "normal"},
     );
   }
 
-  eventFeed.innerHTML = rows.slice(0, 7).map((row) => `
+  const reservedChannels = [
+    ["人员进入事件", "人员识别"],
+    ["跨区域轨迹事件", "跨镜追踪"],
+    ["仪器操作事件", "仪器交互"],
+    ["温湿度异常事件", "环境监测"],
+    ["火情与设备异常事件", "安全告警"],
+    ["系统状态更新", "运行状态"],
+  ];
+  let reservedIndex = 0;
+  while (rows.length < 9) {
+    const channel = reservedChannels[reservedIndex % reservedChannels.length];
+    rows.push({time: "--:--:--", text: `${channel[0]} · 等待数据`, tag: channel[1], tone: "placeholder"});
+    reservedIndex += 1;
+  }
+
+  const nextSignature = JSON.stringify(rows.slice(0, 9).map((row) => [row.text, row.tag, row.tone]));
+  if (nextSignature === eventFeedSignature) return;
+  eventFeedSignature = nextSignature;
+
+  eventFeed.innerHTML = rows.slice(0, 9).map((row) => `
     <div class="event-row ${escapeHtml(row.tone)}">
       <time>${escapeHtml(row.time)}</time>
       <strong>${escapeHtml(row.text)}</strong>
@@ -650,6 +720,7 @@ function update(state) {
 
 async function refresh() {
   try {
+    refreshInteractionResults();
     update(await fetchState());
   } catch (error) {
     serviceState.textContent = "服务断开";
