@@ -70,8 +70,15 @@ let peopleListSignature = "";
 let floorPeopleListSignature = "";
 let eventFeedSignature = "";
 let latestInteractionEvents = [];
+let latestInteractionErrors = [];
 let interactionFetchPending = false;
 let interactionLastFetchMs = 0;
+let synchronizedReplayEnabled = false;
+let synchronizedReplayBusy = false;
+let synchronizedReplayTimer = null;
+let synchronizedReplaySequence = 0;
+let synchronizedReplayCameraIds = [];
+const synchronizedReplayObjectUrls = new Map();
 
 function updateDashboardClock() {
   const now = new Date();
@@ -250,6 +257,7 @@ async function fetchState() {
   const state = await response.json();
   if (hardwareResponse?.ok) state.environment = await hardwareResponse.json();
   state.interaction_events = latestInteractionEvents;
+  state.interaction_errors = latestInteractionErrors;
   return state;
 }
 
@@ -262,9 +270,11 @@ function refreshInteractionResults() {
     .then((response) => response.ok ? response.json() : Promise.reject(new Error("interaction unavailable")))
     .then((payload) => {
       latestInteractionEvents = Array.isArray(payload) ? payload : Array.isArray(payload?.results) ? payload.results : [];
+      latestInteractionErrors = Array.isArray(payload?.errors) ? payload.errors : [];
     })
     .catch(() => {
       latestInteractionEvents = [];
+      latestInteractionErrors = [];
     })
     .finally(() => {
       interactionFetchPending = false;
@@ -517,9 +527,13 @@ function modeText(camera) {
     if (camera.role === "entrance_identity" && !camera.face_recognition_ready) {
       return "ArcFace 模型未就绪";
     }
-    return camera.tracking
-      ? `${camera.role === "entrance_identity" ? "门口识别" : "YOLO 追踪"} · ${camera.counted_people ?? camera.tracked_people ?? 0} 人`
-      : "YOLO 等待人员进入";
+    if (!camera.tracking) return "YOLO 等待人员进入";
+    const tracked = camera.tracked_people ?? 0;
+    const counted = camera.counted_people ?? tracked;
+    const label = camera.role === "entrance_identity" ? "门口识别" : "YOLO 追踪";
+    return tracked === counted
+      ? `${label} · ${tracked} 人`
+      : `${label} · ${tracked} 轨 / ${counted} 已确认`;
   }
   return ["handoff", "overlap_handoff", "transition_handoff"].includes(camera.identity.identity_source)
     ? `跨镜头继承自 ${camera.identity.handoff_from_camera}`
@@ -618,11 +632,23 @@ function renderEventFeed(state) {
 
   const rawInteractions = state.interaction_events || state.instrument_interaction?.events || state.interactions || [];
   for (const interaction of Array.isArray(rawInteractions) ? rawInteractions.slice(0, 3) : []) {
+    const interactionSubject = interaction.display_name || interaction.person_name || interaction.track_id || "目标";
+    const interactionAction = interaction.interaction_label || interaction.message || interaction.description || interaction.event || "检测到交互";
+    const interactionInstrument = interaction.instrument_name || interaction.instrument_id || "仪器";
     rows.push({
-      time: String(interaction.time || interaction.timestamp || now).slice(-8),
-      text: interaction.message || interaction.description || interaction.event || "检测到仪器交互",
-      tag: "仪器交互",
+      time: String(interaction.observed_at || interaction.captured_at || interaction.time || interaction.timestamp || now).slice(11, 19),
+      text: `${interactionSubject} ${interactionAction} ${interactionInstrument}`,
+      tag: interaction.camera_id ? `仪器交互 · ${interaction.camera_id}` : "仪器交互",
       tone: interaction.level === "alarm" ? "alarm" : "normal",
+    });
+  }
+
+  for (const error of Array.isArray(state.interaction_errors) ? state.interaction_errors.slice(0, 3) : []) {
+    rows.push({
+      time: String(error.occurred_at || now).slice(11, 19),
+      text: `仪器分析失败：${error.code || error.message || "unknown_error"}`,
+      tag: error.camera_id ? `仪器交互 · ${error.camera_id}` : "仪器交互",
+      tone: "warning",
     });
   }
 
@@ -663,6 +689,8 @@ function renderEventFeed(state) {
 }
 
 function renderInitial(state) {
+  const synchronizedReplay = state.cameras.length > 0 &&
+    state.cameras.every((camera) => camera.replay?.enabled);
   videoGrid.innerHTML = state.cameras.map((camera) => `
     <article class="camera-card" data-camera-id="${escapeHtml(camera.id)}">
       <header>
@@ -673,12 +701,12 @@ function renderInitial(state) {
         <span class="camera-badge ${escapeHtml(camera.status)}">${escapeHtml(camera.status)}</span>
       </header>
       <div class="camera-viewport">
-        <img src="${API_BASE}/video/${encodeURIComponent(camera.id)}${remoteStream ? "?remote=1" : ""}" alt="${escapeHtml(camera.name)}">
+        <img data-camera-preview="${escapeHtml(camera.id)}" ${synchronizedReplay ? "" : `src="${API_BASE}/video/${encodeURIComponent(camera.id)}${remoteStream ? "?remote=1" : ""}"`} alt="${escapeHtml(camera.name)}">
       </div>
       <footer>
         <strong class="camera-identity">${escapeHtml(identityText(camera.identity))}</strong>
         <span class="camera-mode">${escapeHtml(modeText(camera))}</span>
-        <span class="camera-fps">${escapeHtml(camera.fps)} FPS</span>
+        <span class="camera-fps">${escapeHtml(camera.preview_fps || camera.fps)} FPS</span>
       </footer>
     </article>
   `).join("");
@@ -686,8 +714,64 @@ function renderInitial(state) {
   renderPeopleList(state.people || []);
 }
 
+async function refreshSynchronizedReplay() {
+  if (!synchronizedReplayEnabled || synchronizedReplayBusy) return;
+  synchronizedReplayBusy = true;
+  const syncId = `preview_${Date.now()}_${++synchronizedReplaySequence}`;
+  try {
+    const frames = await Promise.all(synchronizedReplayCameraIds.map(async (cameraId) => {
+      const response = await fetch(
+        `${API_BASE}/api/replay/synchronized-frame/${encodeURIComponent(cameraId)}.jpg?sync_id=${encodeURIComponent(syncId)}`,
+        {cache: "no-store"},
+      );
+      if (!response.ok) throw new Error(`sync preview ${cameraId}: HTTP ${response.status}`);
+      const url = URL.createObjectURL(await response.blob());
+      const preload = new Image();
+      preload.src = url;
+      await preload.decode();
+      return {cameraId, url};
+    }));
+
+    // Decode the whole batch before changing any card. The three panels then
+    // advance in one browser render instead of through independent MJPEG queues.
+    for (const {cameraId, url} of frames) {
+      const image = document.querySelector(`[data-camera-preview="${CSS.escape(cameraId)}"]`);
+      if (image) image.src = url;
+    }
+    for (const {cameraId, url} of frames) {
+      const previous = synchronizedReplayObjectUrls.get(cameraId);
+      synchronizedReplayObjectUrls.set(cameraId, url);
+      if (previous) URL.revokeObjectURL(previous);
+    }
+  } catch (error) {
+    // A replay service restart is transient; the next synchronized batch retries.
+  } finally {
+    synchronizedReplayBusy = false;
+    if (synchronizedReplayEnabled) {
+      synchronizedReplayTimer = window.setTimeout(refreshSynchronizedReplay, 100);
+    }
+  }
+}
+
+function configureSynchronizedReplay(state) {
+  const enabled = state.cameras.length > 0 &&
+    state.cameras.every((camera) => camera.replay?.enabled);
+  synchronizedReplayCameraIds = state.cameras.map((camera) => camera.id);
+  if (enabled === synchronizedReplayEnabled) return;
+  synchronizedReplayEnabled = enabled;
+  if (synchronizedReplayTimer) window.clearTimeout(synchronizedReplayTimer);
+  synchronizedReplayTimer = null;
+  if (enabled) {
+    refreshSynchronizedReplay();
+    return;
+  }
+  for (const url of synchronizedReplayObjectUrls.values()) URL.revokeObjectURL(url);
+  synchronizedReplayObjectUrls.clear();
+}
+
 function update(state) {
   if (videoGrid.children.length !== state.cameras.length) renderInitial(state);
+  configureSynchronizedReplay(state);
   renderPeopleList(state.people || []);
   const runningCount = state.cameras.filter((camera) => camera.status === "running").length;
   cameraSummary.textContent = `${runningCount}/${state.cameras.length} 路正常`;
@@ -712,7 +796,7 @@ function update(state) {
     card.querySelector(".camera-identity").textContent = identityText(camera.identity);
     card.querySelector(".camera-mode").textContent = modeText(camera);
     const latency = camera.processing_latency_ms == null ? "-" : camera.processing_latency_ms;
-    card.querySelector(".camera-fps").textContent = `采 ${camera.capture_fps || 0}/处 ${camera.fps || 0} FPS · ${latency}ms · 丢 ${camera.dropped_frames || 0}`;
+    card.querySelector(".camera-fps").textContent = `采 ${camera.capture_fps || 0}/显 ${camera.preview_fps || 0}/算 ${camera.fps || 0} FPS · ${latency}ms · 丢 ${camera.dropped_frames || 0}`;
   }
   serviceState.textContent = "服务在线";
   serviceState.className = "service-state online";
@@ -726,7 +810,7 @@ async function refresh() {
     serviceState.textContent = "服务断开";
     serviceState.className = "service-state error";
   } finally {
-    // 与后端 200 ms 地图发布节奏对齐；视频流仍由独立 MJPEG 接口连续输出。
+    // 与后端 200 ms 地图发布节奏对齐；录像画面由独立的同步批次循环更新。
     window.setTimeout(refresh, 200);
   }
 }

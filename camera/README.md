@@ -29,7 +29,7 @@ cam_entrance 192.168.31.192  /stream1
 
 ## 启动 RTSP 链路
 
-先在实验室主机从仓库根目录启动 SSH 隧道。若本机 `5000` 已被开发服务占用，可把集群 API 映射到 `15000`：
+先在实验室主机从仓库根目录启动 SSH 隧道。脚本默认把集群 API 映射到本机 `15000`：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\camera\scripts\start_cluster_tunnel.ps1 `
@@ -126,7 +126,7 @@ tar -xzf ~/camera_cluster_bundle.tar.gz -C ~/lab-safety-host
 
 ## 观察页面
 
-`start_cluster_tunnel.ps1` 默认同时映射集群 API。如果使用 `-ApiLocalPort 15000`，再启动本地静态观察页：
+`start_cluster_tunnel.ps1` 默认同时把集群 API 映射到 `15000`。再启动本地静态观察页（观察页默认也连接 `15000`）：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\camera\scripts\start_observer.ps1 `
@@ -296,7 +296,9 @@ $env:LAB_MEMBER_SERVICE_TIMEOUT_SECONDS = "3"
 python .\scripts\test_member_connection.py --event-id "connection.test:<双方约定的固定 ID>"
 ```
 
-该脚本依次检查 `/health`，将同一 `connection.test` 投递两次，比较 `receipt_id`，再查询全局和 `cam_2` 的 `interaction-results/latest`。输出包含各请求的 HTTP 状态和完整 JSON 响应，但不会输出 Authorization 请求头。一次性 Token 测试结束后必须撤销；当前实现默认不自动发送任何真实人物、姓名、人脸、位置、监控画面或生物特征。
+该脚本依次检查 `/health`，将同一 `connection.test` 和使用固定合成身份、64×36 无人物 JPEG 的 `snapshot.ready` 分别投递两次，检查 `status: acknowledged` 和相同 `receipt_id`，再查询全局和 `cam_2` 的 `interaction-results/latest`。输出包含各请求的 HTTP 状态和完整 JSON 响应，但不会输出 Authorization 请求头。`/health` 不携带 Token，其余请求只由服务端添加 Bearer 鉴权。一次性 Token 测试结束后必须撤销；当前测试事件不会发送真实人物、真实姓名、人脸、位置、监控画面或生物特征。
+
+成员接收端启用图片分析后，可使用 `member_integration.build_synthetic_snapshot_frame_event()` 生成符合 `lab-handoff-1.1` 的低频 `snapshot.frame`。该构造器仍只引用上述无人物测试 JPEG，发送前必须先完成 `snapshot.ready` 契约和幂等性验证。
 
 ## 当前已知限制
 

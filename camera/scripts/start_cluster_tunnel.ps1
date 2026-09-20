@@ -3,7 +3,7 @@ param(
     [string]$RemoteHost = "10.10.0.10",
     [int]$LocalPort = 18554,
     [int]$RemotePort = 8554,
-    [int]$ApiLocalPort = 5000,
+    [int]$ApiLocalPort = 15000,
     [int]$ApiRemotePort = 5000,
     [switch]$DisableApiForward,
     [int]$RestartSeconds = 5,

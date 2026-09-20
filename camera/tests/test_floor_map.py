@@ -363,6 +363,62 @@ class FloorMapProjectorTests(unittest.TestCase):
             position, _ = projector.nearest_tracking_position(point)
             self.assertIn(projector.zone_for(**position), allowed_names)
 
+    def test_cam1_region_semantics_match_secondary_aisle(self):
+        config_path = Path(__file__).resolve().parents[1] / "config" / "floor_map.json"
+        floor_config = __import__("json").loads(config_path.read_text(encoding="utf-8"))
+        main = next(
+            zone for zone in floor_config["zones"] if zone["id"] == "secondary_aisle"
+        )
+        cam1 = floor_config["cameras"]["cam_1"]
+        annotation = floor_config["annotations"]["cam_1"]
+
+        self.assertIn("secondary_aisle", annotation["regions"])
+        self.assertNotIn("main_aisle", annotation["regions"])
+        self.assertEqual(cam1["map_points"], annotation["map_points"])
+        for _, y in cam1["map_points"]:
+            self.assertGreaterEqual(y, main["y"] - 0.15)
+            self.assertLessEqual(y, main["y"] + main["height"])
+
+    def test_corridor_switch_requires_consecutive_observations(self):
+        floor_config = config()
+        floor_config["zones"] = [
+            {"id": "main", "name": "Main", "x": 0, "y": 4, "width": 9, "height": 1},
+            {"id": "side", "name": "Side", "x": 8, "y": 1, "width": 1, "height": 4},
+        ]
+        floor_config["tracking_allowed_zone_ids"] = ["main", "side"]
+        floor_config["zone_switch_confirmation_observations"] = 3
+        projector = FloorMapProjector(floor_config)
+
+        def observe(position, observed_at):
+            return projector.state(
+                [{
+                    "camera_id": "cam_1",
+                    "track_id": "person_1",
+                    "position": position,
+                    "observed_at": observed_at,
+                }],
+                now=observed_at,
+                max_map_speed_mps=10.0,
+            )["people"][0]
+
+        observe({"x": 7.5, "y": 4.5}, 10.0)
+        first_side = observe({"x": 8.5, "y": 3.5}, 10.2)
+        back_main = observe({"x": 7.5, "y": 4.5}, 10.4)
+        side_one = observe({"x": 8.5, "y": 3.5}, 10.6)
+        repeated_side_one = observe({"x": 8.5, "y": 3.5}, 10.6)
+        side_two = observe({"x": 8.5, "y": 3.5}, 10.8)
+        side_three = observe({"x": 8.5, "y": 3.5}, 11.0)
+
+        self.assertTrue(first_side["zone_switch_held"])
+        self.assertEqual(first_side["pending_zone_id"], "side")
+        self.assertFalse(back_main["zone_switch_held"])
+        self.assertEqual(side_one["pending_zone_observations"], 1)
+        self.assertEqual(repeated_side_one["pending_zone_observations"], 1)
+        self.assertEqual(side_two["pending_zone_observations"], 2)
+        self.assertTrue(side_two["zone_switch_held"])
+        self.assertFalse(side_three["zone_switch_held"])
+        self.assertEqual(side_three["tracking_zone_id"], "side")
+
     def test_smoothed_map_position_never_enters_solid_fixture(self):
         floor_config = config()
         floor_config["fixtures"] = [
@@ -840,15 +896,14 @@ class FloorMapProjectorTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertNotEqual(first, second)
 
-    def test_actual_cam_1_live_reference_projects_to_main_aisle(self):
+    def test_actual_cam_1_reference_projects_to_secondary_aisle(self):
         config_path = Path(__file__).resolve().parents[1] / "config" / "floor_map.json"
         projector = FloorMapProjector.from_path(config_path)
 
-        # Operator-confirmed live reference on 2026-09-14: the tracked person's
-        # footpoint was in the main aisle, not the secondary aisle.
+        # 2026-09-20 recording and operator correction: Cam1 views the secondary aisle.
         position = projector.project("cam_1", (477, 51, 82, 166), (432, 768, 3))
         main_aisle = next(
-            zone for zone in projector.config["zones"] if zone["id"] == "main_aisle"
+            zone for zone in projector.config["zones"] if zone["id"] == "secondary_aisle"
         )
 
         self.assertIsNotNone(position)

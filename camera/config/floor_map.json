@@ -4,6 +4,7 @@
   "height_m": 7.0,
   "projection_domain_margin_normalized": 0.03,
   "footpoint_inference_max_distance_normalized": 0.18,
+  "zone_switch_confirmation_observations": 3,
   "calibrated": false,
   "calibration": {
     "status": "approximate",
@@ -204,19 +205,19 @@
       "map_points": [
         [
           8.551,
-          5.088
+          2.088
         ],
         [
           8.48,
-          4.381
+          1.381
         ],
         [
           1.287,
-          4.593
+          1.593
         ],
         [
           1.252,
-          5.229
+          2.229
         ]
       ]
     },
@@ -432,19 +433,19 @@
       "map_points": [
         [
           8.551,
-          5.088
+          2.088
         ],
         [
           8.48,
-          4.381
+          1.381
         ],
         [
           1.287,
-          4.593
+          1.593
         ],
         [
           1.252,
-          5.229
+          2.229
         ]
       ]
     },

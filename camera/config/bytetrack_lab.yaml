@@ -1,0 +1,11 @@
+# Laboratory people tracking profile.
+# Keep low-score detections available to ByteTrack instead of discarding them
+# at the YOLO NMS boundary. Only detections at or above new_track_thresh can
+# create a new trajectory; lower scores can maintain an existing trajectory.
+tracker_type: bytetrack
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.20
+track_buffer: 60
+match_thresh: 0.80
+fuse_score: true

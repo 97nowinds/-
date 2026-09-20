@@ -124,18 +124,33 @@ for index, url in enumerate(urls, 1):
     print(f"source_camera_{index}=ok shape={frame.shape}")
 PY
 
-"$PYTHON_BIN" app.py &
-APP_PID=$!
-cleanup() { kill "$APP_PID" 2>/dev/null || true; wait "$APP_PID" 2>/dev/null || true; }
+APP_PID=""
+SHUTDOWN_REQUESTED=0
+RESTART_COUNT=0
+RESTART_MAX="${LAB_APP_RESTART_MAX:-20}"
+RESTART_BASE_SECONDS="${LAB_APP_RESTART_BASE_SECONDS:-3}"
+
+cleanup() {
+    SHUTDOWN_REQUESTED=1
+    if [[ -n "$APP_PID" ]]; then
+        kill "$APP_PID" 2>/dev/null || true
+        wait "$APP_PID" 2>/dev/null || true
+        APP_PID=""
+    fi
+}
 trap cleanup EXIT INT TERM
-"$PYTHON_BIN" - <<'PY'
+
+wait_for_health() {
+    "$PYTHON_BIN" - <<'PY'
 import json
+import os
 import time
 import urllib.request
 
+port = int(os.environ.get("LAB_APP_PORT", "5000"))
 for _ in range(30):
     try:
-        with urllib.request.urlopen("http://127.0.0.1:5000/api/health", timeout=2) as response:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as response:
             payload = json.loads(response.read().decode("utf-8"))
             if response.status == 200 and payload.get("status") == "ok":
                 print("api_health=ok", payload)
@@ -145,4 +160,33 @@ for _ in range(30):
 else:
     raise SystemExit("/api/health did not become ready")
 PY
-wait "$APP_PID"
+}
+
+while (( SHUTDOWN_REQUESTED == 0 )); do
+    echo "starting_camera_app restart_count=${RESTART_COUNT}"
+    "$PYTHON_BIN" app.py &
+    APP_PID=$!
+    wait_for_health
+
+    set +e
+    wait "$APP_PID"
+    APP_EXIT_CODE=$?
+    set -e
+    APP_PID=""
+
+    if (( SHUTDOWN_REQUESTED != 0 )); then
+        break
+    fi
+    RESTART_COUNT=$((RESTART_COUNT + 1))
+    echo "camera_app_exited code=${APP_EXIT_CODE} restart_count=${RESTART_COUNT}" >&2
+    if (( RESTART_COUNT > RESTART_MAX )); then
+        echo "camera_app_restart_limit_exceeded max=${RESTART_MAX}" >&2
+        exit "$APP_EXIT_CODE"
+    fi
+    RESTART_DELAY=$((RESTART_BASE_SECONDS * RESTART_COUNT))
+    if (( RESTART_DELAY > 60 )); then
+        RESTART_DELAY=60
+    fi
+    echo "restarting_camera_app_in_seconds=${RESTART_DELAY}" >&2
+    sleep "$RESTART_DELAY"
+done

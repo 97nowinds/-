@@ -74,6 +74,16 @@ class MemberServiceClient:
         self._token = token.strip()
         if not self._token:
             raise MemberIntegrationConfigError("member service bearer token is not configured")
+        try:
+            self._token.encode("ascii")
+        except UnicodeEncodeError as error:
+            raise MemberIntegrationConfigError(
+                "member service bearer token must contain ASCII characters only"
+            ) from error
+        if any(character.isspace() for character in self._token):
+            raise MemberIntegrationConfigError(
+                "member service bearer token must not contain whitespace"
+            )
         self.timeout_seconds = float(timeout_seconds)
         if not 0.1 <= self.timeout_seconds <= 30.0:
             raise MemberIntegrationConfigError("member service timeout must be between 0.1 and 30 seconds")
@@ -96,13 +106,21 @@ class MemberServiceClient:
             "authentication": "bearer (server-side, redacted)",
         }
 
-    def _request(self, method: str, path: str, payload: Any | None = None) -> MemberServiceResponse:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Any | None = None,
+        *,
+        authenticated: bool = True,
+    ) -> MemberServiceResponse:
         data = None
         headers = {
             "Accept": "application/json",
-            "Authorization": f"Bearer {self._token}",
             "User-Agent": "lab-camera-member-integration/1.0",
         }
+        if authenticated:
+            headers["Authorization"] = f"Bearer {self._token}"
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
@@ -132,7 +150,7 @@ class MemberServiceClient:
         return MemberServiceResponse(int(status), body, content_type or "unknown")
 
     def health(self) -> MemberServiceResponse:
-        return self._request("GET", "/health")
+        return self._request("GET", "/health", authenticated=False)
 
     def send_handoff(self, event: Mapping[str, Any]) -> MemberServiceResponse:
         if not isinstance(event, Mapping) or not str(event.get("event_id", "")).strip():
@@ -162,9 +180,196 @@ def build_connection_test_event(event_id: str, producer: str = "lab-camera-host"
         "event_type": "connection.test",
         "occurred_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         "producer": producer,
-        "test": {
-            "purpose": "no-person connectivity and idempotency verification",
-            "contains_real_data": False,
+        "priority": "low",
+        "status": "test",
+        "data_classification": "synthetic",
+    }
+
+
+def build_synthetic_snapshot_ready_event(
+    event_id: str = "snapshot.ready:synthetic-round2-001:cam_2",
+    *,
+    image_url: str = "http://192.168.31.127:5173/api/handoff/test.jpg",
+    producer: str = "lab-camera-host",
+) -> dict[str, Any]:
+    """Build the contract test event; every identity is explicitly synthetic."""
+
+    observed_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    return {
+        "schema_version": "lab-handoff-1.1",
+        "event_id": event_id,
+        "event_type": "snapshot.ready",
+        "occurred_at": observed_at,
+        "producer": producer,
+        "priority": "normal",
+        "status": "ready",
+        "data_classification": "synthetic",
+        "snapshot": {
+            "snapshot_id": "synthetic-round2-001",
+            "camera_id": "cam_2",
+            "captured_at": observed_at,
+            "image_url": image_url,
+            "frame_width": 64,
+            "frame_height": 36,
+            "people_count": 1,
+            "synchronized": True,
+            "alarm": False,
+        },
+        "people": [
+            {
+                "person_id": "person_test_1",
+                "global_id": "global_test_1",
+                "track_id": "track_test_1",
+                "local_track_id": 1,
+                "display_name": "测试人员",
+                "camera_id": "cam_2",
+                "bbox": [8, 4, 12, 24],
+                "bbox_format": "xywh_pixels",
+                "confidence": 0.9,
+                "observed_at": observed_at,
+            }
+        ],
+    }
+
+
+def build_synthetic_snapshot_frame_event(
+    event_id: str = "snapshot.frame:synthetic-round2-001:cam_2:000001",
+    *,
+    snapshot_id: str = "synthetic-round2-001",
+    image_url: str = "http://192.168.31.127:5173/api/handoff/test.jpg",
+    producer: str = "lab-camera-host",
+    include_test_track: bool = True,
+    test_bbox: tuple[int, int, int, int] = (8, 4, 12, 24),
+    second_test_bbox: tuple[int, int, int, int] | None = None,
+    camera_id: str = "cam_2",
+    track_id: str = "track_test_1",
+    global_id: str = "global_test_1",
+    local_track_id: int = 1,
+    person_id: str = "person_test_1",
+) -> dict[str, Any]:
+    """Build a low-rate synthetic frame for the receiver's analysis phase."""
+
+    captured_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    tracks = []
+    if include_test_track:
+        tracks.append(
+            {
+                "track_id": track_id,
+                "global_id": global_id,
+                "local_track_id": local_track_id,
+                "person_id": person_id,
+                "display_name": "测试人员一",
+                "bbox": list(test_bbox),
+                "bbox_format": "xywh_pixels",
+                "confidence": 0.9,
+                "observed_at": captured_at,
+            }
+        )
+    if second_test_bbox is not None:
+        tracks.append(
+            {
+                "track_id": "track_test_2",
+                "global_id": "global_test_2",
+                "local_track_id": 2,
+                "person_id": "person_test_2",
+                "display_name": "测试人员二",
+                "bbox": list(second_test_bbox),
+                "bbox_format": "xywh_pixels",
+                "confidence": 0.9,
+                "observed_at": captured_at,
+            }
+        )
+    return {
+        "schema_version": "lab-handoff-1.1",
+        "event_id": event_id,
+        "event_type": "snapshot.frame",
+        "occurred_at": captured_at,
+        "producer": producer,
+        "priority": "low",
+        "status": "test",
+        "data_classification": "synthetic",
+        "snapshot_id": snapshot_id,
+        "captured_at": captured_at,
+        "camera": {
+            "camera_id": camera_id,
+            "frame_width": 64,
+            "frame_height": 36,
+            "image_url": image_url,
+            "tracks": tracks,
+        },
+    }
+
+
+def build_synthetic_person_handoff_event(
+    event_id: str = "person.handoff:synthetic-round6-001",
+    *,
+    person_id: str = "person_test_handoff_1",
+    global_id: str = "global_test_handoff_1",
+    source_camera_id: str = "cam_2",
+    target_camera_id: str = "cam_entrance",
+    source_local_track_id: int = 101,
+    target_local_track_id: int = 201,
+) -> dict[str, Any]:
+    """Build a fixed synthetic cross-camera identity handoff event."""
+
+    occurred_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    return {
+        "schema_version": "lab-handoff-1.1",
+        "event_id": event_id,
+        "event_type": "person.handoff",
+        "occurred_at": occurred_at,
+        "producer": "lab-camera-host",
+        "priority": "low",
+        "status": "test",
+        "data_classification": "synthetic",
+        "handoff": {
+            "person_id": person_id,
+            "global_id": global_id,
+            "source_camera_id": source_camera_id,
+            "target_camera_id": target_camera_id,
+            "source_local_track_id": source_local_track_id,
+            "target_local_track_id": target_local_track_id,
+            "occurred_at": occurred_at,
+            "reid_score": 0.91,
+            "time_score": 0.88,
+            "geometry_score": 0.75,
+            "final_score": 0.86,
+            "confidence": 0.86,
+            "association_version": "synthetic-contract-test-1",
+        },
+    }
+
+
+def build_monitoring_snapshot_frame_event(
+    *,
+    event_id: str,
+    snapshot_id: str,
+    camera_id: str,
+    captured_at: str,
+    image_url: str,
+    frame_width: int,
+    frame_height: int,
+    tracks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build an anonymized live frame without credentials or embeddings."""
+
+    return {
+        "schema_version": "lab-handoff-1.1",
+        "event_id": event_id,
+        "event_type": "snapshot.frame",
+        "occurred_at": captured_at,
+        "producer": "lab-camera-host",
+        "priority": "normal",
+        "status": "active",
+        "data_classification": "anonymized_monitoring",
+        "snapshot_id": snapshot_id,
+        "captured_at": captured_at,
+        "camera": {
+            "camera_id": camera_id,
+            "frame_width": int(frame_width),
+            "frame_height": int(frame_height),
+            "image_url": image_url,
+            "tracks": tracks,
         },
     }
 

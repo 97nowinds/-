@@ -44,6 +44,13 @@ class FloorMapProjector:
             raise FloorMapError(
                 "footpoint_inference_max_distance_normalized must be between 0 and 0.5"
             )
+        self.zone_switch_confirmation_observations = int(
+            config.get("zone_switch_confirmation_observations", 3)
+        )
+        if not 1 <= self.zone_switch_confirmation_observations <= 30:
+            raise FloorMapError(
+                "zone_switch_confirmation_observations must be between 1 and 30"
+            )
         self.camera_projection_domain_margins = {}
         zones = config.get("zones", [])
         zones_by_id = {zone.get("id"): zone for zone in zones if zone.get("id")}
@@ -66,6 +73,7 @@ class FloorMapProjector:
         self._kalman_seen_at = {}
         self._filter_positions = {}
         self._position_sources = {}
+        self._zone_switch_states = {}
         self._last_mapped_people = {}
         self._filter_lock = threading.RLock()
         for camera_id, camera in config.get("cameras", {}).items():
@@ -535,6 +543,117 @@ class FloorMapProjector:
         )
         return self.clamp_position(nearest), True
 
+    def _tracking_zone_candidate(self, position, preferred_zone_id=None):
+        """Choose a walkable zone while preserving an overlapping current zone."""
+        if not self.tracking_zones:
+            return None
+        containing = [
+            zone for zone in self.tracking_zones if self._zone_contains(zone, position)
+        ]
+        if preferred_zone_id and any(
+            zone.get("id") == preferred_zone_id for zone in containing
+        ):
+            return preferred_zone_id
+        if containing:
+            return containing[0].get("id")
+        candidates = []
+        for zone in self.tracking_zones:
+            nearest = {
+                "x": float(
+                    np.clip(
+                        position["x"],
+                        float(zone["x"]),
+                        float(zone["x"]) + float(zone["width"]),
+                    )
+                ),
+                "y": float(
+                    np.clip(
+                        position["y"],
+                        float(zone["y"]),
+                        float(zone["y"]) + float(zone["height"]),
+                    )
+                ),
+            }
+            candidates.append(
+                (
+                    float(
+                        np.hypot(
+                            nearest["x"] - float(position["x"]),
+                            nearest["y"] - float(position["y"]),
+                        )
+                    ),
+                    zone.get("id"),
+                )
+            )
+        return min(candidates, key=lambda item: item[0])[1]
+
+    def _position_in_tracking_zone(self, position, zone_id):
+        zone = next(
+            (zone for zone in self.tracking_zones if zone.get("id") == zone_id),
+            None,
+        )
+        if zone is None:
+            return dict(position)
+        return {
+            "x": float(
+                np.clip(
+                    position["x"],
+                    float(zone["x"]),
+                    float(zone["x"]) + float(zone["width"]),
+                )
+            ),
+            "y": float(
+                np.clip(
+                    position["y"],
+                    float(zone["y"]),
+                    float(zone["y"]) + float(zone["height"]),
+                )
+            ),
+        }
+
+    def _apply_zone_switch_hysteresis(self, key, position):
+        """Require repeated evidence before moving one track to another corridor."""
+        if not self.tracking_zones:
+            return dict(position), False, None, None, 0
+        state = self._zone_switch_states.get(key)
+        current_zone_id = state.get("zone_id") if state else None
+        candidate_zone_id = self._tracking_zone_candidate(
+            position, preferred_zone_id=current_zone_id
+        )
+        if current_zone_id is None:
+            self._zone_switch_states[key] = {
+                "zone_id": candidate_zone_id,
+                "pending_zone_id": None,
+                "pending_observations": 0,
+            }
+            return dict(position), False, candidate_zone_id, None, 0
+        if candidate_zone_id == current_zone_id:
+            state.update(pending_zone_id=None, pending_observations=0)
+            return dict(position), False, current_zone_id, None, 0
+        if state.get("pending_zone_id") != candidate_zone_id:
+            state["pending_zone_id"] = candidate_zone_id
+            state["pending_observations"] = 1
+        else:
+            state["pending_observations"] = int(state["pending_observations"]) + 1
+        if (
+            state["pending_observations"]
+            >= self.zone_switch_confirmation_observations
+        ):
+            state.update(
+                zone_id=candidate_zone_id,
+                pending_zone_id=None,
+                pending_observations=0,
+            )
+            return dict(position), False, candidate_zone_id, None, 0
+        held = self._position_in_tracking_zone(position, current_zone_id)
+        return (
+            held,
+            True,
+            current_zone_id,
+            candidate_zone_id,
+            int(state["pending_observations"]),
+        )
+
     @staticmethod
     def _zone_contains(zone, position, epsilon=1e-6):
         return (
@@ -714,29 +833,48 @@ class FloorMapProjector:
     ):
         """Smooth a projected foot point and reject physically impossible jumps."""
         with self._filter_lock:
-            position, walkability_adjusted = self.nearest_walkable_position(position)
             if reset:
                 self._kalman_filters.pop(key, None)
                 self._kalman_seen_at.pop(key, None)
                 self._filter_positions.pop(key, None)
-            kalman = self._kalman_filters.get(key)
+                self._zone_switch_states.pop(key, None)
+            now = float(now)
             previous_at = self._kalman_seen_at.get(key)
             previous_position = self._filter_positions.get(key)
+            if (
+                previous_at is not None
+                and previous_position is not None
+                and now <= previous_at
+            ):
+                zone_state = self._zone_switch_states.get(key, {})
+                return {
+                    **previous_position,
+                    "motion_limited": False,
+                    "raw_step_m": 0.0,
+                    "walkability_adjusted": False,
+                    "corridor_routed": False,
+                    "zone_switch_held": bool(zone_state.get("pending_zone_id")),
+                    "tracking_zone_id": zone_state.get("zone_id"),
+                    "pending_zone_id": zone_state.get("pending_zone_id"),
+                    "pending_zone_observations": int(
+                        zone_state.get("pending_observations", 0)
+                    ),
+                }
+            (
+                position,
+                zone_switch_held,
+                tracking_zone_id,
+                pending_zone_id,
+                pending_zone_observations,
+            ) = self._apply_zone_switch_hysteresis(key, position)
+            position, walkability_adjusted = self.nearest_walkable_position(position)
+            kalman = self._kalman_filters.get(key)
             requested_position = dict(position)
             corridor_routed = False
             if previous_position is not None:
                 position, corridor_routed = self._corridor_waypoint(
                     previous_position, position
                 )
-            now = float(now)
-            if previous_at is not None and now <= previous_at:
-                return {
-                    **previous_position,
-                    "motion_limited": False,
-                    "raw_step_m": 0.0,
-                    "walkability_adjusted": walkability_adjusted,
-                    "corridor_routed": False,
-                }
             if kalman is None:
                 kalman = self._new_kalman_filter(position)
                 self._kalman_filters[key] = kalman
@@ -838,6 +976,10 @@ class FloorMapProjector:
                     walkability_adjusted or corrected_adjusted
                 ),
                 "corridor_routed": corridor_routed,
+                "zone_switch_held": zone_switch_held,
+                "tracking_zone_id": tracking_zone_id,
+                "pending_zone_id": pending_zone_id,
+                "pending_zone_observations": pending_zone_observations,
             }
             self._kalman_seen_at[key] = now
             self._filter_positions[key] = {"x": result["x"], "y": result["y"]}
@@ -855,6 +997,7 @@ class FloorMapProjector:
                 self._kalman_filters.pop(key, None)
                 self._filter_positions.pop(key, None)
                 self._position_sources.pop(key, None)
+                self._zone_switch_states.pop(key, None)
 
     @staticmethod
     def _observation_weight(observation):
@@ -887,6 +1030,7 @@ class FloorMapProjector:
             "calibration_reason": self.calibration_reason,
             "projection_domain_margin_normalized": self.projection_domain_margin,
             "footpoint_inference_max_distance_normalized": self.footpoint_inference_max_distance,
+            "zone_switch_confirmation_observations": self.zone_switch_confirmation_observations,
             "tracking_allowed_zone_ids": self.tracking_allowed_zone_ids,
             "zones": self.config.get("zones", []),
             "fixtures": self.config.get("fixtures", []),
@@ -1106,6 +1250,12 @@ class FloorMapProjector:
                     "raw_position_step_m": position["raw_step_m"],
                     "walkability_adjusted": position["walkability_adjusted"],
                     "corridor_routed": position["corridor_routed"],
+                    "zone_switch_held": position["zone_switch_held"],
+                    "tracking_zone_id": position["tracking_zone_id"],
+                    "pending_zone_id": position["pending_zone_id"],
+                    "pending_zone_observations": position[
+                        "pending_zone_observations"
+                    ],
                     "association_conflict": bool(
                         len(selected) < len(matches)
                         or any(match.get("visual_owner_conflict") for match in matches)

@@ -20,6 +20,7 @@ class AssociationObservation:
     direction: tuple = None
     person_class: str = "person"
     geometry_trusted: bool = True
+    excluded_global_ids: set = field(default_factory=set)
 
 
 @dataclass
@@ -165,6 +166,8 @@ class BatchAssociator:
         }
         if observation.person_class != "person":
             return {**evaluation, "eligible": False, "reason": "class_not_person"}
+        if target.global_id in observation.excluded_global_ids:
+            return {**evaluation, "eligible": False, "reason": "previously_distinct_same_camera_people"}
         transition = self._transition(target.camera_id, observation.camera_id)
         if transition is None:
             return {**evaluation, "eligible": False, "reason": "topology_rejected"}

@@ -16,10 +16,14 @@ param(
     [int]$RestartSeconds = 5,
     [int]$PublisherConnectGraceSeconds = 15,
     [int]$PublisherMissLimit = 3,
+    [switch]$SkipEntranceCamera,
     [switch]$PromptInConsole
 )
 
 $ErrorActionPreference = "Stop"
+if ($SkipEntranceCamera) {
+    $EntranceCameraIp = ""
+}
 if ($RemoteBaseUrl -match '@') {
     throw "Do not put a remote password in RemoteBaseUrl. Use -RemoteUsername and the runtime prompt."
 }

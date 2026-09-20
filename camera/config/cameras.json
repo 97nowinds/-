@@ -15,7 +15,11 @@
     "name": "Hikvision Camera 2",
     "role": "tracking",
     "face_recognition": false,
-    "yolo_frame_stride": 3,
+    "yolo_confidence": 0.1,
+    "yolo_image_size": 640,
+    "yolo_frame_stride": 1,
+    "yolo_tracker_config": "config/bytetrack_lab.yaml",
+    "track_hold_seconds": 1.5,
     "source_env": "LAB_CAM_2_RTSP"
   },
   {

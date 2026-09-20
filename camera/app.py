@@ -120,6 +120,69 @@ REPLAY_LOOP = os.environ.get("LAB_REPLAY_LOOP") == "1"
 app = Flask(__name__)
 
 
+def load_replay_frame_timestamps(source):
+    """Load the recorder's real capture timeline next to a replay video."""
+    if not isinstance(source, str):
+        return [], None
+    video_path = Path(source).expanduser()
+    timestamps_path = video_path.with_name(f"{video_path.stem}_timestamps.csv")
+    if not video_path.is_file() or not timestamps_path.is_file():
+        return [], None
+    try:
+        with timestamps_path.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        timestamps = [float(row["unix_time"]) for row in rows]
+    except (OSError, KeyError, TypeError, ValueError):
+        return [], None
+    if not timestamps or any(not np.isfinite(value) for value in timestamps):
+        return [], None
+    if any(current < previous for previous, current in zip(timestamps, timestamps[1:])):
+        return [], None
+    return timestamps, str(timestamps_path)
+
+
+def configure_replay_timelines(workers):
+    """Put recorded cameras on a smooth shared clock and loop boundary.
+
+    Recorder timestamps are host receive times. Buffered RTSP frames can arrive
+    in bursts, so replaying every raw interval reproduces decoder jitter rather
+    than camera motion. Preserve each stream's real first/last times while
+    distributing its frames uniformly between those anchors.
+    """
+    timestamped = [
+        worker
+        for worker in workers
+        if getattr(worker, "replay_frame_timestamps", None)
+    ]
+    if not timestamped:
+        return None
+    origin = min(worker.replay_frame_timestamps[0] for worker in timestamped)
+    cycle_duration = 0.0
+    for worker in timestamped:
+        timestamps = worker.replay_frame_timestamps
+        start_offset = timestamps[0] - origin
+        recorded_duration = timestamps[-1] - timestamps[0]
+        if len(timestamps) > 1 and recorded_duration > 0:
+            frame_interval = recorded_duration / (len(timestamps) - 1)
+            worker.replay_frame_offsets = [
+                start_offset + index * frame_interval
+                for index in range(len(timestamps))
+            ]
+            worker.replay_timing_mode = "smoothed_host_receive"
+            final_interval = frame_interval
+        else:
+            worker.replay_frame_offsets = [start_offset]
+            worker.replay_timing_mode = "single_timestamp"
+            final_interval = 0.05
+        cycle_duration = max(
+            cycle_duration,
+            worker.replay_frame_offsets[-1] + final_interval,
+        )
+    for worker in timestamped:
+        worker.replay_cycle_duration_seconds = cycle_duration
+    return cycle_duration
+
+
 def recording_session_directory(subject_id, session_id):
     if not RECORDING_PATH_PATTERN.fullmatch(str(subject_id or "")):
         raise ValueError("invalid recording subject")
@@ -191,6 +254,20 @@ def load_cameras():
         source_env = camera.get("source_env")
         if camera.get("optional") and not os.environ.get(source_env or "", "").strip():
             continue
+        tracker_config = str(camera.get("yolo_tracker_config", "bytetrack.yaml")).strip()
+        if not tracker_config:
+            tracker_config = "bytetrack.yaml"
+        if tracker_config != "bytetrack.yaml":
+            tracker_path = Path(tracker_config)
+            if not tracker_path.is_absolute():
+                tracker_path = BASE_DIR / tracker_path
+            tracker_path = tracker_path.resolve()
+            if not tracker_path.is_file():
+                raise ValueError(
+                    f"YOLO tracker config does not exist for {camera.get('id')}: "
+                    f"{tracker_path}"
+                )
+            tracker_config = str(tracker_path)
         normalized.append(
             {
                 "id": camera.get("id", f"cam_{index + 1}"),
@@ -215,6 +292,7 @@ def load_cameras():
                 "yolo_frame_stride": max(
                     1, int(camera.get("yolo_frame_stride", YOLO_FRAME_STRIDE))
                 ),
+                "yolo_tracker_config": tracker_config,
                 "track_hold_seconds": max(
                     0.1,
                     float(camera.get("track_hold_seconds", YOLO_TRACK_HOLD_SECONDS)),
@@ -293,6 +371,7 @@ class CameraWorker:
             YOLO_MODEL_PATH,
             confidence=self.camera["yolo_confidence"],
             image_size=self.camera["yolo_image_size"],
+            tracker_config=self.camera["yolo_tracker_config"],
         )
         self.yolo_trails = TrackTrailStore(max_points=90, stale_seconds=3.0)
         self.yolo_tracks = []
@@ -336,6 +415,9 @@ class CameraWorker:
         self.status = "starting"
         self.fps = 0.0
         self.capture_fps = 0.0
+        self.preview_fps = 0.0
+        self.preview_overlay_age_seconds = None
+        self.preview_overlay_status = "waiting"
         self.processing_latency_ms = None
         self.inference_started_at = None
         self.inference_ended_at = None
@@ -354,9 +436,19 @@ class CameraWorker:
         self._fps_frames = 0
         self._capture_fps_started = time.monotonic()
         self._capture_fps_frames = 0
+        self._preview_fps_started = time.monotonic()
+        self._preview_fps_frames = 0
         self.source_fps = 20.0
         self.replay_enabled = REPLAY_REALTIME and self.camera["source_type"] == "file_or_url"
         self.replay_loop = self.replay_enabled and REPLAY_LOOP
+        self.replay_frame_timestamps, self.replay_timestamp_path = (
+            load_replay_frame_timestamps(self.camera["source"])
+            if self.replay_enabled
+            else ([], None)
+        )
+        self.replay_frame_offsets = []
+        self.replay_timing_mode = "container_fps"
+        self.replay_cycle_duration_seconds = None
         self.replay_start_monotonic = None
         self.replay_start_unix = None
         self.replay_frame_index = 0
@@ -365,12 +457,14 @@ class CameraWorker:
         self.replay_finished = False
         self.capture_condition = threading.Condition()
         self.latest_capture = None
+        self.capture_history = deque(maxlen=16 if self.replay_enabled else 1)
         self.capture_sequence = 0
         self.capture_generation = 0
         self.display_condition = threading.Condition(self.lock)
         self.display_sequence = 0
         self.jpeg_condition = threading.Condition()
         self.jpeg_frames = {False: None, True: None}
+        self.jpeg_subscribers = {False: 0, True: 0}
         self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
         self.thread = threading.Thread(target=self.process_loop, daemon=True)
         self.encoder_thread = threading.Thread(target=self.encode_loop, daemon=True)
@@ -404,11 +498,15 @@ class CameraWorker:
                 self.source_fps = source_fps if 1.0 <= source_fps <= 60.0 else 20.0
                 if self.replay_enabled:
                     frame_count = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 1))
-                    self.replay_duration_seconds = frame_count / self.source_fps
+                    self.replay_duration_seconds = (
+                        self.replay_cycle_duration_seconds
+                        or frame_count / self.source_fps
+                    )
                     self.replay_frame_index = 0
                 with self.capture_condition:
                     self.capture_generation += 1
                     self.latest_capture = None
+                    self.capture_history.clear()
                     self.capture_condition.notify_all()
 
             ok, frame = capture.read()
@@ -426,6 +524,7 @@ class CameraWorker:
                 self.status = "reconnecting"
                 with self.capture_condition:
                     self.latest_capture = None
+                    self.capture_history.clear()
                     self.capture_condition.notify_all()
                 self.publish_placeholder("Camera reconnecting")
                 time.sleep(RECONNECT_SECONDS)
@@ -434,7 +533,10 @@ class CameraWorker:
             self.status = "running"
             if self.replay_enabled:
                 cycle_offset = self.replay_cycle * self.replay_duration_seconds
-                frame_offset = self.replay_frame_index / self.source_fps
+                if self.replay_frame_index < len(self.replay_frame_offsets):
+                    frame_offset = self.replay_frame_offsets[self.replay_frame_index]
+                else:
+                    frame_offset = self.replay_frame_index / self.source_fps
                 captured_monotonic = self.replay_start_monotonic + cycle_offset + frame_offset
                 captured_at = self.replay_start_unix + cycle_offset + frame_offset
                 delay = captured_monotonic - time.monotonic()
@@ -460,6 +562,7 @@ class CameraWorker:
                     captured_monotonic,
                     frame,
                 )
+                self.capture_history.append(self.latest_capture)
                 self.capture_condition.notify_all()
 
         if capture is not None:
@@ -533,22 +636,64 @@ class CameraWorker:
         self.end_current_track()
 
     def encode_loop(self):
-        encoded_sequence = 0
+        """Encode the newest capture without waiting for the AI pipeline.
+
+        Detection, ReID and map localization intentionally run on a separate
+        latest-frame consumer.  The browser preview therefore remains fluid
+        when that consumer is slower, while cached detections are drawn only
+        for a short, explicitly labelled interval.
+        """
+        encoded_capture_sequence = 0
+        encoded_display_sequence = 0
+        jpeg_sequence = 0
         while self.running:
-            with self.display_condition:
-                self.display_condition.wait_for(
-                    lambda: not self.running or self.display_sequence > encoded_sequence,
-                    timeout=1.0,
+            with self.capture_condition:
+                self.capture_condition.wait_for(
+                    lambda: not self.running
+                    or (
+                        self.latest_capture is not None
+                        and self.latest_capture[0] > encoded_capture_sequence
+                    ),
+                    timeout=0.25,
                 )
                 if not self.running:
                     return
-                sequence = self.display_sequence
-                frame = self.display_frame.copy() if self.display_frame is not None else None
+                capture = self.latest_capture
+
+            frame = None
+            if capture is not None and capture[0] > encoded_capture_sequence:
+                sequence, _generation, _captured_at, captured_monotonic, raw_frame = capture
+                frame = self.resize(raw_frame.copy())
+                frame = self.render_async_preview(frame, captured_monotonic)
+                encoded_capture_sequence = sequence
+            else:
+                # Connection errors and replay completion publish placeholders
+                # through the legacy display path because there is no capture.
+                with self.display_condition:
+                    if self.latest_capture is None and self.display_sequence > encoded_display_sequence:
+                        frame = (
+                            self.display_frame.copy()
+                            if self.display_frame is not None
+                            else None
+                        )
+                        encoded_display_sequence = self.display_sequence
             if frame is None:
+                continue
+
+            jpeg_sequence += 1
+            with self.jpeg_condition:
+                active_profiles = {
+                    remote
+                    for remote, subscribers in self.jpeg_subscribers.items()
+                    if subscribers > 0
+                }
+            if not active_profiles:
                 continue
 
             profiles = {}
             for remote, quality, max_width in ((False, 82, 960), (True, 68, 640)):
+                if remote not in active_profiles:
+                    continue
                 output = frame
                 if output.shape[1] > max_width:
                     scale = max_width / output.shape[1]
@@ -557,11 +702,101 @@ class CameraWorker:
                     ".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
                 )
                 if ok:
-                    profiles[remote] = (sequence, encoded.tobytes())
+                    profiles[remote] = (jpeg_sequence, encoded.tobytes())
             with self.jpeg_condition:
                 self.jpeg_frames.update(profiles)
                 self.jpeg_condition.notify_all()
-            encoded_sequence = sequence
+            self.record_preview_frame()
+
+    def render_async_preview(self, frame, captured_monotonic):
+        """Draw a read-only snapshot of the latest AI result on a live frame."""
+        with self.lock:
+            tracks = [dict(item) for item in self.yolo_tracks]
+            identities = {
+                int(local_id): dict(identity)
+                for local_id, identity in self.track_identities.items()
+            }
+            detected_at = self.last_yolo_tracks_at
+
+        overlay_age = (
+            max(0.0, float(captured_monotonic) - float(detected_at))
+            if detected_at is not None
+            else None
+        )
+        max_overlay_age = max(1.0, float(self.camera.get("track_hold_seconds", 1.0)))
+        if overlay_age is None:
+            overlay_status = "waiting"
+            visible_tracks = []
+        elif overlay_age > max_overlay_age:
+            overlay_status = "stale"
+            visible_tracks = []
+        else:
+            overlay_status = "fresh"
+            visible_tracks = tracks
+
+        self.preview_overlay_age_seconds = (
+            round(overlay_age, 2) if overlay_age is not None else None
+        )
+        self.preview_overlay_status = overlay_status
+
+        for track in visible_tracks:
+            local_id = int(track.get("local_id", 0))
+            x, y, width, height = (int(value) for value in track["box"])
+            x = max(0, min(x, frame.shape[1] - 1))
+            y = max(0, min(y, frame.shape[0] - 1))
+            width = max(1, min(width, frame.shape[1] - x))
+            height = max(1, min(height, frame.shape[0] - y))
+            color = self.yolo_color(local_id)
+            identity = identities.get(local_id)
+            if identity:
+                number = identity.get("person_number")
+                label = (
+                    f"{number} {identity.get('name', '')}".strip()
+                    if number
+                    else str(identity.get("name", "IDENTIFIED"))
+                )
+                label_color = (80, 220, 130)
+            else:
+                label = "UNREGISTERED" if track.get("counted") else "PENDING"
+                label_color = color
+            confidence = float(track.get("confidence", 0.0))
+            cv2.rectangle(frame, (x, y), (x + width, y + height), color, 3)
+            cv2.putText(
+                frame,
+                f"{label} | {confidence:.0%}",
+                (x, max(62, y - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                label_color,
+                2,
+                cv2.LINE_AA,
+            )
+
+        cv2.rectangle(frame, (0, 0), (frame.shape[1], 40), (20, 23, 27), -1)
+        if overlay_status == "fresh":
+            ai_label = f"AI {overlay_age:.1f}s"
+            header_color = (235, 238, 242)
+        elif overlay_status == "stale":
+            ai_label = f"AI STALE {overlay_age:.1f}s"
+            header_color = (80, 160, 255)
+        else:
+            ai_label = "AI WAITING"
+            header_color = (80, 160, 255)
+        header = (
+            f"{self.camera['id']} | LIVE PREVIEW | "
+            f"{len(visible_tracks)} PEOPLE | {ai_label}"
+        )
+        cv2.putText(
+            frame,
+            header,
+            (12, 27),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            header_color,
+            2,
+            cv2.LINE_AA,
+        )
+        return frame
 
     def open_capture(self):
         source = self.camera["source"]
@@ -621,6 +856,14 @@ class CameraWorker:
             self.capture_fps = round(self._capture_fps_frames / elapsed, 1)
             self._capture_fps_frames = 0
             self._capture_fps_started = time.monotonic()
+
+    def record_preview_frame(self):
+        self._preview_fps_frames += 1
+        elapsed = time.monotonic() - self._preview_fps_started
+        if elapsed >= 1.0:
+            self.preview_fps = round(self._preview_fps_frames / elapsed, 1)
+            self._preview_fps_frames = 0
+            self._preview_fps_started = time.monotonic()
 
     def detect_faces(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -1316,10 +1559,10 @@ class CameraWorker:
                         "confidence": track["confidence"],
                         "counted": mtmc_diagnostics["counted"],
                         "count_status": mtmc_diagnostics["count_status"],
-                        "count_duplicate_of": mtmc_diagnostics["count_duplicate_of"],
-                        "count_duplicate_reid_score": mtmc_diagnostics[
+                        "count_duplicate_of": mtmc_diagnostics.get("count_duplicate_of"),
+                        "count_duplicate_reid_score": mtmc_diagnostics.get(
                             "count_duplicate_reid_score"
-                        ],
+                        ),
                         "track_age_seconds": mtmc_diagnostics["track_age_seconds"],
                         "observed_at": frame_unix_time,
                         "observed_monotonic": now,
@@ -1344,10 +1587,10 @@ class CameraWorker:
                     "association_pending": mtmc_diagnostics["pending"],
                     "counted": mtmc_diagnostics["counted"],
                     "count_status": mtmc_diagnostics["count_status"],
-                    "count_duplicate_of": mtmc_diagnostics["count_duplicate_of"],
-                    "count_duplicate_reid_score": mtmc_diagnostics[
+                    "count_duplicate_of": mtmc_diagnostics.get("count_duplicate_of"),
+                    "count_duplicate_reid_score": mtmc_diagnostics.get(
                         "count_duplicate_reid_score"
-                    ],
+                    ),
                     "track_age_seconds": mtmc_diagnostics["track_age_seconds"],
                     "observation_count": mtmc_diagnostics["observation_count"],
                     "position_estimated": bool(location.get("estimated")),
@@ -1623,6 +1866,16 @@ class CameraWorker:
             )
             return self.jpeg_frames[remote]
 
+    def add_jpeg_subscriber(self, remote):
+        with self.jpeg_condition:
+            self.jpeg_subscribers[remote] += 1
+
+    def remove_jpeg_subscriber(self, remote):
+        with self.jpeg_condition:
+            self.jpeg_subscribers[remote] = max(
+                0, self.jpeg_subscribers[remote] - 1
+            )
+
     def registration_face(self):
         """Return one quality-checkable face constrained by the current YOLO person box."""
         with self.lock:
@@ -1738,6 +1991,10 @@ class CameraWorker:
             "status": status,
             "fps": self.fps,
             "capture_fps": self.capture_fps,
+            "preview_fps": self.preview_fps,
+            "preview_mode": "latest_capture_with_async_ai_overlay",
+            "preview_overlay_age_seconds": self.preview_overlay_age_seconds,
+            "preview_overlay_status": self.preview_overlay_status,
             "frame_age_seconds": round(age, 2) if age is not None else None,
             "capture_age_seconds": round(capture_age, 2) if capture_age is not None else None,
             "processing_latency_ms": self.processing_latency_ms,
@@ -1756,6 +2013,9 @@ class CameraWorker:
                 "frame_index": self.replay_frame_index,
                 "duration_seconds": self.replay_duration_seconds,
                 "finished": self.replay_finished,
+                "timestamp_file": self.replay_timestamp_path,
+                "timestamp_pacing": bool(self.replay_frame_offsets),
+                "timing_mode": self.replay_timing_mode,
             },
             "rtsp_transport": RTSP_TRANSPORT if self.camera["source_type"] == "rtsp" else None,
             "reconnect_count": self.reconnect_count,
@@ -1783,6 +2043,7 @@ class CameraWorker:
             "inference_frame_stride": self.camera["yolo_frame_stride"],
             "detector_confidence_threshold": self.camera["yolo_confidence"],
             "detector_image_size": self.camera["yolo_image_size"],
+            "tracking_diagnostics": self.yolo_tracker.diagnostics(),
             "last_inference_age_seconds": (
                 round(now_monotonic - self.last_yolo_at, 2)
                 if self.last_yolo_at is not None
@@ -1867,6 +2128,9 @@ class CameraManager:
             baudrate=int(os.environ.get("LAB_HARDWARE_BAUD", "115200")),
             stale_seconds=float(os.environ.get("LAB_HARDWARE_STALE_SECONDS", "30")),
         )
+        self.synchronized_preview_lock = threading.Lock()
+        self.synchronized_preview_batches = {}
+        self.synchronized_preview_order = deque(maxlen=4)
         self.workers = {
             camera["id"]: CameraWorker(
                 camera,
@@ -1878,6 +2142,7 @@ class CameraManager:
             )
             for camera in cameras
         }
+        configure_replay_timelines(self.workers.values())
         replay_start_monotonic = time.monotonic() + 2.0
         replay_start_unix = time.time() + 2.0
         for worker in self.workers.values():
@@ -1891,6 +2156,64 @@ class CameraManager:
         for worker in self.workers.values():
             worker.stop()
         self.recorder.stop_if_active()
+
+    def synchronized_preview_batch(self, sync_id):
+        """Build one atomic three-camera preview batch for replay clients."""
+        with self.synchronized_preview_lock:
+            cached = self.synchronized_preview_batches.get(sync_id)
+            if cached is not None:
+                return cached
+
+            histories = {}
+            for camera_id, worker in self.workers.items():
+                with worker.capture_condition:
+                    histories[camera_id] = list(worker.capture_history)
+            if not histories or any(not history for history in histories.values()):
+                result = {"frames": {}, "skew_seconds": None}
+                return result
+
+            # Use the slowest camera's latest capture as the batch clock. Faster
+            # cameras select an older buffered frame nearest to that same time.
+            target_monotonic = min(history[-1][3] for history in histories.values())
+            selected = {
+                camera_id: min(
+                    history,
+                    key=lambda capture: abs(capture[3] - target_monotonic),
+                )
+                for camera_id, history in histories.items()
+            }
+
+            batch = {}
+            capture_times = []
+            for camera_id, worker in self.workers.items():
+                capture = selected[camera_id]
+                _sequence, _generation, captured_at, captured_monotonic, raw_frame = capture
+                frame = worker.resize(raw_frame.copy())
+                frame = worker.render_async_preview(frame, captured_monotonic)
+                if frame.shape[1] > 640:
+                    scale = 640 / frame.shape[1]
+                    frame = cv2.resize(frame, (640, int(frame.shape[0] * scale)))
+                ok, encoded = cv2.imencode(
+                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 68]
+                )
+                if not ok:
+                    continue
+                capture_times.append(float(captured_monotonic))
+                batch[camera_id] = {
+                    "jpeg": encoded.tobytes(),
+                    "captured_at": float(captured_at),
+                    "captured_monotonic": float(captured_monotonic),
+                }
+                worker.record_preview_frame()
+
+            skew = max(capture_times) - min(capture_times) if capture_times else None
+            result = {"frames": batch, "skew_seconds": skew}
+            if len(self.synchronized_preview_order) == self.synchronized_preview_order.maxlen:
+                oldest = self.synchronized_preview_order.popleft()
+                self.synchronized_preview_batches.pop(oldest, None)
+            self.synchronized_preview_order.append(sync_id)
+            self.synchronized_preview_batches[sync_id] = result
+            return result
 
     def state(self):
         cameras = [worker.status_payload() for worker in self.workers.values()]
@@ -2226,12 +2549,16 @@ class FaceRegistrationManager:
 
 def mjpeg_stream(worker, remote=False):
     sequence = -1
-    while worker.running:
-        result = worker.wait_for_jpeg(remote, sequence)
-        if result is None or result[0] <= sequence:
-            continue
-        sequence, encoded = result
-        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + encoded + b"\r\n"
+    worker.add_jpeg_subscriber(remote)
+    try:
+        while worker.running:
+            result = worker.wait_for_jpeg(remote, sequence)
+            if result is None or result[0] <= sequence:
+                continue
+            sequence, encoded = result
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + encoded + b"\r\n"
+    finally:
+        worker.remove_jpeg_subscriber(remote)
 
 
 def _validate_annotation_point(point, name, *, normalized=False):
@@ -2429,6 +2756,30 @@ def video(camera_id):
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
+@app.route("/api/replay/synchronized-frame/<camera_id>.jpg")
+def synchronized_replay_frame(camera_id):
+    worker = camera_manager.workers.get(camera_id)
+    if worker is None:
+        return "camera not found", 404
+    if not worker.replay_enabled:
+        return "synchronized preview is only available in replay mode", 409
+    sync_id = request.args.get("sync_id", "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", sync_id):
+        return "invalid sync_id", 400
+    batch = camera_manager.synchronized_preview_batch(sync_id)
+    item = batch["frames"].get(camera_id)
+    if item is None:
+        return "frame not ready", 503
+    response = Response(item["jpeg"], mimetype="image/jpeg")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["X-Capture-Unix-Time"] = f"{item['captured_at']:.6f}"
+    if batch["skew_seconds"] is not None:
+        response.headers["X-Synchronized-Skew-Ms"] = (
+            f"{batch['skew_seconds'] * 1000.0:.3f}"
+        )
     return response
 
 

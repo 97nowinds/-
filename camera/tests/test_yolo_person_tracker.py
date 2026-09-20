@@ -67,6 +67,25 @@ class YoloPersonTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.model.kwargs["tracker"], "bytetrack.yaml")
         self.assertEqual(tracker.model.kwargs["classes"], [0])
 
+    def test_custom_tracker_config_and_diagnostics_are_reported(self):
+        tracker = YoloPersonTracker(
+            "model.pt",
+            confidence=0.1,
+            tracker_config="config/bytetrack_lab.yaml",
+            model_factory=FakeModel,
+        )
+
+        tracks = tracker.track(np.zeros((180, 320, 3), dtype=np.uint8))
+        diagnostics = tracker.diagnostics()
+
+        self.assertEqual(tracker.model.kwargs["tracker"], "config/bytetrack_lab.yaml")
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(diagnostics["tracker_result_boxes"], 2)
+        self.assertEqual(diagnostics["valid_track_boxes"], 1)
+        self.assertEqual(diagnostics["deduplicated_tracks"], 1)
+        self.assertEqual(diagnostics["invalid_or_unassigned_boxes"], 1)
+        self.assertEqual(diagnostics["minimum_detector_confidence"], 0.1)
+
     def test_reset_discards_predictor_tracker_state(self):
         tracker = YoloPersonTracker("model.pt", model_factory=FakeModel)
 
@@ -84,6 +103,16 @@ class YoloPersonTrackerTests(unittest.TestCase):
         deduplicated = YoloPersonTracker.deduplicate_tracks(tracks)
 
         self.assertEqual([track["track_id"] for track in deduplicated], [7, 9])
+
+    def test_partially_overlapping_people_are_not_deduplicated(self):
+        tracks = [
+            {"track_id": 7, "box": (10, 20, 60, 120), "confidence": 0.91},
+            {"track_id": 8, "box": (45, 25, 60, 120), "confidence": 0.84},
+        ]
+
+        deduplicated = YoloPersonTracker.deduplicate_tracks(tracks)
+
+        self.assertEqual([track["track_id"] for track in deduplicated], [7, 8])
 
 
 class TrackTrailStoreTests(unittest.TestCase):
@@ -437,6 +466,53 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
 
         self.assertEqual(second, first)
         self.assertEqual(coordinator.local_bindings[("cam_entrance", 2)], first)
+
+    def test_same_camera_reacquisition_restores_confirmed_identity(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        frame[20:80, 30:70] = (20, 80, 180)
+        first = coordinator.update_batch(
+            "cam_entrance", [{"track_id": 1, "box": (30, 20, 40, 60)}],
+            frame, monotonic_time=1, unix_time=100,
+        )[1]
+        coordinator.set_identity(first, {"known": True, "person_id": "test_a", "name": "A"}, "cam_entrance", now=1)
+        coordinator.forget_local("cam_entrance", 1)
+        second = coordinator.update_batch(
+            "cam_entrance", [{"track_id": 2, "box": (31, 20, 40, 60)}],
+            frame, monotonic_time=1.4, unix_time=100.4,
+        )[2]
+        self.assertEqual(first, second)
+        self.assertEqual(coordinator.identity_for(second, "cam_entrance", now=1.4)["person_id"], "test_a")
+        self.assertIsNone(coordinator.identity_for(second, "cam_entrance", now=1000))
+
+    def test_crossing_crops_do_not_overwrite_clean_features(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.zeros((100, 160, 3), dtype=np.uint8)
+        frame[20:80, 10:50] = (20, 80, 180)
+        frame[20:80, 100:140] = (180, 80, 20)
+        tracks = [{"track_id": 1, "box": (10, 20, 40, 60)}, {"track_id": 2, "box": (100, 20, 40, 60)}]
+        first = coordinator.update_batch("cam_1", tracks, frame, monotonic_time=1, unix_time=100)
+        features = {key: value[0].copy() for key, value in coordinator.local_features.items()}
+        crossing = [{"track_id": 1, "box": (50, 20, 40, 60)}, {"track_id": 2, "box": (55, 20, 40, 60)}]
+        second = coordinator.update_batch("cam_1", crossing, frame, monotonic_time=2, unix_time=101)
+        self.assertEqual(first, second)
+        self.assertNotEqual(second[1], second[2])
+        for key, feature in features.items():
+            np.testing.assert_array_equal(coordinator.local_features[key][0], feature)
+            self.assertEqual(coordinator.local_features[key][1], 1)
+
+    def test_one_frame_occlusion_cannot_merge_previously_distinct_people(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.full((100, 160, 3), (20, 80, 180), dtype=np.uint8)
+        tracks = [{"track_id": 1, "box": (10, 20, 40, 60)}, {"track_id": 2, "box": (100, 20, 40, 60)}]
+        initial = coordinator.update_batch("cam_1", tracks, frame, monotonic_time=1, unix_time=100)
+        coordinator.forget_local("cam_1", 1)
+        occluded = coordinator.update_batch("cam_1", tracks[1:], frame, monotonic_time=1.2, unix_time=100.2)
+        self.assertEqual(occluded[2], initial[2])
+        self.assertIn(initial[1], coordinator.global_tracks)
+        restored = coordinator.update_batch("cam_1", tracks, frame, monotonic_time=1.4, unix_time=100.4)
+        self.assertEqual(restored, initial)
+        self.assertIsNone(coordinator._merge(*initial.values()))
 
     def test_same_camera_simultaneous_tracks_do_not_merge(self):
         coordinator = self.coordinator(self.UncalibratedFloorMap())

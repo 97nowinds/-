@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import app as app_module
@@ -57,6 +58,56 @@ def create_session(root, status="complete"):
 
 
 class RecordingReviewTests(unittest.TestCase):
+    def test_replay_uses_recorded_capture_timestamps_instead_of_container_fps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            video = directory / "cam_entrance.mp4"
+            video.write_bytes(b"video")
+            write_timestamps(
+                directory / "cam_entrance_timestamps.csv",
+                [100.25, 100.50, 101.25],
+            )
+
+            timestamps, path = app_module.load_replay_frame_timestamps(str(video))
+
+        self.assertEqual(timestamps, [100.25, 100.50, 101.25])
+        self.assertTrue(path.endswith("cam_entrance_timestamps.csv"))
+
+    def test_replay_cameras_share_origin_and_loop_duration(self):
+        cam_1 = SimpleNamespace(
+            replay_frame_timestamps=[100.0, 100.5, 101.0],
+            replay_frame_offsets=[],
+            replay_cycle_duration_seconds=None,
+        )
+        entrance = SimpleNamespace(
+            replay_frame_timestamps=[100.25, 100.75],
+            replay_frame_offsets=[],
+            replay_cycle_duration_seconds=None,
+        )
+
+        duration = app_module.configure_replay_timelines([cam_1, entrance])
+
+        self.assertEqual(cam_1.replay_frame_offsets, [0.0, 0.5, 1.0])
+        self.assertEqual(entrance.replay_frame_offsets, [0.25, 0.75])
+        self.assertEqual(duration, 1.5)
+        self.assertEqual(cam_1.replay_cycle_duration_seconds, 1.5)
+        self.assertEqual(entrance.replay_cycle_duration_seconds, 1.5)
+
+    def test_replay_smooths_bursty_host_receive_intervals(self):
+        camera = SimpleNamespace(
+            replay_frame_timestamps=[100.0, 100.001, 100.002, 101.0],
+            replay_frame_offsets=[],
+            replay_cycle_duration_seconds=None,
+        )
+
+        app_module.configure_replay_timelines([camera])
+
+        self.assertEqual(camera.replay_timing_mode, "smoothed_host_receive")
+        self.assertEqual(
+            [round(value, 3) for value in camera.replay_frame_offsets],
+            [0.0, 0.333, 0.667, 1.0],
+        )
+
     def test_video_time_maps_to_frame_before_capture_timestamp(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = create_session(Path(temporary))

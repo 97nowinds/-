@@ -52,6 +52,23 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn("${API_BASE}/api/state", source)
         self.assertIn("${API_BASE}/video/", source)
 
+    def test_monitoring_page_separates_capture_preview_and_ai_fps(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("camera.preview_fps", source)
+        self.assertIn("/显 ${camera.preview_fps || 0}/算", source)
+
+    def test_replay_preview_advances_all_camera_images_atomically(self):
+        source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        backend = (ROOT / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn("Promise.all(synchronizedReplayCameraIds.map", source)
+        self.assertIn("await preload.decode()", source)
+        self.assertIn("/api/replay/synchronized-frame/", source)
+        self.assertIn("camera.replay?.enabled", source)
+        self.assertIn('@app.route("/api/replay/synchronized-frame/<camera_id>.jpg")', backend)
+        self.assertIn("synchronized_preview_batch(sync_id)", backend)
+
     def test_provisional_tracks_are_visible_but_excluded_from_people_count(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
 
@@ -99,6 +116,113 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertNotIn("LAB_MEMBER_SERVICE_TOKEN", script)
         self.assertIn('INTERACTION_URL = "/api/interaction-results/latest"', script)
         self.assertIn("now - interactionLastFetchMs < 1000", script)
+        self.assertIn("interaction.interaction_label", script)
+        self.assertIn("interaction.instrument_name", script)
+        self.assertIn("interaction.track_id", script)
+        self.assertIn("interaction.observed_at", script)
+
+    def test_synthetic_round_two_trigger_is_local_only_and_fixed_payload(self):
+        server = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('"/api/integration/synthetic-round2": self._run_synthetic_round2', server)
+        self.assertIn('self.client_address[0] not in {"127.0.0.1", "::1"}', server)
+        self.assertIn('"request body is not allowed"', server)
+        self.assertIn('"error_type": type(error).__name__', server)
+        self.assertIn('"error": str(error)[:500]', server)
+        self.assertIn('"connection.test:synthetic-round2-001"', server)
+        self.assertIn("build_synthetic_snapshot_ready_event()", server)
+        self.assertNotIn("Authorization", server)
+
+    def test_synthetic_round_three_is_fixed_to_five_empty_frames_at_one_hz(self):
+        server = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('"/api/integration/synthetic-round3-frames"', server)
+        self.assertIn("for index in range(1, 6)", server)
+        self.assertIn("started + (index - 1)", server)
+        self.assertIn("include_test_track=False", server)
+        self.assertIn('"requested_frequency_hz": 1', server)
+        self.assertIn('"requested_frame_count": 5', server)
+
+    def test_synthetic_round_four_uses_one_moving_track_on_the_blank_jpeg(self):
+        server = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('"/api/integration/synthetic-round4-track"', server)
+        self.assertIn('"snapshot.frame:synthetic-round4:cam_2:', server)
+        self.assertIn("bbox = (8 + ((index - 1) * 4), 4, 12, 24)", server)
+        self.assertIn("include_test_track=True", server)
+        self.assertIn('"synthetic_track_id": "track_test_1"', server)
+
+    def test_synthetic_round_five_uses_two_crossing_tracks(self):
+        server = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('"/api/integration/synthetic-round5-crossing-tracks"', server)
+        self.assertIn('"snapshot.frame:synthetic-round5:cam_2:', server)
+        self.assertIn("first_bbox = (4 + ((index - 1) * 6), 4, 10, 24)", server)
+        self.assertIn("second_bbox = (34 - ((index - 1) * 6), 4, 10, 24)", server)
+        self.assertIn('"scenario": "two_tracks_crossing"', server)
+
+    def test_synthetic_round_six_exercises_cross_camera_handoff_idempotency(self):
+        server = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
+
+        self.assertIn('"/api/integration/synthetic-round6-camera-handoff"', server)
+        self.assertIn('"scenario": "cam_2_to_cam_entrance_handoff"', server)
+        self.assertIn("build_synthetic_person_handoff_event()", server)
+        self.assertIn('client.latest_interactions("cam_entrance")', server)
+        self.assertIn('"same_receipt_id": same_handoff_receipt', server)
+
+    def test_frontend_start_script_supports_a_masked_gui_token_prompt(self):
+        script = (ROOT / "scripts" / "start_frontend.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("[switch]$GuiTokenPrompt", script)
+        self.assertIn("Read-MemberTokenFromDialog", script)
+        self.assertIn("UseSystemPasswordChar = $true", script)
+        self.assertIn("内容会隐藏且不会保存到文件", script)
+        self.assertIn("[switch]$DisableLivePublisher", script)
+
+    def test_live_member_publisher_is_low_rate_and_receiver_restricted(self):
+        server = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
+
+        self.assertIn("class LiveSnapshotPublisher", server)
+        self.assertIn('camera_id="cam_2"', server)
+        self.assertIn("interval_seconds=1.0", server)
+        self.assertIn('"LAB_MEMBER_RECEIVER_IP", "192.168.31.189"', server)
+        self.assertIn("live snapshot access denied", server)
+        self.assertIn('"LAB_MEMBER_LIVE_PUBLISH_ENABLED", "1"', server)
+        self.assertIn("build_monitoring_snapshot_frame_event", server)
+        self.assertIn('state="idle_no_tracks"', server)
+        self.assertIn('self._update(state="complete")', server)
+        self.assertIn('"http_status": response.status', server)
+        self.assertIn("frame_reports = frame_reports[-20:]", server)
+
+    def test_live_publisher_preserves_xywh_tracker_boxes(self):
+        from frontend_server import LiveSnapshotPublisher
+
+        tracks = LiveSnapshotPublisher._tracks(
+            {
+                "yolo_tracks": [
+                    {
+                        "track_id": "person_1",
+                        "local_id": 7,
+                        "box": [540, 169, 77, 131],
+                        "confidence": 0.9,
+                    }
+                ]
+            },
+            "2026-09-17T12:00:00+08:00",
+        )
+        self.assertEqual(tracks[0]["bbox"], [540.0, 169.0, 77.0, 131.0])
+
+    def test_monitoring_page_surfaces_interaction_analysis_errors(self):
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("let latestInteractionErrors = [];", script)
+        self.assertIn("state.interaction_errors = latestInteractionErrors", script)
+        self.assertIn("仪器分析失败", script)
+
+    def test_embedded_handoff_jpeg_dimensions_are_detected(self):
+        from frontend_server import HANDOFF_TEST_JPEG, _jpeg_dimensions
+
+        self.assertEqual(_jpeg_dimensions(HANDOFF_TEST_JPEG), (64, 36))
 
     def test_cluster_service_uses_persistent_floor_map_config(self):
         service = (ROOT.parent / "cluster" / "camera_service.slurm").read_text(encoding="utf-8")
@@ -112,6 +236,7 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn("function Test-PublisherConnection", script)
         self.assertIn("alive but no longer publishing; forcing restart", script)
         self.assertIn("Get-NetTCPConnection -OwningProcess", script)
+        self.assertIn("[switch]$SkipEntranceCamera", script)
 
     def test_monitoring_page_exposes_fixed_calibration_entry(self):
         template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
@@ -168,7 +293,23 @@ class FrontendSeparationTests(unittest.TestCase):
         cameras = json.loads((ROOT / "config" / "cameras.json").read_text(encoding="utf-8"))
         cam2 = next(camera for camera in cameras if camera["id"] == "cam_2")
 
-        self.assertLessEqual(cam2["yolo_frame_stride"], 3)
+        self.assertEqual(cam2["yolo_frame_stride"], 1)
+        self.assertLessEqual(cam2["yolo_confidence"], 0.1)
+        self.assertGreaterEqual(cam2["yolo_image_size"], 640)
+        self.assertEqual(cam2["yolo_tracker_config"], "config/bytetrack_lab.yaml")
+        tracker = (ROOT / cam2["yolo_tracker_config"]).read_text(encoding="utf-8")
+        self.assertIn("track_low_thresh: 0.10", tracker)
+        self.assertIn("new_track_thresh: 0.20", tracker)
+
+    def test_state_exposes_detector_and_tracker_counts(self):
+        backend = (ROOT / "app.py").read_text(encoding="utf-8")
+        tracker = (ROOT / "yolo_person_tracker.py").read_text(encoding="utf-8")
+        frontend = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('"tracking_diagnostics": self.yolo_tracker.diagnostics()', backend)
+        self.assertIn('"tracker_result_boxes"', tracker)
+        self.assertIn('"deduplicated_tracks"', tracker)
+        self.assertIn("${tracked} 轨 / ${counted} 已确认", frontend)
 
     def test_person_detection_is_not_discarded_when_footpoint_is_unavailable(self):
         backend = (ROOT / "app.py").read_text(encoding="utf-8")

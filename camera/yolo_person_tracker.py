@@ -22,6 +22,7 @@ class YoloPersonTracker:
         confidence=0.45,
         iou=0.50,
         image_size=640,
+        tracker_config="bytetrack.yaml",
         device=None,
         model_factory=YOLO,
     ):
@@ -29,8 +30,16 @@ class YoloPersonTracker:
         self.confidence = float(confidence)
         self.iou = float(iou)
         self.image_size = int(image_size)
+        self.tracker_config = str(tracker_config)
         self.device = device if device is not None else ("0" if torch.cuda.is_available() else "cpu")
         self.model = model_factory(self.model_path)
+        self.last_diagnostics = {
+            "tracker_result_boxes": 0,
+            "valid_track_boxes": 0,
+            "deduplicated_tracks": 0,
+            "invalid_or_unassigned_boxes": 0,
+            "confidences": [],
+        }
 
     @staticmethod
     def _values(tensor):
@@ -46,7 +55,7 @@ class YoloPersonTracker:
         results = self.model.track(
             source=frame,
             persist=True,
-            tracker="bytetrack.yaml",
+            tracker=self.tracker_config,
             classes=[0],
             conf=self.confidence,
             iou=self.iou,
@@ -55,6 +64,13 @@ class YoloPersonTracker:
             verbose=False,
         )
         if not results or results[0].boxes is None:
+            self.last_diagnostics = {
+                "tracker_result_boxes": 0,
+                "valid_track_boxes": 0,
+                "deduplicated_tracks": 0,
+                "invalid_or_unassigned_boxes": 0,
+                "confidences": [],
+            }
             return []
 
         boxes = results[0].boxes
@@ -62,6 +78,13 @@ class YoloPersonTracker:
         xyxy = self._values(boxes.xyxy)
         confidences = self._values(boxes.conf)
         if not track_ids:
+            self.last_diagnostics = {
+                "tracker_result_boxes": len(xyxy),
+                "valid_track_boxes": 0,
+                "deduplicated_tracks": 0,
+                "invalid_or_unassigned_boxes": len(xyxy),
+                "confidences": [round(float(value), 4) for value in confidences],
+            }
             return []
 
         tracks = []
@@ -80,7 +103,26 @@ class YoloPersonTracker:
                     "confidence": round(float(confidence), 4),
                 }
             )
-        return self.deduplicate_tracks(tracks)
+        deduplicated = self.deduplicate_tracks(tracks)
+        self.last_diagnostics = {
+            # Ultralytics exposes boxes after the tracker callback here.  This
+            # is intentionally not labelled as raw detector output.
+            "tracker_result_boxes": len(xyxy),
+            "valid_track_boxes": len(tracks),
+            "deduplicated_tracks": len(deduplicated),
+            "invalid_or_unassigned_boxes": max(0, len(xyxy) - len(tracks)),
+            "confidences": [round(float(value), 4) for value in confidences],
+        }
+        return deduplicated
+
+    def diagnostics(self):
+        return {
+            **self.last_diagnostics,
+            "minimum_detector_confidence": self.confidence,
+            "nms_iou_threshold": self.iou,
+            "image_size": self.image_size,
+            "tracker_config": self.tracker_config,
+        }
 
     @staticmethod
     def box_iou(first, second):
@@ -221,6 +263,7 @@ class CrossCameraTrackCoordinator:
         self.pending = {}
         self.redirects = {}
         self.active_local_ids_by_camera = {}
+        self.distinct_global_pairs = {}
         self.stream_timestamps = {}
         self.association_reservations = {}
         self.last_merge_rejection_reason = None
@@ -615,6 +658,9 @@ class CrossCameraTrackCoordinator:
 
     def _merge(self, first_id, second_id, prefer=None, unix_time=None):
         self.last_merge_rejection_reason = None
+        if frozenset((first_id, second_id)) in self.distinct_global_pairs:
+            self.last_merge_rejection_reason = "previously_distinct_same_camera_people"
+            return None
         if prefer in (first_id, second_id):
             keep_id = prefer
             remove_id = second_id if prefer == first_id else first_id
@@ -689,6 +735,14 @@ class CrossCameraTrackCoordinator:
         elif keep_gallery is not None and remove_gallery is not None:
             keep_gallery.merge(remove_gallery)
         self.redirects[remove_id] = keep_id
+        for pair, seen_at in list(self.distinct_global_pairs.items()):
+            if remove_id in pair:
+                self.distinct_global_pairs.pop(pair)
+                replacement = frozenset(keep_id if item == remove_id else item for item in pair)
+                if len(replacement) == 2:
+                    self.distinct_global_pairs[replacement] = max(
+                        seen_at, self.distinct_global_pairs.get(replacement, seen_at)
+                    )
         self.pending.pop(remove_id, None)
         self._record_event(
             "merge",
@@ -790,7 +844,10 @@ class CrossCameraTrackCoordinator:
             if person_id and self.person_locks.get(person_id) != global_id:
                 return None
             if record.get("camera_id") == camera_id:
-                return None
+                # Restore an already-established global owner after local ID loss.
+                if global_id not in self.global_tracks:
+                    return None
+                return {**record["identity"], "identity_source": "same_camera_reacquisition"}
             if not self._handoff_allowed(
                 record.get("camera_id"),
                 camera_id,
@@ -850,7 +907,17 @@ class CrossCameraTrackCoordinator:
             key = (camera_id, local_id)
             gallery = self.local_galleries.setdefault(key, self._new_gallery())
             cached = self.local_features.get(key)
-            if cached is None or monotonic_time - cached[1] >= self.feature_refresh_seconds:
+            occluded = any(
+                int(other["track_id"]) != local_id
+                and YoloPersonTracker.box_iou(box, other["box"])
+                >= self.mtmc_config["reid"]["occlusion_iou_threshold"]
+                for other in tracks
+            )
+            # Crossing bodies produce mixed crops. Keep the last clean gallery
+            # until separation, including the legacy single-vector fallback.
+            if not occluded and (
+                cached is None or monotonic_time - cached[1] >= self.feature_refresh_seconds
+            ):
                 quality = BodyQualityScorer.assess(frame, box)
                 appearance = self.feature_extractor.extract(frame, box)
                 if appearance is not None:
@@ -900,6 +967,9 @@ class CrossCameraTrackCoordinator:
 
         with self.lock:
             self.active_local_ids_by_camera[camera_id] = set(active_local_ids)
+            for pair, seen_at in list(self.distinct_global_pairs.items()):
+                if monotonic_time - seen_at > self.retention_seconds:
+                    self.distinct_global_pairs.pop(pair, None)
             for global_id, target in list(self.global_tracks.items()):
                 if monotonic_time - target["last_seen"] > self.retention_seconds:
                     self.global_tracks.pop(global_id, None)
@@ -948,6 +1018,10 @@ class CrossCameraTrackCoordinator:
                         self._camera_geometry_allowed(camera_id)
                         and item["geometry_trusted"]
                     ),
+                    excluded_global_ids={
+                        other for pair in self.distinct_global_pairs
+                        if bound_id in pair for other in pair if other != bound_id
+                    },
                 )
                 observations.append(observation)
                 observation_by_key[(camera_id, item["local_id"])] = item
@@ -1081,6 +1155,11 @@ class CrossCameraTrackCoordinator:
                 # track when there was no association candidate to evaluate.
                 if candidate_id is not None or previous_id is None:
                     self._record_event("associate", **recorded, unix_time=unix_time)
+
+            visible_global_ids = sorted(set(results.values()))
+            for index, first in enumerate(visible_global_ids):
+                for second in visible_global_ids[index + 1:]:
+                    self.distinct_global_pairs[frozenset((first, second))] = monotonic_time
 
             for item in prepared:
                 global_id = results[item["local_id"]]
