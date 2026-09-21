@@ -22,6 +22,7 @@ class CameraWorkerIdentityTests(unittest.TestCase):
         worker.identity_votes = deque(maxlen=7)
         worker.track_identities = {}
         worker.identity_votes_by_track = defaultdict(lambda: deque(maxlen=7))
+        worker.face_attempts_by_track = {}
         worker.handoff_unknown_count = 0
         return worker
 
@@ -82,6 +83,20 @@ class CameraWorkerIdentityTests(unittest.TestCase):
         selected = worker.select_face_target(tracks)
 
         self.assertEqual(selected["track_id"], 2)
+
+    def test_face_target_rotates_between_unidentified_people(self):
+        worker = self.worker()
+        tracks = [
+            {"track_id": 1, "box": (0, 0, 100, 200), "confidence": 0.95},
+            {"track_id": 2, "box": (200, 0, 70, 160), "confidence": 0.80},
+        ]
+
+        first = worker.select_face_target(tracks)
+        worker.face_attempts_by_track[first["track_id"]] = 10.0
+        second = worker.select_face_target(tracks)
+
+        self.assertEqual(first["track_id"], 1)
+        self.assertEqual(second["track_id"], 2)
 
 
 if __name__ == "__main__":

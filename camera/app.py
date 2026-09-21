@@ -116,6 +116,51 @@ REGISTRATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 RECORDING_PATH_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 REPLAY_REALTIME = os.environ.get("LAB_REPLAY_REALTIME") == "1"
 REPLAY_LOOP = os.environ.get("LAB_REPLAY_LOOP") == "1"
+REPLAY_TIMING_MODE = os.environ.get(
+    "LAB_REPLAY_TIMING_MODE", "smoothed"
+).strip().lower()
+if REPLAY_TIMING_MODE not in {"smoothed", "original"}:
+    raise RuntimeError(
+        "LAB_REPLAY_TIMING_MODE must be either 'smoothed' or 'original'"
+    )
+
+
+def load_replay_camera_time_offsets(raw_value=None):
+    """Load per-camera corrections without changing source recordings.
+
+    A negative value advances a camera whose decoded picture arrived later than
+    the other streams. Recording files and timestamp CSVs remain unchanged.
+    """
+    raw_value = (
+        os.environ.get("LAB_REPLAY_CAMERA_TIME_OFFSETS", "{}")
+        if raw_value is None
+        else raw_value
+    )
+    try:
+        payload = json.loads(raw_value or "{}")
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "LAB_REPLAY_CAMERA_TIME_OFFSETS must be a JSON object"
+        ) from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("LAB_REPLAY_CAMERA_TIME_OFFSETS must be a JSON object")
+    offsets = {}
+    for camera_id, value in payload.items():
+        try:
+            offset = float(value)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"invalid replay time offset for camera {camera_id!r}"
+            ) from error
+        if not np.isfinite(offset) or abs(offset) > 10.0:
+            raise RuntimeError(
+                f"replay time offset for camera {camera_id!r} must be within 10 seconds"
+            )
+        offsets[str(camera_id)] = offset
+    return offsets
+
+
+REPLAY_CAMERA_TIME_OFFSETS = load_replay_camera_time_offsets()
 
 app = Flask(__name__)
 
@@ -141,14 +186,21 @@ def load_replay_frame_timestamps(source):
     return timestamps, str(timestamps_path)
 
 
-def configure_replay_timelines(workers):
-    """Put recorded cameras on a smooth shared clock and loop boundary.
+def configure_replay_timelines(workers, timing_mode=None, camera_offsets=None):
+    """Put recorded cameras on a shared clock and loop boundary.
 
     Recorder timestamps are host receive times. Buffered RTSP frames can arrive
-    in bursts, so replaying every raw interval reproduces decoder jitter rather
-    than camera motion. Preserve each stream's real first/last times while
-    distributing its frames uniformly between those anchors.
+    in bursts. ``smoothed`` preserves each stream's real first/last time while
+    distributing frames uniformly. ``original`` replays every recorded time
+    node exactly, including the original inter-camera start offsets and uneven
+    frame intervals.
     """
+    timing_mode = (timing_mode or REPLAY_TIMING_MODE).strip().lower()
+    if timing_mode not in {"smoothed", "original"}:
+        raise ValueError("replay timing mode must be 'smoothed' or 'original'")
+    camera_offsets = (
+        REPLAY_CAMERA_TIME_OFFSETS if camera_offsets is None else camera_offsets
+    )
     timestamped = [
         worker
         for worker in workers
@@ -160,16 +212,31 @@ def configure_replay_timelines(workers):
     cycle_duration = 0.0
     for worker in timestamped:
         timestamps = worker.replay_frame_timestamps
-        start_offset = timestamps[0] - origin
+        camera_id = str(getattr(worker, "camera", {}).get("id", ""))
+        timing_offset = float(camera_offsets.get(camera_id, 0.0))
+        worker.replay_timing_offset_seconds = timing_offset
+        start_offset = timestamps[0] - origin + timing_offset
         recorded_duration = timestamps[-1] - timestamps[0]
         if len(timestamps) > 1 and recorded_duration > 0:
-            frame_interval = recorded_duration / (len(timestamps) - 1)
-            worker.replay_frame_offsets = [
-                start_offset + index * frame_interval
-                for index in range(len(timestamps))
+            intervals = [
+                current - previous
+                for previous, current in zip(timestamps, timestamps[1:])
+                if current > previous
             ]
-            worker.replay_timing_mode = "smoothed_host_receive"
-            final_interval = frame_interval
+            if timing_mode == "original":
+                worker.replay_frame_offsets = [
+                    timestamp - origin + timing_offset for timestamp in timestamps
+                ]
+                worker.replay_timing_mode = "original_host_receive"
+                final_interval = float(np.median(intervals)) if intervals else 0.05
+            else:
+                frame_interval = recorded_duration / (len(timestamps) - 1)
+                worker.replay_frame_offsets = [
+                    start_offset + index * frame_interval
+                    for index in range(len(timestamps))
+                ]
+                worker.replay_timing_mode = "smoothed_host_receive"
+                final_interval = frame_interval
         else:
             worker.replay_frame_offsets = [start_offset]
             worker.replay_timing_mode = "single_timestamp"
@@ -392,12 +459,18 @@ class CameraWorker:
         self.track_identities = {}
         self.identity_votes_by_track = defaultdict(lambda: deque(maxlen=7))
         self.active_local_ids = set()
+        self.local_track_last_seen = {}
         self.handoff_unknown_count = 0
         self.last_face_at = None
         self.last_face_attempt_at = 0.0
         self.last_face_box = None
         self.last_face_result = None
         self.last_face_box_at = 0.0
+        self.face_attempts_by_track = {}
+        self.face_attempt_count = 0
+        self.face_detection_count = 0
+        self.face_match_count = 0
+        self.last_face_attempt_track_id = None
         self.last_handoff_refresh_at = 0.0
         self.last_handoff_attempt_at = 0.0
         self.track_sequence = 0
@@ -448,6 +521,7 @@ class CameraWorker:
         )
         self.replay_frame_offsets = []
         self.replay_timing_mode = "container_fps"
+        self.replay_timing_offset_seconds = 0.0
         self.replay_cycle_duration_seconds = None
         self.replay_start_monotonic = None
         self.replay_start_unix = None
@@ -629,6 +703,9 @@ class CameraWorker:
         self.coordinator.forget_camera(self.camera["id"])
         self.face_store.forget_camera(self.camera["id"])
         self.active_local_ids.clear()
+        self.local_track_last_seen = {}
+        self.face_attempts_by_track.clear()
+        self.last_face_attempt_track_id = None
         self.yolo_generation += 1
         self.last_yolo_at = None
         self.last_map_publish_at = 0.0
@@ -994,11 +1071,15 @@ class CameraWorker:
             for track in tracks
             if int(track["track_id"]) not in self.track_identities
         ]
-        return max(
-            unidentified or tracks,
+        candidates = unidentified or tracks
+        # In a crowd, do not let one large but repeatedly unrecognizable face
+        # monopolize every ArcFace attempt. Prefer the least recently checked
+        # local track, using face size/confidence only as the tie breaker.
+        return min(
+            candidates,
             key=lambda track: (
-                float(track.get("confidence", 0.0)) * track["box"][2] * track["box"][3],
-                track["box"][2] * track["box"][3],
+                self.face_attempts_by_track.get(int(track["track_id"]), 0.0),
+                -float(track.get("confidence", 0.0)) * track["box"][2] * track["box"][3],
             ),
         )
 
@@ -1323,9 +1404,14 @@ class CameraWorker:
             self.last_slam_at = now
         # 只在每路摄像头配置的抽样帧运行 YOLO。非抽样帧使用上一批检测框绘制画面，
         # 这样视频流仍然连续，而检测模型不再被每一帧调用。
+        effective_yolo_stride = (
+            min(2, self.camera["yolo_frame_stride"])
+            if self.replay_enabled
+            else self.camera["yolo_frame_stride"]
+        )
         should_infer = (
             self.frame_counter == 1
-            or self.frame_counter % self.camera["yolo_frame_stride"] == 0
+            or self.frame_counter % effective_yolo_stride == 0
             or self.last_yolo_at is None
         )
         cached_global_ids = {}
@@ -1393,11 +1479,20 @@ class CameraWorker:
         # A confirmed identity belongs to the active ByteTrack target. Keep
         # that name while the target moves, but clear it when the ID is gone.
         active_local_ids = {int(item["track_id"]) for item in tracks}
+        for local_id in active_local_ids:
+            self.local_track_last_seen[local_id] = now
+        retained_local_ids = set()
         for missing_local_id in self.active_local_ids - active_local_ids:
+            last_seen = self.local_track_last_seen.get(missing_local_id, now)
+            if now - last_seen <= self.camera["track_hold_seconds"]:
+                retained_local_ids.add(missing_local_id)
+                continue
             self.clear_identity(missing_local_id)
             self.face_store.forget_track((self.camera["id"], missing_local_id))
             self.coordinator.forget_local(self.camera["id"], missing_local_id)
-        self.active_local_ids = active_local_ids
+            self.local_track_last_seen.pop(missing_local_id, None)
+            self.face_attempts_by_track.pop(missing_local_id, None)
+        self.active_local_ids = active_local_ids | retained_local_ids
 
         observations = []
         published_tracks = []
@@ -1611,11 +1706,18 @@ class CameraWorker:
             self.last_face_attempt_at = now
             target_track = self.select_face_target(tracks)
             if target_track is not None:
+                target_local_id = int(target_track.get("track_id"))
+                self.face_attempts_by_track[target_local_id] = now
+                self.last_face_attempt_track_id = target_local_id
+                self.face_attempt_count += 1
                 candidate = self.confirm_face_identity(
                     frame, target_track["box"], target_track.get("track_id")
                 )
                 if candidate is not None:
                     face_box, face_result = candidate
+                    self.face_detection_count += 1
+                    if face_result.get("known"):
+                        self.face_match_count += 1
                     self.last_face_box = face_box
                     self.last_face_result = face_result
                     self.last_face_box_at = now
@@ -1988,6 +2090,10 @@ class CameraWorker:
             "face_recognition_enabled": self.camera["face_recognition"],
             "face_recognition_ready": self.face_recognition_ready,
             "face_recognition_error": self.face_recognition_error,
+            "face_attempt_count": self.face_attempt_count,
+            "face_detection_count": self.face_detection_count,
+            "face_match_count": self.face_match_count,
+            "last_face_attempt_track_id": self.last_face_attempt_track_id,
             "status": status,
             "fps": self.fps,
             "capture_fps": self.capture_fps,
@@ -2016,6 +2122,7 @@ class CameraWorker:
                 "timestamp_file": self.replay_timestamp_path,
                 "timestamp_pacing": bool(self.replay_frame_offsets),
                 "timing_mode": self.replay_timing_mode,
+                "timing_offset_seconds": self.replay_timing_offset_seconds,
             },
             "rtsp_transport": RTSP_TRANSPORT if self.camera["source_type"] == "rtsp" else None,
             "reconnect_count": self.reconnect_count,
@@ -2040,7 +2147,11 @@ class CameraWorker:
             "track_confidence": round(confidence, 4),
             "track_failures": 1 if self.yolo_error else 0,
             "tracker_error": self.yolo_error,
-            "inference_frame_stride": self.camera["yolo_frame_stride"],
+            "inference_frame_stride": (
+                min(2, self.camera["yolo_frame_stride"])
+                if self.replay_enabled
+                else self.camera["yolo_frame_stride"]
+            ),
             "detector_confidence_threshold": self.camera["yolo_confidence"],
             "detector_image_size": self.camera["yolo_image_size"],
             "tracking_diagnostics": self.yolo_tracker.diagnostics(),

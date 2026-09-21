@@ -6,7 +6,9 @@ from pathlib import Path
 
 import numpy as np
 
+import dataset_recorder as recorder_module
 from dataset_recorder import DatasetRecorder, RecordingError, validate_subject_id
+from unittest.mock import patch
 
 
 class DatasetRecorderTests(unittest.TestCase):
@@ -50,6 +52,27 @@ class DatasetRecorderTests(unittest.TestCase):
     def test_subject_validation_accepts_registered_number_format(self):
         self.assertEqual(validate_subject_id("person_003"), "person_003")
         self.assertEqual(validate_subject_id("stranger-01"), "stranger-01")
+
+    def test_high_resolution_stream_is_downscaled_before_async_encoding(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            recorder_module, "RECORDING_MAX_WIDTH", 1280
+        ):
+            recorder = DatasetRecorder(
+                Path(temporary) / "recordings", ("cam_entrance",), min_free_bytes=0
+            )
+            recorder.start("entrance_test")
+            frame = np.zeros((1440, 2560, 3), dtype=np.uint8)
+
+            recorder.submit("cam_entrance", frame, fps=20.0, captured_at=time.time())
+            stopped = recorder.stop()
+
+            stream = stopped["streams"]["cam_entrance"]
+            self.assertEqual(stream["source_width"], 2560)
+            self.assertEqual(stream["source_height"], 1440)
+            self.assertEqual(stream["width"], 1280)
+            self.assertEqual(stream["height"], 720)
+            self.assertEqual(stream["frames"], 1)
+            self.assertEqual(stream["queue_dropped_frames"], 0)
 
 
 if __name__ == "__main__":

@@ -108,6 +108,64 @@ class RecordingReviewTests(unittest.TestCase):
             [0.0, 0.333, 0.667, 1.0],
         )
 
+    def test_replay_can_preserve_original_recorded_time_nodes(self):
+        cam_1 = SimpleNamespace(
+            camera={"id": "cam_1"},
+            replay_frame_timestamps=[100.0, 100.001, 100.5, 101.0],
+            replay_frame_offsets=[],
+            replay_cycle_duration_seconds=None,
+        )
+        entrance = SimpleNamespace(
+            camera={"id": "cam_entrance"},
+            replay_frame_timestamps=[100.25, 100.4, 100.9],
+            replay_frame_offsets=[],
+            replay_cycle_duration_seconds=None,
+        )
+
+        app_module.configure_replay_timelines(
+            [cam_1, entrance], timing_mode="original"
+        )
+
+        self.assertEqual(cam_1.replay_timing_mode, "original_host_receive")
+        self.assertEqual(entrance.replay_timing_mode, "original_host_receive")
+        self.assertEqual(
+            [round(value, 3) for value in cam_1.replay_frame_offsets],
+            [0.0, 0.001, 0.5, 1.0],
+        )
+        self.assertEqual(
+            [round(value, 3) for value in entrance.replay_frame_offsets],
+            [0.25, 0.4, 0.9],
+        )
+
+    def test_replay_applies_camera_content_delay_compensation(self):
+        cam_1 = SimpleNamespace(
+            camera={"id": "cam_1"},
+            replay_frame_timestamps=[100.0, 101.0],
+            replay_frame_offsets=[],
+            replay_cycle_duration_seconds=None,
+        )
+        entrance = SimpleNamespace(
+            camera={"id": "cam_entrance"},
+            replay_frame_timestamps=[100.0, 101.0],
+            replay_frame_offsets=[],
+            replay_cycle_duration_seconds=None,
+        )
+
+        app_module.configure_replay_timelines(
+            [cam_1, entrance],
+            timing_mode="original",
+            camera_offsets={"cam_entrance": -1.3},
+        )
+
+        self.assertEqual(cam_1.replay_frame_offsets, [0.0, 1.0])
+        self.assertAlmostEqual(entrance.replay_frame_offsets[0], -1.3)
+        self.assertAlmostEqual(entrance.replay_frame_offsets[1], -0.3)
+        self.assertEqual(entrance.replay_timing_offset_seconds, -1.3)
+
+    def test_replay_camera_offsets_reject_out_of_range_values(self):
+        with self.assertRaisesRegex(RuntimeError, "within 10 seconds"):
+            app_module.load_replay_camera_time_offsets('{"cam_entrance": -12}')
+
     def test_video_time_maps_to_frame_before_capture_timestamp(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = create_session(Path(temporary))

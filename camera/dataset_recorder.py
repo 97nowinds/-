@@ -1,5 +1,7 @@
 import csv
 import json
+import os
+import queue
 import re
 import shutil
 import threading
@@ -12,6 +14,12 @@ import cv2
 
 SUBJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$")
 MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
+RECORDING_MAX_WIDTH = max(
+    640, min(2560, int(os.environ.get("LAB_RECORDING_MAX_WIDTH", "1280")))
+)
+RECORDING_QUEUE_SIZE = max(
+    4, min(64, int(os.environ.get("LAB_RECORDING_QUEUE_SIZE", "16")))
+)
 
 
 class RecordingError(RuntimeError):
@@ -32,10 +40,14 @@ def validate_subject_id(value):
 class RecordingStream:
     def __init__(self, directory, camera_id, frame, fps):
         self.camera_id = camera_id
-        self.width = int(frame.shape[1])
-        self.height = int(frame.shape[0])
+        self.source_width = int(frame.shape[1])
+        self.source_height = int(frame.shape[0])
+        scale = min(1.0, RECORDING_MAX_WIDTH / max(self.source_width, 1))
+        self.width = max(2, int(round(self.source_width * scale)) // 2 * 2)
+        self.height = max(2, int(round(self.source_height * scale)) // 2 * 2)
         self.fps = float(fps) if 1.0 <= float(fps or 0) <= 60.0 else 20.0
         self.frames = 0
+        self.queue_dropped_frames = 0
         self.first_frame_at = None
         self.last_frame_at = None
         self.error = None
@@ -46,6 +58,9 @@ class RecordingStream:
         self.timestamps_file = self.timestamps_path.open("w", encoding="utf-8", newline="")
         self.timestamps = csv.writer(self.timestamps_file)
         self.timestamps.writerow(("frame_index", "unix_time", "local_time"))
+        self.pending = queue.Queue(maxsize=RECORDING_QUEUE_SIZE)
+        self.writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self.writer_thread.start()
 
     def _open_writer(self, directory):
         candidates = (
@@ -66,13 +81,22 @@ class RecordingStream:
             path.unlink(missing_ok=True)
         raise RecordingError(f"无法为{self.camera_id}创建视频编码器")
 
-    def write(self, frame, captured_at):
+    def _writer_loop(self):
+        while True:
+            item = self.pending.get()
+            try:
+                if item is None:
+                    return
+                frame, captured_at = item
+                self._write_now(frame, captured_at)
+            finally:
+                self.pending.task_done()
+
+    def _write_now(self, frame, captured_at):
         with self.lock:
             if self.writer is None or self.error:
                 return
             try:
-                if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                    frame = cv2.resize(frame, (self.width, self.height))
                 self.writer.write(frame)
                 self.timestamps.writerow((self.frames, f"{captured_at:.6f}", iso_time(captured_at)))
                 self.frames += 1
@@ -83,7 +107,38 @@ class RecordingStream:
             except (OSError, cv2.error) as error:
                 self.error = str(error)
 
+    def write(self, frame, captured_at):
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            queued_frame = cv2.resize(
+                frame, (self.width, self.height), interpolation=cv2.INTER_AREA
+            )
+        else:
+            queued_frame = frame.copy()
+        item = (queued_frame, float(captured_at))
+        try:
+            self.pending.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        # Encoding must never block camera acquisition. Drop the oldest queued
+        # frame so the recording remains close to live time rather than
+        # accumulating an ever-growing RTSP delay.
+        try:
+            self.pending.get_nowait()
+            self.pending.task_done()
+            with self.lock:
+                self.queue_dropped_frames += 1
+        except queue.Empty:
+            pass
+        try:
+            self.pending.put_nowait(item)
+        except queue.Full:
+            with self.lock:
+                self.queue_dropped_frames += 1
+
     def close(self):
+        self.pending.put(None)
+        self.writer_thread.join()
         with self.lock:
             if self.writer is not None:
                 self.writer.release()
@@ -102,8 +157,11 @@ class RecordingStream:
                 "codec": self.codec,
                 "width": self.width,
                 "height": self.height,
+                "source_width": self.source_width,
+                "source_height": self.source_height,
                 "fps": round(self.fps, 2),
                 "frames": self.frames,
+                "queue_dropped_frames": self.queue_dropped_frames,
                 "first_frame_at": iso_time(self.first_frame_at) if self.first_frame_at else None,
                 "last_frame_at": iso_time(self.last_frame_at) if self.last_frame_at else None,
                 "error": self.error,

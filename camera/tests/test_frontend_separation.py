@@ -276,7 +276,10 @@ class FrontendSeparationTests(unittest.TestCase):
         entrance = next(camera for camera in cameras if camera["id"] == "cam_entrance")
 
         self.assertTrue(entrance["face_recognition"])
-        self.assertLessEqual(entrance["face_interval_seconds"], 0.2)
+        # Keep ArcFace frequent enough to collect three votes while leaving
+        # GPU/CPU time for frame-by-frame ByteTrack updates during replay.
+        self.assertGreaterEqual(entrance["face_interval_seconds"], 0.5)
+        self.assertLessEqual(entrance["face_interval_seconds"], 0.8)
         self.assertLess(entrance["yolo_confidence"], 0.45)
         self.assertLess(entrance["yolo_frame_stride"], 5)
         self.assertGreater(entrance["track_hold_seconds"], 0.8)

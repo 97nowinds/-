@@ -148,7 +148,8 @@ import time
 import urllib.request
 
 port = int(os.environ.get("LAB_APP_PORT", "5000"))
-for _ in range(30):
+startup_attempts = max(30, min(300, int(os.environ.get("LAB_HEALTH_STARTUP_ATTEMPTS", "120"))))
+for _ in range(startup_attempts):
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=2) as response:
             payload = json.loads(response.read().decode("utf-8"))
