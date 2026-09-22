@@ -10,7 +10,7 @@ class MTMCConfigError(ValueError):
 
 
 DEFAULT_CONFIG = {
-    "algorithm_version": "mtmc-2.1.1",
+    "algorithm_version": "mtmc-2.1.2",
     "calibration": {
         "formal_required_for_geometry": True,
         "max_stream_skew_seconds": 0.5,
@@ -19,6 +19,12 @@ DEFAULT_CONFIG = {
         "max_map_speed_mps": 2.2,
         "max_motion_gap_seconds": 0.25,
         "map_position_hold_seconds": 8.0,
+        # During a brief projection gap, continue each track along its own
+        # recent motion vector before falling back to a stationary hold.
+        # This is display continuity only; it never participates in identity
+        # association or geometric camera fusion.
+        "map_position_predict_seconds": 1.2,
+        "map_position_predict_max_distance_m": 0.65,
     },
     "reid": {
         "gallery_capacity": 12,
@@ -34,6 +40,11 @@ DEFAULT_CONFIG = {
     "association": {
         "window_seconds": 0.75,
         "global_track_ttl_seconds": 8.0,
+        "same_camera_relink_seconds": 2.6,
+        "same_camera_relink_min_score": 0.45,
+        "same_camera_relink_min_spatial_score": 0.08,
+        "same_camera_relink_max_center_ratio": 0.95,
+        "same_camera_relink_match_margin": 0.08,
         "identity_retention_seconds": 90.0,
         "pending_ttl_seconds": 3.0,
         "high_confidence_score": 0.78,
@@ -90,6 +101,8 @@ def validate_config(config):
         "calibration.max_map_speed_mps": (0.2, 10.0, False),
         "calibration.max_motion_gap_seconds": (0.05, 2.0, False),
         "calibration.map_position_hold_seconds": (0.0, 30.0, False),
+        "calibration.map_position_predict_seconds": (0.0, 5.0, False),
+        "calibration.map_position_predict_max_distance_m": (0.0, 3.0, False),
         "reid.gallery_capacity": (1, 100, True),
         "reid.min_sample_quality": (0.0, 1.0, False),
         "reid.duplicate_similarity": (0.0, 1.0, False),
@@ -101,6 +114,11 @@ def validate_config(config):
         "reid.match_margin": (0.0, 1.0, False),
         "association.window_seconds": (0.01, 10.0, False),
         "association.global_track_ttl_seconds": (0.1, 300.0, False),
+        "association.same_camera_relink_seconds": (0.1, 10.0, False),
+        "association.same_camera_relink_min_score": (0.0, 1.0, False),
+        "association.same_camera_relink_min_spatial_score": (0.0, 1.0, False),
+        "association.same_camera_relink_max_center_ratio": (0.1, 3.0, False),
+        "association.same_camera_relink_match_margin": (0.0, 1.0, False),
         "association.identity_retention_seconds": (1.0, 86400.0, False),
         "association.pending_ttl_seconds": (0.1, 60.0, False),
         "association.high_confidence_score": (0.0, 1.0, False),

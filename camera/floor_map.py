@@ -65,6 +65,29 @@ class FloorMapProjector:
             )
         self.tracking_allowed_zone_ids = list(dict.fromkeys(allowed_zone_ids))
         self.tracking_zones = [zones_by_id[zone_id] for zone_id in self.tracking_allowed_zone_ids]
+        portal_values = config.get("corridor_portals", [])
+        if not isinstance(portal_values, list):
+            raise FloorMapError("corridor_portals must be a list")
+        self.corridor_portals = {}
+        self._zone_adjacency = {}
+        for portal in portal_values:
+            if not isinstance(portal, dict):
+                raise FloorMapError("each corridor portal must be an object")
+            portal_id = portal.get("zone_id")
+            first = portal.get("from_zone_id")
+            second = portal.get("to_zone_id")
+            if not all(isinstance(value, str) and value for value in (portal_id, first, second)):
+                raise FloorMapError("corridor portal needs zone_id/from_zone_id/to_zone_id")
+            if portal_id not in zones_by_id or first not in zones_by_id or second not in zones_by_id:
+                raise FloorMapError("corridor portal references an unknown zone")
+            if portal_id not in self.tracking_allowed_zone_ids:
+                raise FloorMapError("corridor portal zone_id must be a tracking_allowed_zone_id")
+            if first == second or portal_id in {first, second}:
+                raise FloorMapError("corridor portal must connect three distinct zone ids")
+            self.corridor_portals[portal_id] = {first, second}
+            self._zone_adjacency.setdefault(portal_id, set()).update((first, second))
+            self._zone_adjacency.setdefault(first, set()).add(portal_id)
+            self._zone_adjacency.setdefault(second, set()).add(portal_id)
         self.transforms = {}
         self.image_domains = {}
         self.tracking_image_regions = {}
@@ -72,6 +95,7 @@ class FloorMapProjector:
         self._kalman_filters = {}
         self._kalman_seen_at = {}
         self._filter_positions = {}
+        self._filter_velocities = {}
         self._position_sources = {}
         self._zone_switch_states = {}
         self._last_mapped_people = {}
@@ -515,6 +539,19 @@ class FloorMapProjector:
                 return zone["name"]
         return "实验室"
 
+    def overlap_zone_for(self, x, y):
+        """Return the camera-overlap overlay without changing corridor topology."""
+        epsilon = 1e-6
+        for zone in self.config.get("zones", []):
+            if zone.get("kind") != "overlap":
+                continue
+            if (
+                float(zone["x"]) - epsilon <= x <= float(zone["x"]) + float(zone["width"]) + epsilon
+                and float(zone["y"]) - epsilon <= y <= float(zone["y"]) + float(zone["height"]) + epsilon
+            ):
+                return zone
+        return None
+
     def nearest_tracking_position(self, position):
         """Project a map point into the configured union of walkable tracking zones."""
         current = self.clamp_position(position)
@@ -587,6 +624,38 @@ class FloorMapProjector:
             )
         return min(candidates, key=lambda item: item[0])[1]
 
+    def _zone_name(self, zone_id):
+        zone = next(
+            (item for item in self.tracking_zones if item.get("id") == zone_id),
+            None,
+        )
+        return zone.get("name") if zone else None
+
+    def _zone_transition_allowed(self, source_zone_id, target_zone_id):
+        """When portal topology is configured, forbid corridor shortcuts."""
+        if not self.corridor_portals or source_zone_id == target_zone_id:
+            return True
+        return target_zone_id in self._zone_adjacency.get(source_zone_id, set())
+
+    def _zone_confirmation_observations(self, zone_id):
+        zone = next(
+            (item for item in self.tracking_zones if item.get("id") == zone_id),
+            {},
+        )
+        value = zone.get(
+            "confirmation_observations", self.zone_switch_confirmation_observations
+        )
+        try:
+            value = int(value)
+        except (TypeError, ValueError) as error:
+            raise FloorMapError("zone confirmation_observations must be an integer") from error
+        if not 1 <= value <= self.zone_switch_confirmation_observations:
+            raise FloorMapError(
+                "zone confirmation_observations must be between 1 and "
+                "zone_switch_confirmation_observations"
+            )
+        return value
+
     def _position_in_tracking_zone(self, position, zone_id):
         zone = next(
             (zone for zone in self.tracking_zones if zone.get("id") == zone_id),
@@ -630,6 +699,13 @@ class FloorMapProjector:
         if candidate_zone_id == current_zone_id:
             state.update(pending_zone_id=None, pending_observations=0)
             return dict(position), False, current_zone_id, None, 0
+        if not self._zone_transition_allowed(current_zone_id, candidate_zone_id):
+            # A homography outlier must never cut directly through the central
+            # bench from one corridor to another.  The track must first be
+            # observed in the explicitly configured connecting portal.
+            state.update(pending_zone_id=None, pending_observations=0)
+            held = self._position_in_tracking_zone(position, current_zone_id)
+            return held, True, current_zone_id, candidate_zone_id, 0
         if state.get("pending_zone_id") != candidate_zone_id:
             state["pending_zone_id"] = candidate_zone_id
             state["pending_observations"] = 1
@@ -637,7 +713,7 @@ class FloorMapProjector:
             state["pending_observations"] = int(state["pending_observations"]) + 1
         if (
             state["pending_observations"]
-            >= self.zone_switch_confirmation_observations
+            >= self._zone_confirmation_observations(candidate_zone_id)
         ):
             state.update(
                 zone_id=candidate_zone_id,
@@ -837,6 +913,7 @@ class FloorMapProjector:
                 self._kalman_filters.pop(key, None)
                 self._kalman_seen_at.pop(key, None)
                 self._filter_positions.pop(key, None)
+                self._filter_velocities.pop(key, None)
                 self._zone_switch_states.pop(key, None)
             now = float(now)
             previous_at = self._kalman_seen_at.get(key)
@@ -981,6 +1058,27 @@ class FloorMapProjector:
                 "pending_zone_id": pending_zone_id,
                 "pending_zone_observations": pending_zone_observations,
             }
+            # Keep a bounded, observed velocity for short display-only
+            # projection gaps.  It is deliberately derived from the emitted
+            # (already speed-gated) map positions, so a bad homography sample
+            # cannot turn a held person into a long-distance prediction.
+            if previous_position is not None and previous_at is not None:
+                velocity_dt = max(0.01, min(1.0, now - previous_at))
+                vx = (result["x"] - previous_position["x"]) / velocity_dt
+                vy = (result["y"] - previous_position["y"]) / velocity_dt
+                speed = float(np.hypot(vx, vy))
+                if speed > float(max_speed_mps):
+                    scale = float(max_speed_mps) / speed
+                    vx *= scale
+                    vy *= scale
+                previous_velocity = self._filter_velocities.get(key)
+                if previous_velocity is not None:
+                    # Damp one-frame detector jitter without coupling tracks.
+                    vx = previous_velocity["x"] * 0.35 + vx * 0.65
+                    vy = previous_velocity["y"] * 0.35 + vy * 0.65
+                self._filter_velocities[key] = {"x": vx, "y": vy}
+            else:
+                self._filter_velocities[key] = {"x": 0.0, "y": 0.0}
             self._kalman_seen_at[key] = now
             self._filter_positions[key] = {"x": result["x"], "y": result["y"]}
             return result
@@ -996,6 +1094,7 @@ class FloorMapProjector:
                 self._kalman_seen_at.pop(key, None)
                 self._kalman_filters.pop(key, None)
                 self._filter_positions.pop(key, None)
+                self._filter_velocities.pop(key, None)
                 self._position_sources.pop(key, None)
                 self._zone_switch_states.pop(key, None)
 
@@ -1049,6 +1148,8 @@ class FloorMapProjector:
         max_motion_gap_seconds=0.25,
         active_tracks=None,
         map_position_hold_seconds=8.0,
+        map_position_predict_seconds=1.2,
+        map_position_predict_max_distance_m=0.65,
     ):
         now = time.time() if now is None else float(now)
         # The continuity filter must live at least as long as the public map
@@ -1242,7 +1343,12 @@ class FloorMapProjector:
                     ),
                     "x": position["x"],
                     "y": position["y"],
-                    "zone": self.zone_for(position["x"], position["y"]),
+                    "zone": (
+                        self._zone_name(position["tracking_zone_id"])
+                        if self.corridor_portals
+                        else None
+                    )
+                    or self.zone_for(position["x"], position["y"]),
                     "cameras": sorted({match["camera_id"] for match in selected}),
                     "position_source_camera": source_camera,
                     "position_source_changed": source_changed,
@@ -1304,6 +1410,31 @@ class FloorMapProjector:
                 if position_age > float(map_position_hold_seconds):
                     continue
                 held = dict(cached["person"])
+                predicted = False
+                if (
+                    position_age <= float(map_position_predict_seconds)
+                    and float(map_position_predict_max_distance_m) > 0.0
+                ):
+                    velocity = self._filter_velocities.get(cache_key)
+                    if velocity:
+                        predicted_distance = min(
+                            float(map_position_predict_max_distance_m),
+                            position_age
+                            * float(np.hypot(velocity["x"], velocity["y"])),
+                        )
+                        speed = float(np.hypot(velocity["x"], velocity["y"]))
+                        if predicted_distance > 0.005 and speed > 0.005:
+                            candidate = {
+                                "x": held["x"] + velocity["x"] / speed * predicted_distance,
+                                "y": held["y"] + velocity["y"] / speed * predicted_distance,
+                            }
+                            candidate, _ = self.nearest_walkable_position(candidate)
+                            # Do not let a projection gap route a dot across a
+                            # corridor boundary.  The next real observation
+                            # still goes through normal routing and speed gates.
+                            if self.zone_for(candidate["x"], candidate["y"]) == held.get("zone"):
+                                held.update(candidate)
+                                predicted = True
                 held.update(
                     {
                         "cameras": sorted(active["cameras"]),
@@ -1311,7 +1442,7 @@ class FloorMapProjector:
                         "position_observed_at": cached["mapped_at"],
                         "position_age_seconds": round(position_age, 3),
                         "position_estimated": True,
-                        "localization_state": "held",
+                        "localization_state": "predicted" if predicted else "held",
                         "position_source_changed": False,
                         "motion_limited": False,
                         "raw_position_step_m": 0.0,
@@ -1350,5 +1481,9 @@ class FloorMapProjector:
         )
         public["visual_track_count"] = len(people)
         public["map_position_hold_seconds"] = float(map_position_hold_seconds)
+        public["map_position_predict_seconds"] = float(map_position_predict_seconds)
+        public["map_position_predict_max_distance_m"] = float(
+            map_position_predict_max_distance_m
+        )
         public["max_motion_gap_seconds"] = float(max_motion_gap_seconds)
         return public

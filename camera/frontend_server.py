@@ -1,10 +1,12 @@
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import threading
 import time
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -102,6 +104,14 @@ class LiveSnapshotPublisher:
         self.camera_id = camera_id
         self.interval_seconds = max(0.25, float(interval_seconds))
         self.max_frames = int(max_frames) if max_frames else None
+        self.position_match_tolerance_seconds = max(
+            0.05,
+            min(
+                5.0,
+                float(os.environ.get("LAB_MEMBER_POSITION_MAX_DELTA_SECONDS", "0.75")),
+            ),
+        )
+        self.position_history = defaultdict(lambda: deque(maxlen=120))
         self.stop_event = threading.Event()
         self.thread = None
         self._lock = threading.Lock()
@@ -114,6 +124,8 @@ class LiveSnapshotPublisher:
             "last_error": None,
             "last_receipt_id": None,
             "target_frames": self.max_frames,
+            "position_match_tolerance_seconds": self.position_match_tolerance_seconds,
+            "last_tracks_with_location": 0,
             "frames": [],
         }
 
@@ -144,7 +156,129 @@ class LiveSnapshotPublisher:
             return json.loads(response.read().decode("utf-8"))
 
     @staticmethod
-    def _tracks(camera, observed_at):
+    def _location_observed_at(value):
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return datetime.fromtimestamp(float(value), timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    @staticmethod
+    def _unix_time(value):
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _person_aliases(person):
+        aliases = {
+            person.get("global_id"),
+            person.get("global_track_id"),
+            person.get("track_id"),
+            *(person.get("global_track_ids") or []),
+        }
+        return {str(alias) for alias in aliases if alias is not None}
+
+    def _remember_floor_people(self, floor_people):
+        for person in floor_people or []:
+            if not isinstance(person, dict):
+                continue
+            observed_unix = self._unix_time(person.get("observed_at"))
+            try:
+                x_m = float(person["x"])
+                y_m = float(person["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if observed_unix is None or not math.isfinite(x_m) or not math.isfinite(y_m):
+                continue
+            quality = str(person.get("localization_quality") or "unknown").lower()
+            if quality not in {"high", "medium", "low", "unknown"}:
+                quality = "unknown"
+            sample = {
+                "unix_time": observed_unix,
+                "x_m": x_m,
+                "y_m": y_m,
+                "quality": quality,
+                "localization_state": str(person.get("localization_state") or ""),
+                "association_conflict": bool(person.get("association_conflict")),
+            }
+            for alias in self._person_aliases(person):
+                history = self.position_history[alias]
+                if history and abs(history[-1]["unix_time"] - observed_unix) < 1e-6:
+                    history[-1] = sample
+                else:
+                    history.append(sample)
+
+    @staticmethod
+    def _trajectory_status(sample, history):
+        if sample.get("association_conflict"):
+            return "unknown"
+        if sample.get("localization_state") == "held":
+            return "lost"
+        previous = next(
+            (
+                item
+                for item in reversed(history)
+                if item["unix_time"] < sample["unix_time"] - 1e-6
+            ),
+            None,
+        )
+        if previous is None:
+            return "unknown"
+        elapsed = sample["unix_time"] - previous["unix_time"]
+        if elapsed <= 0.0 or elapsed > 3.0:
+            return "unknown"
+        distance = math.hypot(
+            sample["x_m"] - previous["x_m"],
+            sample["y_m"] - previous["y_m"],
+        )
+        return "moving" if distance / elapsed >= 0.15 else "stationary"
+
+    @classmethod
+    def _tracks(
+        cls,
+        camera,
+        observed_at,
+        floor_people=None,
+        position_history=None,
+        max_location_delta_seconds=0.75,
+    ):
+        candidates_by_id = defaultdict(list)
+        for person in floor_people or []:
+            if not isinstance(person, dict):
+                continue
+            observed_unix = cls._unix_time(person.get("observed_at"))
+            try:
+                x_m = float(person["x"])
+                y_m = float(person["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if observed_unix is None or not math.isfinite(x_m) or not math.isfinite(y_m):
+                continue
+            quality = str(person.get("localization_quality") or "unknown").lower()
+            if quality not in {"high", "medium", "low", "unknown"}:
+                quality = "unknown"
+            sample = {
+                "unix_time": observed_unix,
+                "x_m": x_m,
+                "y_m": y_m,
+                "quality": quality,
+                "localization_state": str(person.get("localization_state") or ""),
+                "association_conflict": bool(person.get("association_conflict")),
+            }
+            for alias in cls._person_aliases(person):
+                candidates_by_id[alias].append(sample)
+        for alias, history in (position_history or {}).items():
+            candidates_by_id[str(alias)].extend(history)
+
+        captured_unix = cls._unix_time(observed_at)
         result = []
         for track in camera.get("yolo_tracks") or []:
             box = track.get("box") or []
@@ -153,20 +287,44 @@ class LiveSnapshotPublisher:
             x1, y1, width, height = (max(0.0, float(value)) for value in box)
             if width <= 0 or height <= 0:
                 continue
-            global_id = str(track.get("track_id") or f"anonymous-{track.get('local_id')}")[:128]
-            result.append(
-                {
-                    "track_id": global_id,
-                    "global_id": global_id,
-                    "local_track_id": track.get("local_id"),
-                    "person_id": None,
-                    "display_name": None,
-                    "bbox": [round(x1, 2), round(y1, 2), round(width, 2), round(height, 2)],
-                    "bbox_format": "xywh_pixels",
-                    "confidence": min(1.0, max(0.0, float(track.get("confidence") or 0.0))),
-                    "observed_at": observed_at,
-                }
+            global_id = str(
+                track.get("global_id")
+                or track.get("track_id")
+                or f"anonymous-{track.get('local_id')}"
+            )[:128]
+            item = {
+                "track_id": global_id,
+                "global_id": global_id,
+                "local_track_id": track.get("local_id"),
+                "person_id": None,
+                "display_name": None,
+                "bbox": [round(x1, 2), round(y1, 2), round(width, 2), round(height, 2)],
+                "bbox_format": "xywh_pixels",
+                "confidence": min(1.0, max(0.0, float(track.get("confidence") or 0.0))),
+                "observed_at": observed_at,
+            }
+            candidates = candidates_by_id.get(global_id) or []
+            nearest = (
+                min(candidates, key=lambda sample: abs(sample["unix_time"] - captured_unix))
+                if candidates and captured_unix is not None
+                else None
             )
+            if (
+                nearest is not None
+                and abs(nearest["unix_time"] - captured_unix)
+                <= float(max_location_delta_seconds)
+            ):
+                history = sorted(candidates, key=lambda sample: sample["unix_time"])
+                # Detector confidence describes the image-space person box,
+                # not the map projection. Do not copy it into location.
+                item["location"] = {
+                    "x_m": round(nearest["x_m"], 3),
+                    "y_m": round(nearest["y_m"], 3),
+                    "quality": nearest["quality"],
+                    "trajectory_status": cls._trajectory_status(nearest, history),
+                    "observed_at": cls._location_observed_at(nearest["unix_time"]),
+                }
+            result.append(item)
         return result
 
     def _publish_once(self):
@@ -177,10 +335,17 @@ class LiveSnapshotPublisher:
         )
         if not camera or camera.get("status") != "running":
             raise RuntimeError(f"{self.camera_id} is not running")
+        floor_people = (state.get("floor_map") or {}).get("people") or []
+        self._remember_floor_people(floor_people)
         jpeg = _read_live_jpeg(self.server.api_base, self.camera_id)
         width, height = _jpeg_dimensions(jpeg)
+        capture_unix = self._unix_time(camera.get("capture_received_at"))
         now = datetime.now(timezone.utc)
-        captured_at = now.isoformat(timespec="milliseconds")
+        captured_at = (
+            datetime.fromtimestamp(capture_unix, timezone.utc).isoformat(timespec="milliseconds")
+            if capture_unix is not None
+            else now.isoformat(timespec="milliseconds")
+        )
         unique = now.strftime("%Y%m%dT%H%M%S%fZ")
         snapshot_id = f"live-{self.camera_id}-{unique}"
         image_url = f"{self.server.live_public_base}/api/handoff/live/{snapshot_id}.jpg"
@@ -192,13 +357,19 @@ class LiveSnapshotPublisher:
             image_url=image_url,
             frame_width=width,
             frame_height=height,
-            tracks=self._tracks(camera, captured_at),
+            tracks=self._tracks(
+                camera,
+                captured_at,
+                position_history=self.position_history,
+                max_location_delta_seconds=self.position_match_tolerance_seconds,
+            ),
         )
         if not event["camera"]["tracks"]:
             self._update(
                 state="idle_no_tracks",
                 last_error=None,
                 last_tracks=0,
+                last_tracks_with_location=0,
                 frame_width=width,
                 frame_height=height,
             )
@@ -230,6 +401,9 @@ class LiveSnapshotPublisher:
             frames=frame_reports,
             last_sent_at=captured_at,
             last_tracks=len(event["camera"]["tracks"]),
+            last_tracks_with_location=sum(
+                1 for track in event["camera"]["tracks"] if "location" in track
+            ),
             frame_width=width,
             frame_height=height,
         )

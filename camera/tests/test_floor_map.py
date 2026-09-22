@@ -419,6 +419,50 @@ class FloorMapProjectorTests(unittest.TestCase):
         self.assertFalse(side_three["zone_switch_held"])
         self.assertEqual(side_three["tracking_zone_id"], "side")
 
+    def test_portal_topology_rejects_direct_corridor_shortcut(self):
+        floor_config = config()
+        floor_config["zones"] = [
+            {"id": "secondary", "name": "Secondary", "x": 0, "y": 1, "width": 8, "height": 1},
+            {"id": "secondary_side_gate", "name": "Secondary Gate", "kind": "portal", "x": 8, "y": 1, "width": 1, "height": 1, "confirmation_observations": 1},
+            {"id": "side", "name": "Side", "x": 8, "y": 2, "width": 1, "height": 2},
+            {"id": "side_main_gate", "name": "Main Gate", "kind": "portal", "x": 8, "y": 4, "width": 1, "height": 1, "confirmation_observations": 1},
+            {"id": "main", "name": "Main", "x": 0, "y": 4, "width": 8, "height": 1},
+        ]
+        floor_config["tracking_allowed_zone_ids"] = [
+            "secondary", "secondary_side_gate", "side", "side_main_gate", "main"
+        ]
+        floor_config["corridor_portals"] = [
+            {"zone_id": "secondary_side_gate", "from_zone_id": "secondary", "to_zone_id": "side"},
+            {"zone_id": "side_main_gate", "from_zone_id": "side", "to_zone_id": "main"},
+        ]
+        projector = FloorMapProjector(floor_config)
+
+        def observe(position, at):
+            return projector.state(
+                [{"camera_id": "cam_1", "track_id": "person_1", "position": position, "observed_at": at}],
+                now=at,
+                max_map_speed_mps=10.0,
+            )["people"][0]
+
+        first = observe({"x": 6.0, "y": 1.5}, 10.0)
+        shortcut = observe({"x": 6.0, "y": 4.5}, 10.2)
+        gate_one = observe({"x": 8.5, "y": 1.5}, 10.4)
+        observe({"x": 8.5, "y": 3.0}, 10.6)
+        observe({"x": 8.5, "y": 3.0}, 10.8)
+        side = observe({"x": 8.5, "y": 3.0}, 11.0)
+        gate_two = observe({"x": 8.5, "y": 4.5}, 11.2)
+        observe({"x": 6.0, "y": 4.5}, 11.4)
+        observe({"x": 6.0, "y": 4.5}, 11.6)
+        main = observe({"x": 6.0, "y": 4.5}, 11.8)
+
+        self.assertEqual(first["zone"], "Secondary")
+        self.assertEqual(shortcut["zone"], "Secondary")
+        self.assertTrue(shortcut["zone_switch_held"])
+        self.assertEqual(gate_one["zone"], "Secondary Gate")
+        self.assertEqual(side["zone"], "Side")
+        self.assertEqual(gate_two["zone"], "Main Gate")
+        self.assertEqual(main["zone"], "Main")
+
     def test_smoothed_map_position_never_enters_solid_fixture(self):
         floor_config = config()
         floor_config["fixtures"] = [
@@ -806,6 +850,79 @@ class FloorMapProjectorTests(unittest.TestCase):
         self.assertTrue(held["position_estimated"])
         self.assertEqual(held["localization_state"], "held")
         self.assertEqual(held["position_age_seconds"], 2.5)
+
+    def test_two_tracks_predict_independently_during_short_projection_gap(self):
+        """A brief map gap must not turn two moving workers into one waiting dot."""
+        observations = [
+            {
+                "camera_id": "cam_1",
+                "track_id": "left_to_right",
+                "position": {"x": 2.0, "y": 2.0},
+                "observed_at": 10.0,
+            },
+            {
+                "camera_id": "cam_2",
+                "track_id": "right_to_left",
+                "position": {"x": 8.0, "y": 4.0},
+                "observed_at": 10.0,
+            },
+        ]
+        self.projector.state(observations, now=10.0)
+        moved = [
+            {**observations[0], "position": {"x": 2.4, "y": 2.0}, "observed_at": 10.2},
+            {**observations[1], "position": {"x": 7.6, "y": 4.0}, "observed_at": 10.2},
+        ]
+        self.projector.state(moved, now=10.2)
+
+        held = self.projector.state(
+            [],
+            now=10.55,
+            active_tracks=[
+                {"track_id": "left_to_right", "cameras": ["cam_1"], "observed_at": 10.55},
+                {"track_id": "right_to_left", "cameras": ["cam_2"], "observed_at": 10.55},
+            ],
+            map_position_hold_seconds=4.0,
+            map_position_predict_seconds=1.0,
+            map_position_predict_max_distance_m=0.5,
+        )["people"]
+
+        by_id = {person["track_id"]: person for person in held}
+        self.assertEqual(set(by_id), {"left_to_right", "right_to_left"})
+        self.assertEqual(by_id["left_to_right"]["localization_state"], "predicted")
+        self.assertEqual(by_id["right_to_left"]["localization_state"], "predicted")
+        self.assertGreater(by_id["left_to_right"]["x"], 2.4)
+        self.assertLess(by_id["right_to_left"]["x"], 7.6)
+        self.assertGreater(math.dist(
+            (by_id["left_to_right"]["x"], by_id["left_to_right"]["y"]),
+            (by_id["right_to_left"]["x"], by_id["right_to_left"]["y"]),
+        ), 1.0)
+
+    def test_prediction_is_short_then_falls_back_to_stationary_hold(self):
+        first = {
+            "camera_id": "cam_1", "track_id": "person_1",
+            "position": {"x": 3.0, "y": 3.0}, "observed_at": 10.0,
+        }
+        second = {**first, "position": {"x": 3.4, "y": 3.0}, "observed_at": 10.2}
+        self.projector.state([first], now=10.0)
+        measured = self.projector.state([second], now=10.2)["people"][0]
+        predicted = self.projector.state(
+            [], now=10.6,
+            active_tracks=[{"track_id": "person_1", "cameras": ["cam_1"], "observed_at": 10.6}],
+            map_position_hold_seconds=4.0,
+            map_position_predict_seconds=0.8,
+            map_position_predict_max_distance_m=0.4,
+        )["people"][0]
+        later = self.projector.state(
+            [], now=11.2,
+            active_tracks=[{"track_id": "person_1", "cameras": ["cam_1"], "observed_at": 11.2}],
+            map_position_hold_seconds=4.0,
+            map_position_predict_seconds=0.8,
+            map_position_predict_max_distance_m=0.4,
+        )["people"][0]
+        self.assertEqual(predicted["localization_state"], "predicted")
+        self.assertGreater(predicted["x"], measured["x"])
+        self.assertEqual(later["localization_state"], "held")
+        self.assertEqual(later["x"], measured["x"])
 
     def test_position_hold_requires_active_tracking_and_expires(self):
         observation = {

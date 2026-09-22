@@ -212,6 +212,127 @@ class FrontendSeparationTests(unittest.TestCase):
         )
         self.assertEqual(tracks[0]["bbox"], [540.0, 169.0, 77.0, 131.0])
 
+    def test_live_publisher_joins_floor_location_without_reusing_yolo_confidence(self):
+        from frontend_server import LiveSnapshotPublisher
+
+        tracks = LiveSnapshotPublisher._tracks(
+            {
+                "yolo_tracks": [
+                    {
+                        "track_id": "person_176",
+                        "local_id": 550,
+                        "box": [455, 146, 147, 269],
+                        "confidence": 0.921,
+                    }
+                ]
+            },
+            "2026-09-21T17:27:00.300+08:00",
+            [
+                {
+                    "global_track_id": "person_176",
+                    "track_id": "person_176",
+                    "x": 6.29,
+                    "y": 5.69,
+                    "observed_at": 1789982820.245077,
+                }
+            ],
+        )
+
+        self.assertEqual(
+            tracks[0]["location"],
+            {
+                "x_m": 6.29,
+                "y_m": 5.69,
+                "quality": "unknown",
+                "trajectory_status": "unknown",
+                "observed_at": "2026-09-21T09:27:00.245+00:00",
+            },
+        )
+        self.assertNotIn("confidence", tracks[0]["location"])
+
+    def test_live_publisher_uses_nearest_historical_location_and_omits_stale(self):
+        from frontend_server import LiveSnapshotPublisher
+
+        camera = {
+            "yolo_tracks": [
+                {
+                    "track_id": "person_1",
+                    "local_id": 7,
+                    "box": [10, 20, 30, 60],
+                    "confidence": 0.93,
+                }
+            ]
+        }
+        history = {
+            "person_1": [
+                {
+                    "unix_time": 100.0,
+                    "x_m": 1.0,
+                    "y_m": 2.0,
+                    "quality": "medium",
+                    "localization_state": "measured",
+                    "association_conflict": False,
+                },
+                {
+                    "unix_time": 101.0,
+                    "x_m": 1.4,
+                    "y_m": 2.0,
+                    "quality": "high",
+                    "localization_state": "measured",
+                    "association_conflict": False,
+                },
+            ]
+        }
+
+        matched = LiveSnapshotPublisher._tracks(
+            camera,
+            "1970-01-01T00:01:40.100+00:00",
+            position_history=history,
+            max_location_delta_seconds=0.75,
+        )
+        self.assertEqual(matched[0]["location"]["x_m"], 1.0)
+        self.assertEqual(matched[0]["location"]["quality"], "medium")
+        self.assertEqual(matched[0]["location"]["trajectory_status"], "unknown")
+        self.assertNotIn("confidence", matched[0]["location"])
+
+        stale = LiveSnapshotPublisher._tracks(
+            camera,
+            "1970-01-01T00:01:45.000+00:00",
+            position_history=history,
+            max_location_delta_seconds=0.75,
+        )
+        self.assertNotIn("location", stale[0])
+
+    def test_live_publisher_derives_motion_from_position_history(self):
+        from frontend_server import LiveSnapshotPublisher
+
+        history = {
+            "person_1": [
+                {
+                    "unix_time": 100.0,
+                    "x_m": 1.0,
+                    "y_m": 2.0,
+                    "quality": "medium",
+                    "localization_state": "measured",
+                    "association_conflict": False,
+                },
+                {
+                    "unix_time": 101.0,
+                    "x_m": 1.4,
+                    "y_m": 2.0,
+                    "quality": "high",
+                    "localization_state": "measured",
+                    "association_conflict": False,
+                },
+            ]
+        }
+        tracks = LiveSnapshotPublisher._tracks(
+            {"yolo_tracks": [{"track_id": "person_1", "box": [1, 2, 3, 4]}]},
+            "1970-01-01T00:01:41.000+00:00",
+            position_history=history,
+        )
+        self.assertEqual(tracks[0]["location"]["trajectory_status"], "moving")
+
     def test_monitoring_page_surfaces_interaction_analysis_errors(self):
         script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
 

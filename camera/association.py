@@ -129,7 +129,10 @@ class BatchAssociator:
 
     def _transition(self, source, target):
         if source == target:
-            return {"max_gap_seconds": self.association["global_track_ttl_seconds"], "same_camera": True}
+            return {
+                "max_gap_seconds": self.association["same_camera_relink_seconds"],
+                "same_camera": True,
+            }
         for transition in self.transitions:
             direct = transition.get("from") == source and transition.get("to") == target
             reverse = (

@@ -7,7 +7,13 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
-from association import ASSOCIATION_ALGORITHM, AssociationObservation, AssociationTarget, BatchAssociator
+from association import (
+    ASSOCIATION_ALGORITHM,
+    AssociationObservation,
+    AssociationTarget,
+    BatchAssociator,
+    hungarian_maximize,
+)
 from mtmc_config import load_mtmc_config
 from reid_gallery import BodyQualityScorer, TrackFeatureGallery
 
@@ -478,6 +484,158 @@ class CrossCameraTrackCoordinator:
             if score >= self.same_camera_similarity_threshold:
                 eligible.append((score, candidate_id))
         return sorted(eligible, reverse=True)
+
+    def _same_camera_relink_assignments(
+        self, camera_id, prepared, active_local_ids, now, unix_time
+    ):
+        """Reconnect ByteTrack ID switches using conservative pixel continuity.
+
+        Floor-map geometry is intentionally not used here: an approximate map
+        must not turn a nearby second person into the previous target.  The
+        assignment is one-to-one, requires strong appearance evidence and a
+        clear spatial margin, and therefore stays unresolved during ambiguous
+        crossings.
+        """
+        settings = self.mtmc_config["association"]
+        unbound = [
+            item
+            for item in prepared
+            if (camera_id, item["local_id"]) not in self.local_bindings
+            and item.get("appearance") is not None
+        ]
+        if not unbound:
+            return {}
+        active_local_ids = {int(item) for item in active_local_ids}
+        candidates = []
+        for global_id, target in self.global_tracks.items():
+            if target.get("camera_id") != camera_id:
+                continue
+            age = now - float(target.get("last_seen", 0.0))
+            if age < 0.0 or age > settings["same_camera_relink_seconds"]:
+                continue
+            if any(
+                bound_camera == camera_id
+                and bound_local_id in active_local_ids
+                and bound_id == global_id
+                for (bound_camera, bound_local_id), bound_id in self.local_bindings.items()
+            ):
+                continue
+            if target.get("appearance") is None or target.get("box") is None:
+                continue
+            candidates.append((global_id, target, age))
+        if not candidates:
+            return {}
+
+        matrix = np.full((len(unbound), len(candidates)), -np.inf, dtype=np.float64)
+        details = {}
+        maximum_ratio = float(settings["same_camera_relink_max_center_ratio"])
+        for row, item in enumerate(unbound):
+            box = item.get("box")
+            if box is None:
+                continue
+            for column, (global_id, target, age) in enumerate(candidates):
+                target_box = target["box"]
+                iou = YoloPersonTracker.box_iou(box, target_box)
+                scale = max(box[2], box[3], target_box[2], target_box[3], 1)
+                center_ratio = self._box_center_distance(box, target_box) / scale
+                if iou < 0.02 and center_ratio > maximum_ratio:
+                    continue
+                spatial_score = max(
+                    iou,
+                    1.0 - center_ratio / max(maximum_ratio, 1e-6),
+                )
+                if spatial_score < settings["same_camera_relink_min_spatial_score"]:
+                    continue
+                target_gallery = self.global_galleries.get(global_id)
+                comparison = (
+                    item["gallery"].compare(target_gallery)
+                    if item.get("gallery") is not None and target_gallery is not None
+                    else {}
+                )
+                reid_score = comparison.get("score")
+                if reid_score is None:
+                    reid_score = self.similarity(
+                        target.get("appearance"), item.get("appearance")
+                    )
+                if (
+                    reid_score is None
+                    or reid_score < self.same_camera_similarity_threshold
+                ):
+                    continue
+                time_score = max(
+                    0.0,
+                    1.0 - age / settings["same_camera_relink_seconds"],
+                )
+                score = 0.65 * spatial_score + 0.25 * reid_score + 0.10 * time_score
+                matrix[row, column] = score
+                details[(row, column)] = {
+                    "global_id": global_id,
+                    "reid_score": float(reid_score),
+                    "spatial_score": float(spatial_score),
+                    "time_gap_seconds": float(age),
+                    "final_score": float(score),
+                }
+
+        assignments = {}
+        for row, column in hungarian_maximize(matrix):
+            assigned_score = float(matrix[row, column])
+            row_competitors = [
+                float(value)
+                for other_column, value in enumerate(matrix[row])
+                if other_column != column and np.isfinite(value)
+            ]
+            column_competitors = [
+                float(matrix[other_row, column])
+                for other_row in range(len(unbound))
+                if other_row != row and np.isfinite(matrix[other_row, column])
+            ]
+            margin = min(
+                assigned_score - max(row_competitors) if row_competitors else 1.0,
+                assigned_score - max(column_competitors) if column_competitors else 1.0,
+            )
+            if assigned_score < settings["same_camera_relink_min_score"]:
+                continue
+            if margin < settings["same_camera_relink_match_margin"]:
+                continue
+            item = unbound[row]
+            detail = details[(row, column)]
+            global_id = detail["global_id"]
+            # ByteTrack can resurrect an old local ID after assigning a new
+            # one.  Once continuity is transferred, remove inactive aliases
+            # so the old ID cannot later reactivate as a second live owner of
+            # the same global person.
+            for binding_key, bound_id in list(self.local_bindings.items()):
+                if (
+                    binding_key[0] == camera_id
+                    and binding_key[1] != item["local_id"]
+                    and binding_key[1] not in active_local_ids
+                    and bound_id == global_id
+                ):
+                    self.local_bindings.pop(binding_key, None)
+                    self.local_features.pop(binding_key, None)
+                    self.local_galleries.pop(binding_key, None)
+                    self.local_motion.pop(binding_key, None)
+            self.local_bindings[(camera_id, item["local_id"])] = global_id
+            assignments[item["local_id"]] = global_id
+            self._record_event(
+                "associate",
+                camera_id=camera_id,
+                target_camera=camera_id,
+                target_local_id=item["local_id"],
+                global_id=global_id,
+                candidate_global_id=global_id,
+                accepted=True,
+                confidence="high",
+                reason="same_camera_spatial_relink",
+                reid_score=round(detail["reid_score"], 6),
+                geometry_score=round(detail["spatial_score"], 6),
+                final_score=round(detail["final_score"], 6),
+                match_margin=round(float(margin), 6),
+                time_gap_seconds=round(detail["time_gap_seconds"], 6),
+                unix_time=unix_time,
+                algorithm_version=ASSOCIATION_ALGORITHM,
+            )
+        return assignments
 
     @staticmethod
     def _number(global_id):
@@ -992,6 +1150,14 @@ class CrossCameraTrackCoordinator:
                 if monotonic_time - reserved_at > batch_window:
                     self.association_reservations.pop(reserved_id, None)
 
+            relinked_results = self._same_camera_relink_assignments(
+                camera_id,
+                prepared,
+                active_local_ids,
+                monotonic_time,
+                unix_time,
+            )
+
             active_by_global = defaultdict(set)
             for (bound_camera, local_id), global_id in self.local_bindings.items():
                 if local_id in self.active_local_ids_by_camera.get(bound_camera, set()):
@@ -999,8 +1165,10 @@ class CrossCameraTrackCoordinator:
 
             observations = []
             observation_by_key = {}
-            existing_results = {}
+            existing_results = dict(relinked_results)
             for item in prepared:
+                if item["local_id"] in relinked_results:
+                    continue
                 key = (camera_id, item["local_id"])
                 bound_id = self.local_bindings.get(key)
                 if bound_id in self.redirects:

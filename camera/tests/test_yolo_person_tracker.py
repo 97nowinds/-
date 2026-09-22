@@ -485,6 +485,135 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         self.assertEqual(coordinator.identity_for(second, "cam_entrance", now=1.4)["person_id"], "test_a")
         self.assertIsNone(coordinator.identity_for(second, "cam_entrance", now=1000))
 
+    def test_same_camera_two_id_switches_relink_one_to_one_by_pixel_motion(self):
+        event_store = RecordingEventStore()
+        coordinator = self.coordinator(
+            self.UncalibratedFloorMap(), event_store=event_store
+        )
+        frame = np.full((120, 220, 3), (20, 80, 180), dtype=np.uint8)
+        initial = coordinator.update_batch(
+            "cam_1",
+            [
+                {"track_id": 1, "box": (10, 20, 40, 80)},
+                {"track_id": 2, "box": (150, 20, 40, 80)},
+            ],
+            frame,
+            active_local_ids={1, 2},
+            monotonic_time=1.0,
+            unix_time=100.0,
+        )
+
+        relinked = coordinator.update_batch(
+            "cam_1",
+            [
+                {"track_id": 11, "box": (14, 20, 40, 80)},
+                {"track_id": 12, "box": (146, 20, 40, 80)},
+            ],
+            frame,
+            active_local_ids={11, 12},
+            monotonic_time=1.3,
+            unix_time=100.3,
+        )
+
+        self.assertEqual(relinked, {11: initial[1], 12: initial[2]})
+        relink_events = [
+            item
+            for item in event_store.events
+            if item.get("reason") == "same_camera_spatial_relink"
+        ]
+        self.assertEqual(len(relink_events), 2)
+        self.assertEqual(len({item["global_id"] for item in relink_events}), 2)
+        self.assertNotIn(("cam_1", 1), coordinator.local_bindings)
+        self.assertNotIn(("cam_1", 2), coordinator.local_bindings)
+
+        resurrected = coordinator.update_batch(
+            "cam_1",
+            [
+                {"track_id": 1, "box": (18, 20, 40, 80)},
+                {"track_id": 11, "box": (20, 20, 40, 80)},
+            ],
+            frame,
+            active_local_ids={1, 11},
+            monotonic_time=1.5,
+            unix_time=100.5,
+        )
+        self.assertNotEqual(resurrected[1], resurrected[11])
+
+    def test_same_camera_ambiguous_crossing_does_not_force_relink(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.full((120, 220, 3), (20, 80, 180), dtype=np.uint8)
+        initial = coordinator.update_batch(
+            "cam_1",
+            [
+                {"track_id": 1, "box": (35, 20, 40, 80)},
+                {"track_id": 2, "box": (105, 20, 40, 80)},
+            ],
+            frame,
+            active_local_ids={1, 2},
+            monotonic_time=1.0,
+            unix_time=100.0,
+        )
+
+        ambiguous = coordinator.update_batch(
+            "cam_1",
+            [
+                {"track_id": 11, "box": (68, 20, 40, 80)},
+                {"track_id": 12, "box": (72, 20, 40, 80)},
+            ],
+            frame,
+            active_local_ids={11, 12},
+            monotonic_time=1.3,
+            unix_time=100.3,
+        )
+
+        self.assertTrue(set(ambiguous.values()).isdisjoint(set(initial.values())))
+
+    def test_same_camera_fast_motion_within_short_gap_keeps_global_id(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.full((120, 220, 3), (20, 80, 180), dtype=np.uint8)
+        first = coordinator.update_batch(
+            "cam_1",
+            [{"track_id": 1, "box": (5, 20, 45, 90)}],
+            frame,
+            active_local_ids={1},
+            monotonic_time=1.0,
+            unix_time=100.0,
+        )[1]
+
+        moved = coordinator.update_batch(
+            "cam_1",
+            [{"track_id": 9, "box": (58, 16, 80, 100)}],
+            frame,
+            active_local_ids={9},
+            monotonic_time=2.7,
+            unix_time=101.7,
+        )[9]
+
+        self.assertEqual(moved, first)
+
+    def test_same_camera_gap_beyond_relink_window_stays_new(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.full((120, 220, 3), (20, 80, 180), dtype=np.uint8)
+        first = coordinator.update_batch(
+            "cam_1",
+            [{"track_id": 1, "box": (20, 20, 40, 80)}],
+            frame,
+            active_local_ids={1},
+            monotonic_time=1.0,
+            unix_time=100.0,
+        )[1]
+
+        late = coordinator.update_batch(
+            "cam_1",
+            [{"track_id": 9, "box": (22, 20, 40, 80)}],
+            frame,
+            active_local_ids={9},
+            monotonic_time=3.7,
+            unix_time=102.7,
+        )[9]
+
+        self.assertNotEqual(late, first)
+
     def test_crossing_crops_do_not_overwrite_clean_features(self):
         coordinator = self.coordinator(self.UncalibratedFloorMap())
         frame = np.zeros((100, 160, 3), dtype=np.uint8)

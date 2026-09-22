@@ -29,10 +29,8 @@ try:
     from floor_map import FloorMapProjector
     from hardware_serial import EnvironmentSerialMonitor, discover_hardware_port
     from identity_handoff import IdentityHandoff
-    from motion_person_detector import MotionPersonDetector
     from mtmc_config import load_mtmc_config, public_config
     from mtmc_events import AssociationEventStore
-    from person_tracking import PersonTrack
     from reid_embedder import ReIDEmbedder
     from slam_localizer import SlamLocalizer
     from yolo_person_tracker import (
@@ -90,12 +88,9 @@ FRAME_STALE_SECONDS = 4.0
 # Face cascades are CPU-heavy. Recognition does not need to run on every
 # tracking frame; the current track remains valid between these attempts.
 FACE_DETECT_INTERVAL_SECONDS = 2.0
-BODY_DETECT_INTERVAL = 5
 IDENTITY_VOTES_REQUIRED = 3
 HANDOFF_UNKNOWN_LIMIT = 6
 IDENTITY_HANDOFF_TTL_SECONDS = 90.0
-BODY_CONFIDENCE_MIN = 0.65
-BODY_TRACK_IOU_MIN = 0.12
 YOLO_CONFIDENCE_MIN = 0.45
 YOLO_IMAGE_SIZE = 640
 # 每 5 帧才运行一次 YOLO；中间帧复用上一检测结果，降低 CPU/GPU 压力。
@@ -430,10 +425,6 @@ class CameraWorker:
         if self.face_store.modern.available:
             self.face_detector_backend = self.face_store.modern.engine
             self.face_detector_error = None
-        self.body_detector = cv2.HOGDescriptor()
-        self.body_detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-        self.motion_detector = MotionPersonDetector(warmup_frames=20)
-        self.person_track = PersonTrack(lost_seconds=2.0, evidence_seconds=5.0)
         self.yolo_tracker = YoloPersonTracker(
             YOLO_MODEL_PATH,
             confidence=self.camera["yolo_confidence"],
@@ -473,13 +464,6 @@ class CameraWorker:
         self.last_face_attempt_track_id = None
         self.last_handoff_refresh_at = 0.0
         self.last_handoff_attempt_at = 0.0
-        self.track_sequence = 0
-        self.local_track_id = None
-        self.pending_body_box = None
-        self.pending_body_hits = 0
-        self.pending_body_at = 0.0
-        self.pending_body_origin = None
-        self.pending_body_travel = 0.0
         self.lock = threading.RLock()
         self.frame = None
         self.display_frame = None
@@ -694,7 +678,6 @@ class CameraWorker:
                 self.display_condition.notify_all()
 
     def reset_processing_state(self):
-        self.motion_detector.reset()
         self.slam.reset()
         self.slam_state = self.slam.status_payload()
         self.yolo_tracker.reset()
@@ -1046,12 +1029,6 @@ class CameraWorker:
                 records.append({"box": box, "detection": row, "score": score})
         return gray, records
 
-    def _legacy_detect_faces(self, gray, frame):
-        """Retained only for readable fallback code paths."""
-        # This method is intentionally unused; fallback logic lives in
-        # detect_faces so existing installations need no extra dependency.
-        return gray, []
-
     @staticmethod
     def is_valid_face_box(frame, box):
         x, y, width, height = map(int, box)
@@ -1173,26 +1150,6 @@ class CameraWorker:
         texture = float(np.std(gray_crop))
         return skin_ratio >= 0.055 and texture >= 8.0
 
-    def detect_bodies(self, frame):
-        detection = frame
-        scale = min(1.0, 640.0 / max(frame.shape[1], 1))
-        if scale < 1.0:
-            detection = cv2.resize(frame, None, fx=scale, fy=scale)
-        try:
-            boxes, weights = self.body_detector.detectMultiScale(
-                detection, winStride=(8, 8), padding=(8, 8), scale=1.05
-            )
-        except cv2.error:
-            return []
-        candidates = []
-        inverse = 1.0 / scale
-        for box, weight in zip(boxes, weights):
-            if float(weight) < BODY_CONFIDENCE_MIN:
-                continue
-            transformed = tuple(int(round(value * inverse)) for value in box)
-            candidates.append((float(weight), transformed))
-        return sorted(candidates, key=lambda item: item[0], reverse=True)
-
     @staticmethod
     def box_iou(first, second):
         ax, ay, aw, ah = first
@@ -1202,25 +1159,6 @@ class CameraWorker:
         intersection = max(0, right - left) * max(0, bottom - top)
         union = aw * ah + bw * bh - intersection
         return intersection / max(union, 1)
-
-    @staticmethod
-    def motion_to_person_box(box, frame_shape):
-        """Expand a moving body part into a conservative whole-person box."""
-        x, y, width, height = box
-        aspect = width / max(height, 1)
-        width_scale = 1.25 if aspect < 0.48 else 1.4
-        height_scale = 1.25 if aspect < 0.48 else 2.05
-        person_width = max(width, int(round(width * width_scale)))
-        person_height = max(
-            height,
-            int(round(height * height_scale)),
-            int(round(person_width * 2.0)),
-        )
-        person_x = int(round(x + width / 2 - person_width / 2))
-        person_y = int(round(y - height * 0.12))
-        return PersonTrack.tracker_box(
-            (person_x, person_y, person_width, person_height), frame_shape
-        )
 
     def accept_face_result(self, result, appearance, track_id=None):
         if track_id is not None:
@@ -1285,24 +1223,11 @@ class CameraWorker:
         self.identity_votes.clear()
         self.handoff_unknown_count = 0
 
-    def begin_local_track(self):
-        if self.local_track_id is None:
-            self.track_sequence += 1
-            self.local_track_id = f"unknown:{self.camera['id']}:{self.track_sequence}"
-        return self.local_track_id
-
     def end_current_track(self):
-        self.person_track.stop()
         self.clear_identity()
         self.last_face_box = None
         self.last_face_result = None
         self.last_face_box_at = 0.0
-        self.local_track_id = None
-        self.pending_body_box = None
-        self.pending_body_hits = 0
-        self.pending_body_at = 0.0
-        self.pending_body_origin = None
-        self.pending_body_travel = 0.0
         self.last_handoff_refresh_at = 0.0
         self.last_handoff_attempt_at = 0.0
         with self.lock:
@@ -1311,32 +1236,6 @@ class CameraWorker:
             self.yolo_tracks = []
         self.yolo_trails.clear()
         self.coordinator.forget_camera(self.camera["id"])
-
-    def body_candidate_is_stable(self, box, frame_shape, require_displacement=False):
-        now = time.monotonic()
-        center = (box[0] + box[2] / 2.0, box[1] + box[3] / 2.0)
-        if (
-            self.pending_body_box is not None
-            and now - self.pending_body_at <= 1.5
-            and self.box_iou(self.pending_body_box, box) >= 0.20
-        ):
-            self.pending_body_hits += 1
-        else:
-            self.pending_body_hits = 1
-            self.pending_body_origin = center
-            self.pending_body_travel = 0.0
-        if self.pending_body_origin is not None:
-            dx = center[0] - self.pending_body_origin[0]
-            dy = center[1] - self.pending_body_origin[1]
-            self.pending_body_travel = max(
-                self.pending_body_travel, (dx * dx + dy * dy) ** 0.5
-            )
-        self.pending_body_box = box
-        self.pending_body_at = now
-        minimum_travel = max(10.0, min(frame_shape[:2]) * 0.025)
-        return self.pending_body_hits >= 3 and (
-            not require_displacement or self.pending_body_travel >= minimum_travel
-        )
 
     def refresh_handoff(self, frame, box, identity=None):
         identity = identity or self.identity
@@ -1348,10 +1247,6 @@ class CameraWorker:
         appearance = self.handoff.appearance(frame, box)
         self.handoff.confirm(self.camera["id"], identity, appearance)
         self.last_handoff_refresh_at = now
-
-    def body_candidate_is_walkable(self, box, frame_shape):
-        position = self.project_box(box, frame_shape)
-        return self.floor_map.is_walkable(position)
 
     def project_box(self, box, frame_shape):
         return self.locate_box(box, frame_shape)["position"]
@@ -1797,158 +1692,6 @@ class CameraWorker:
             cv2.LINE_AA,
         )
         return display
-
-    def process_legacy(self, frame):
-        display = frame.copy()
-        face_boxes = []
-        gray = None
-        if (self.frame_counter - 1) % FACE_DETECT_INTERVAL == 0:
-            gray, face_boxes = self.detect_faces(frame)
-
-        # Motion is only a scene-change hint. It must never create a person
-        # track by itself because screens, reflections and moving instruments
-        # are common in a laboratory.
-        self.motion_detector.detect(frame)
-        body_candidates = []
-        if self.frame_counter % BODY_DETECT_INTERVAL == 0:
-            body_candidates = [
-                candidate
-                for candidate in self.detect_bodies(frame)
-                if self.body_candidate_is_walkable(candidate[1], frame.shape)
-            ]
-
-        track_box = self.person_track.update(frame)
-        if (
-            track_box is None
-            and self.person_track.last_seen_at is not None
-            and time.time() - self.person_track.last_seen_at > self.person_track.lost_seconds
-        ):
-            self.end_current_track()
-        face_result = None
-        if face_boxes:
-            face_box = max(face_boxes, key=lambda box: box[2] * box[3])
-            person_box = PersonTrack.face_to_person(face_box, frame.shape)
-            if self.person_track.observation_is_distinct(person_box):
-                self.end_current_track()
-            track_id = self.begin_local_track()
-            track_box = self.person_track.observe(
-                frame,
-                person_box,
-                self.identity["person_id"] if self.identity else track_id,
-            )
-            self.pending_body_box = None
-            self.pending_body_hits = 0
-            self.pending_body_origin = None
-            self.pending_body_travel = 0.0
-            x, y, width, height = face_box
-            face = gray[y : y + height, x : x + width]
-            if face.size:
-                appearance = self.handoff.appearance(frame, track_box)
-                face_result = self.face_store.predict(face)
-                self.accept_face_result(face_result, appearance)
-                self.last_face_at = time.time()
-                cv2.rectangle(display, (x, y), (x + width, y + height), (255, 190, 70), 2)
-
-        # A detector confirmation anchors CamShift to a real person and prevents
-        # a color track from slowly walking onto a wall or piece of furniture.
-        if track_box is not None and body_candidates:
-            _, matched_body = max(
-                body_candidates,
-                key=lambda item: self.box_iou(track_box, item[1]),
-            )
-            if self.box_iou(track_box, matched_body) >= BODY_TRACK_IOU_MIN:
-                self.person_track.mark_evidence()
-
-        # A local visual tracker can follow any textured object indefinitely.
-        # Require periodic face/body confirmation so instruments cannot remain
-        # published as people after an initial false proposal.
-        if self.person_track.evidence_expired():
-            self.end_current_track()
-            track_box = None
-
-        # Only a verified body detector result may start a body-only track.
-        if track_box is None and not face_boxes and body_candidates:
-            _, body_box = body_candidates[0]
-            stable = self.body_candidate_is_stable(
-                body_box,
-                frame.shape,
-                require_displacement=False,
-            )
-            if stable:
-                appearance = self.handoff.appearance(frame, body_box)
-                inherited = self.handoff.inherit(self.camera["id"], appearance)
-                if inherited:
-                    self.identity = inherited
-                    self.handoff_unknown_count = 0
-                    self.begin_local_track()
-                    track_box = self.person_track.seed(
-                        frame, body_box, inherited["person_id"], validated=True
-                    )
-                else:
-                    track_id = self.begin_local_track()
-                    track_box = self.person_track.seed(
-                        frame, body_box, track_id, validated=True
-                    )
-                self.pending_body_box = None
-                self.pending_body_hits = 0
-                self.pending_body_origin = None
-                self.pending_body_travel = 0.0
-
-        if track_box is not None:
-            self.refresh_handoff(frame, track_box)
-
-        self.update_map_observation(track_box, frame.shape)
-        self.draw_overlay(display, track_box, face_result)
-        return display
-
-    def update_map_observation(self, box, frame_shape):
-        position = self.project_box(box, frame_shape)
-        if position is None:
-            with self.lock:
-                self.map_observation = None
-            return
-
-        identity = self.identity or {}
-        observation = {
-            "camera_id": self.camera["id"],
-            "track_id": self.local_track_id,
-            "position": position,
-            "person_id": identity.get("person_id"),
-            "person_number": identity.get("person_number"),
-            "name": identity.get("name"),
-            "identity_source": identity.get("identity_source"),
-            "observed_at": time.time(),
-        }
-        with self.lock:
-            self.map_observation = observation
-
-    def draw_overlay(self, frame, box, face_result):
-        cv2.rectangle(frame, (0, 0), (frame.shape[1], 40), (20, 23, 27), -1)
-        if box is not None:
-            x, y, width, height = box
-            if self.identity:
-                source = self.identity.get("identity_source", "face")
-                color = (70, 225, 120) if source == "face" else (60, 220, 245)
-                number = self.identity.get("person_number")
-                identity_label = f"{number} {self.identity['name']}" if number else self.identity["name"]
-                mode = "FACE+TRACK" if source == "face" else "HANDOFF+TRACK"
-                label = f"{identity_label} | {mode}"
-            else:
-                color = (80, 160, 255)
-                label = face_result["name"] if face_result else "SEARCHING IDENTITY"
-            cv2.rectangle(frame, (x, y), (x + width, y + height), color, 3)
-            cv2.putText(
-                frame,
-                label,
-                (x, max(62, y - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
-        header = f"{self.camera['id']} | {self.status.upper()}"
-        cv2.putText(frame, header, (12, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (235, 238, 242), 2)
 
     def get_frame(self):
         with self.lock:
@@ -2400,6 +2143,8 @@ class CameraManager:
                 max_motion_gap_seconds=self.mtmc_config["calibration"]["max_motion_gap_seconds"],
                 active_tracks=list(active_tracks_by_id.values()),
                 map_position_hold_seconds=self.mtmc_config["calibration"]["map_position_hold_seconds"],
+                map_position_predict_seconds=self.mtmc_config["calibration"]["map_position_predict_seconds"],
+                map_position_predict_max_distance_m=self.mtmc_config["calibration"]["map_position_predict_max_distance_m"],
             ),
         }
 
