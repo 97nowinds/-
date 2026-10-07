@@ -1,6 +1,7 @@
 import csv
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,6 +59,33 @@ def create_session(root, status="complete"):
 
 
 class RecordingReviewTests(unittest.TestCase):
+    def test_replay_barrier_clears_shared_state_once_for_three_cameras(self):
+        events = []
+        manager = app_module.CameraManager.__new__(app_module.CameraManager)
+        manager.coordinator = SimpleNamespace(reset_replay_cycle=lambda: events.append("ids"))
+        manager.floor_map = SimpleNamespace(reset_replay_cycle=lambda: events.append("map"))
+        manager.handoff = SimpleNamespace(reset_replay_cycle=lambda: events.append("faces"))
+        manager.workers = {
+            camera_id: SimpleNamespace(
+                camera={"id": camera_id},
+                replay_loop=True,
+                processing_lock=threading.RLock(),
+                end_current_track=lambda cid=camera_id: events.append(cid),
+            )
+            for camera_id in ("cam_1", "cam_2", "cam_entrance")
+        }
+        barrier = threading.Barrier(3, action=manager._reset_replay_cycle)
+        threads = [threading.Thread(target=barrier.wait) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(events[:3], ["ids", "map", "faces"])
+        self.assertEqual(set(events[3:]), set(manager.workers))
+        self.assertEqual(len(events), 6)
+
     def test_replay_uses_recorded_capture_timestamps_instead_of_container_fps(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

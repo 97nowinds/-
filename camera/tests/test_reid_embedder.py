@@ -1,6 +1,8 @@
 import unittest
+import threading
 
 import numpy as np
+import torch
 
 from reid_embedder import ReIDEmbedder, ReIDNetwork
 
@@ -26,6 +28,32 @@ class ReIDEmbedderTests(unittest.TestCase):
 
         self.assertEqual(model.base.layer4[0].conv2.stride, (1, 1))
         self.assertEqual(model.base.layer4[0].downsample[0].stride, (1, 1))
+
+    def test_extract_batch_runs_one_model_call_for_multiple_people(self):
+        class FakeModel:
+            def __init__(self):
+                self.batch_sizes = []
+
+            def __call__(self, inputs):
+                self.batch_sizes.append(int(inputs.shape[0]))
+                return torch.ones((inputs.shape[0], 4), dtype=torch.float32)
+
+        embedder = ReIDEmbedder.__new__(ReIDEmbedder)
+        embedder.device = torch.device("cpu")
+        embedder.lock = threading.RLock()
+        embedder.model = FakeModel()
+        frame = np.full((160, 200, 3), 127, dtype=np.uint8)
+
+        features = embedder.extract_batch(
+            frame,
+            [(0, 0, 50, 120), (60, 10, 50, 120), (130, 20, 5, 20)],
+        )
+
+        self.assertEqual(embedder.model.batch_sizes, [2])
+        self.assertEqual(len(features), 3)
+        self.assertEqual(features[0].shape, (4,))
+        self.assertEqual(features[1].shape, (4,))
+        self.assertIsNone(features[2])
 
 
 if __name__ == "__main__":

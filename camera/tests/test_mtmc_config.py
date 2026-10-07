@@ -14,6 +14,7 @@ class MTMCConfigTests(unittest.TestCase):
             config = load_mtmc_config(path)
         self.assertEqual(config["reid"]["gallery_capacity"], 7)
         self.assertEqual(config["algorithm_version"], "mtmc-2.1.2")
+        self.assertEqual(config["calibration"]["map_publish_interval_seconds"], 0.2)
         self.assertEqual(config["calibration"]["map_position_hold_seconds"], 8.0)
         self.assertEqual(config["calibration"]["map_position_predict_seconds"], 1.2)
         self.assertEqual(config["calibration"]["map_position_predict_max_distance_m"], 0.65)

@@ -97,6 +97,11 @@ class FloorMapProjector:
         self._filter_positions = {}
         self._filter_velocities = {}
         self._position_sources = {}
+        # Per-global-track display ownership while an observation moves from
+        # one camera to another.  This intentionally affects *only* map
+        # presentation: association remains the coordinator's one-to-one
+        # decision and is never weakened by a visual smoothing decision.
+        self._handoff_switch_states = {}
         self._zone_switch_states = {}
         self._last_mapped_people = {}
         self._filter_lock = threading.RLock()
@@ -131,6 +136,17 @@ class FloorMapProjector:
     def from_path(cls, path):
         path = Path(path)
         return cls(json.loads(path.read_text(encoding="utf-8")))
+
+    def reset_replay_cycle(self):
+        """Clear measured, predicted, and held positions from the last loop."""
+        with self._filter_lock:
+            for state in (
+                self._kalman_filters, self._kalman_seen_at,
+                self._filter_positions, self._filter_velocities,
+                self._position_sources, self._handoff_switch_states,
+                self._zone_switch_states, self._last_mapped_people,
+            ):
+                state.clear()
 
     @staticmethod
     def _points(value, name):
@@ -1150,6 +1166,11 @@ class FloorMapProjector:
         map_position_hold_seconds=8.0,
         map_position_predict_seconds=1.2,
         map_position_predict_max_distance_m=0.65,
+        # Preserve the historical direct-source behavior for callers that do
+        # not opt in.  The application supplies its configured value (2).
+        handoff_target_confirmations=1,
+        handoff_transition_seconds=0.6,
+        handoff_wait_seconds=0.8,
     ):
         now = time.time() if now is None else float(now)
         # The continuity filter must live at least as long as the public map
@@ -1161,6 +1182,12 @@ class FloorMapProjector:
                 float(map_position_hold_seconds), FILTER_RETENTION_SECONDS
             ),
         )
+        with self._filter_lock:
+            self._handoff_switch_states = {
+                key: value
+                for key, value in self._handoff_switch_states.items()
+                if now - float(value.get("updated_at", now)) <= 10.0
+            }
         valid = []
         identity_owners = {}
         visual_owners = {}
@@ -1295,15 +1322,103 @@ class FloorMapProjector:
                 match["position"]["y"] * weight
                 for match, weight in zip(selected, selected_weights)
             ) / total_weight
-            source_camera = best["camera_id"]
-            source_changed = bool(previous_source and previous_source != source_camera)
+            observed_source_camera = best["camera_id"]
+            source_camera = observed_source_camera
+            source_changed = bool(
+                previous_source and previous_source != observed_source_camera
+            )
+            handoff_state = "stable"
+            handoff_waiting = False
+            handoff_progress = 1.0
+            position_discontinuity = False
+            previous_person = self._last_mapped_people.get(
+                str(best.get("global_track_id") or key), {}
+            ).get("person")
+            if source_changed and int(handoff_target_confirmations) > 1:
+                switch = self._handoff_switch_states.get(key)
+                if (
+                    not switch
+                    or switch.get("from_camera") != previous_source
+                    or switch.get("to_camera") != observed_source_camera
+                ):
+                    switch = {
+                        "from_camera": previous_source,
+                        "to_camera": observed_source_camera,
+                        "confirmations": 1,
+                        "started_at": now,
+                        "last_observed_at": float(best["observed_at"]),
+                    }
+                else:
+                    # Dashboard polling may reuse the same detection. Count
+                    # distinct target-camera measurements, not state calls.
+                    observed_at = float(best["observed_at"])
+                    if observed_at > float(switch["last_observed_at"]) + 1e-4:
+                        switch["confirmations"] = int(switch["confirmations"]) + 1
+                        switch["last_observed_at"] = observed_at
+                switch["updated_at"] = now
+                self._handoff_switch_states[key] = switch
+                confirmations = int(switch["confirmations"])
+                if confirmations < int(handoff_target_confirmations) and previous_person:
+                    # The incoming camera has not yet shown a stable tracklet.
+                    # Keep the last source coordinate briefly instead of
+                    # drawing a dot that visibly bounces across the corridor.
+                    source_camera = previous_source
+                    source_changed = False
+                    handoff_state = "waiting_target_confirmation"
+                    handoff_waiting = True
+                    handoff_progress = min(
+                        1.0,
+                        max(0.0, now - float(switch["started_at"]))
+                        / float(handoff_wait_seconds),
+                    )
+                else:
+                    handoff_state = "transitioning"
+                    handoff_progress = min(
+                        1.0,
+                        max(0.0, now - float(switch["started_at"]))
+                        / float(handoff_transition_seconds),
+                    )
+            else:
+                self._handoff_switch_states.pop(key, None)
+
             self._position_sources[key] = source_camera
+            raw_position = {"x": x, "y": y}
+            position_observed_at = max(
+                float(match["observed_at"]) for match in selected
+            )
+            if handoff_waiting and previous_person:
+                raw_position = {
+                    "x": float(previous_person["x"]),
+                    "y": float(previous_person["y"]),
+                }
+                position_observed_at = float(previous_person.get(
+                    "position_observed_at", previous_person["observed_at"]
+                ))
+            elif handoff_state == "transitioning" and previous_person:
+                cross_camera_gap = float(np.hypot(
+                    x - float(previous_person["x"]),
+                    y - float(previous_person["y"]),
+                ))
+                if not geometry_allowed and cross_camera_gap > 1.5:
+                    # Approximate camera maps can disagree by several metres.
+                    # Continuing the old filter fabricates a walk through the
+                    # corridor. Keep identity, but start a new position segment.
+                    position_discontinuity = True
+                    handoff_state = "relocalized"
+                else:
+                    raw_position = {
+                        "x": float(previous_person["x"])
+                        + (x - float(previous_person["x"])) * handoff_progress,
+                        "y": float(previous_person["y"])
+                        + (y - float(previous_person["y"])) * handoff_progress,
+                    }
             position = self._smooth_position(
                 key,
-                {"x": x, "y": y},
-                max(float(match["observed_at"]) for match in selected),
+                raw_position,
+                position_observed_at,
                 max_speed_mps=max_map_speed_mps,
                 max_motion_gap_seconds=max_motion_gap_seconds,
+                reset=position_discontinuity,
             )
             global_track_ids = sorted(
                 {
@@ -1352,6 +1467,14 @@ class FloorMapProjector:
                     "cameras": sorted({match["camera_id"] for match in selected}),
                     "position_source_camera": source_camera,
                     "position_source_changed": source_changed,
+                    "position_discontinuity": position_discontinuity,
+                    "handoff_state": handoff_state,
+                    "handoff_waiting": handoff_waiting,
+                    "map_visible": not handoff_waiting,
+                    "handoff_target_camera": (
+                        observed_source_camera if handoff_state != "stable" else None
+                    ),
+                    "handoff_progress": round(handoff_progress, 3),
                     "motion_limited": position["motion_limited"],
                     "raw_position_step_m": position["raw_step_m"],
                     "walkability_adjusted": position["walkability_adjusted"],
@@ -1367,14 +1490,21 @@ class FloorMapProjector:
                         or any(match.get("visual_owner_conflict") for match in matches)
                     ),
                     "observed_at": max(match["observed_at"] for match in matches),
-                    "position_estimated": bool(best.get("position_estimated")),
+                    "position_observed_at": position_observed_at,
+                    "position_estimated": bool(
+                        handoff_waiting or best.get("position_estimated")
+                    ),
                     "localization_state": (
+                        "held" if handoff_waiting else
                         "estimated" if best.get("position_estimated") else "measured"
                     ),
                     "localization_quality": best.get("localization_quality"),
                     "localization_reason": best.get("localization_reason"),
                     "footpoint_visible": best.get("footpoint_visible"),
-                    "position_age_seconds": 0.0,
+                    "position_age_seconds": (
+                        round(max(0.0, now - position_observed_at), 3)
+                        if handoff_waiting else 0.0
+                    ),
                 }
             )
 
@@ -1398,7 +1528,7 @@ class FloorMapProjector:
                 measured_keys.add(cache_key)
                 self._last_mapped_people[cache_key] = {
                     "person": dict(person),
-                    "mapped_at": float(person["observed_at"]),
+                    "mapped_at": float(person["position_observed_at"]),
                 }
             for cache_key, active in active_by_track.items():
                 if cache_key in measured_keys:
@@ -1448,6 +1578,14 @@ class FloorMapProjector:
                         "raw_position_step_m": 0.0,
                     }
                 )
+                if held.get("position_source_camera") not in active["cameras"]:
+                    # The identity is visible in another camera, but its old
+                    # map coordinate no longer has a current source. Keep the
+                    # person/count while withholding the misleading old dot.
+                    held["map_visible"] = False
+                    held["handoff_waiting"] = True
+                    held["handoff_state"] = "waiting_target_localization"
+                    held["handoff_target_camera"] = sorted(active["cameras"])[0]
                 people.append(held)
             expired_cache_keys = [
                 cache_key
@@ -1485,5 +1623,9 @@ class FloorMapProjector:
         public["map_position_predict_max_distance_m"] = float(
             map_position_predict_max_distance_m
         )
+        public["handoff_target_confirmations"] = int(handoff_target_confirmations)
+        public["handoff_transition_seconds"] = float(handoff_transition_seconds)
+        public["handoff_wait_seconds"] = float(handoff_wait_seconds)
         public["max_motion_gap_seconds"] = float(max_motion_gap_seconds)
+        public["max_map_speed_mps"] = float(max_map_speed_mps)
         return public

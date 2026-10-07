@@ -103,10 +103,35 @@ class ReIDEmbedder:
         return tensor.sub_(mean).div_(std).unsqueeze(0)
 
     def extract(self, frame, box):
-        crop = self.crop_person(frame, box)
-        if crop is None or crop.shape[0] < 32 or crop.shape[1] < 12:
-            return None
-        inputs = self.preprocess(crop).to(self.device)
+        features = self.extract_batch(frame, [box])
+        return features[0] if features else None
+
+    def extract_batch(self, frame, boxes):
+        """Extract all visible people in one GPU pass.
+
+        The coordinator used to invoke ResNet50 once per person.  That made
+        crowd latency grow almost linearly and increased the chance of several
+        camera threads contending for CUDA at the same time.  Keep a ``None``
+        placeholder for an invalid crop so callers can map results back to the
+        original track order.
+        """
+        boxes = list(boxes)
+        if not boxes:
+            return []
+        valid_indices = []
+        tensors = []
+        for index, box in enumerate(boxes):
+            crop = self.crop_person(frame, box)
+            if crop is None or crop.shape[0] < 32 or crop.shape[1] < 12:
+                continue
+            valid_indices.append(index)
+            tensors.append(self.preprocess(crop))
+        features = [None] * len(boxes)
+        if not tensors:
+            return features
+        inputs = torch.cat(tensors, dim=0).to(self.device)
         with self.lock, torch.inference_mode():
-            feature = self.model(inputs)[0].cpu().numpy().astype(np.float32)
-        return feature
+            batch = self.model(inputs).cpu().numpy().astype(np.float32)
+        for index, feature in zip(valid_indices, batch):
+            features[index] = feature
+        return features

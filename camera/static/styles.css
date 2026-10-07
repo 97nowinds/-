@@ -50,6 +50,7 @@ h2 { font-size: 16px; }
 
 .service-state.online,
 .camera-badge.running { background: #173d2b; color: #86e9ad; }
+.service-state.delayed { background: #4b3519; color: #ffd181; }
 .service-state.error,
 .camera-badge.stale { background: #512426; color: #ff9c9c; }
 .camera-badge.reconnecting,

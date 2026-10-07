@@ -7,6 +7,7 @@ from mtmc_evaluate import (
     FORMAT_VERSION,
     apply_session_timestamps,
     evaluate,
+    load_diagnostic_predictions,
     load_session_timestamps,
     markdown_report,
     validate_ground_truth,
@@ -84,6 +85,47 @@ class MTMCEvaluationTests(unittest.TestCase):
 
         self.assertEqual(result["message"], "尚无真实评测数据")
         self.assertIn("尚无真实评测数据", markdown_report(result))
+
+    def test_position_error_uses_matched_floor_coordinates_and_reports_coverage(self):
+        ground_truth, predictions = self.sample()
+        for annotation in ground_truth["annotations"]:
+            annotation["floor_position_m"] = {"x": 1.0, "y": 2.0}
+        predictions["predictions"][0]["floor_position_m"] = {"x": 1.3, "y": 2.4}
+        predictions["predictions"][1]["floor_position_m"] = {"x": 1.0, "y": 3.0}
+
+        result = evaluate(ground_truth, predictions)
+        position = result["metrics"]["position"]
+        self.assertEqual(position["annotated"], 4)
+        self.assertEqual(position["evaluated"], 2)
+        self.assertEqual(position["coverage"], 0.5)
+        self.assertEqual(position["median_error_m"], 0.5)
+        self.assertEqual(position["p90_error_m"], 1.0)
+        self.assertIn("中位数 0.5", markdown_report(result))
+
+    def test_position_error_rejects_nonfinite_ground_truth(self):
+        ground_truth, predictions = self.sample()
+        ground_truth["annotations"][0]["floor_position_m"] = {"x": "nan", "y": 2}
+        with self.assertRaisesRegex(ValueError, "finite numbers"):
+            evaluate(ground_truth, predictions)
+
+    def test_offline_replay_diagnostics_supply_exact_frame_positions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "diagnostics.jsonl"
+            path.write_text(
+                json.dumps({
+                    "camera_id": "cam_1", "frame_index": 12,
+                    "tracks": [{
+                        "track_id": 7, "global_id": "person_3",
+                        "position": {"x": 3.0, "y": 4.0},
+                    }],
+                }) + "\n", encoding="utf-8",
+            )
+            predictions = load_diagnostic_predictions(path)
+            self.assertEqual(predictions["predictions"], [{
+                "camera_id": "cam_1", "frame_index": 12,
+                "local_id": 7, "global_id": "person_3",
+                "floor_position_m": {"x": 3.0, "y": 4.0},
+            }])
 
     def test_invalid_annotation_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "local_detection.local_id"):

@@ -9,6 +9,7 @@ import argparse
 from collections import defaultdict
 import csv
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -19,8 +20,51 @@ from association import hungarian_maximize
 FORMAT_VERSION = "mtmc-ground-truth-v1"
 
 
+def _floor_position(item, label):
+    position = item.get("floor_position_m")
+    if position is None:
+        return None
+    if not isinstance(position, dict) or not all(axis in position for axis in ("x", "y")):
+        raise ValueError(f"{label}.floor_position_m requires x and y")
+    try:
+        point = (float(position["x"]), float(position["y"]))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label}.floor_position_m must contain finite numbers") from error
+    if not all(math.isfinite(value) for value in point):
+        raise ValueError(f"{label}.floor_position_m must contain finite numbers")
+    return point
+
+
+def _percentile_nearest_rank(values, fraction):
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
+
+
 def _load(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def load_diagnostic_predictions(path):
+    """Convert the offline replay's per-frame JSONL into evaluator predictions."""
+    predictions = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            for track in record.get("tracks", []):
+                item = {
+                    "camera_id": record["camera_id"],
+                    "frame_index": record["frame_index"],
+                    "local_id": track["track_id"],
+                    "global_id": track.get("global_id"),
+                }
+                position = track.get("position")
+                if position is not None:
+                    item["floor_position_m"] = position
+                    _floor_position(item, f"line {line_number} track {track['track_id']}")
+                predictions.append(item)
+    return {"predictions": predictions}
 
 
 def validate_ground_truth(payload):
@@ -37,6 +81,7 @@ def validate_ground_truth(payload):
         detection = item.get("local_detection")
         if not isinstance(detection, dict) or "local_id" not in detection:
             raise ValueError(f"annotation {index} requires local_detection.local_id")
+        _floor_position(item, f"annotation {index}")
     for index, item in enumerate(payload.get("handoffs", [])):
         required = {"person_id", "from_camera", "to_camera", "start_time", "end_time"}
         if not required.issubset(item):
@@ -140,6 +185,17 @@ def _metrics(rows, handoffs=None):
         for row in rows
     )
 
+    position_annotated = sum(row.get("floor_position_m") is not None for row in rows)
+    position_errors = [row["position_error_m"] for row in rows if row.get("position_error_m") is not None]
+    position_metrics = {
+        "annotated": position_annotated,
+        "evaluated": len(position_errors),
+        "coverage": round(len(position_errors) / position_annotated, 6) if position_annotated else None,
+        "median_error_m": round(_percentile_nearest_rank(position_errors, 0.5), 3) if position_errors else None,
+        "p90_error_m": round(_percentile_nearest_rank(position_errors, 0.9), 3) if position_errors else None,
+        "max_error_m": round(max(position_errors), 3) if position_errors else None,
+    }
+
     handoff_results = []
     for handoff in handoffs or []:
         person = handoff["person_id"]
@@ -177,19 +233,30 @@ def _metrics(rows, handoffs=None):
         "missed_handoff_rate": round((handoff_total - successes) / handoff_total, 6) if handoff_total else None,
         "wrong_identity_inheritance_rate": round(wrong_rows / total_pred, 6) if total_pred else None,
         "ambiguous_global_ids": sum(len(owners) > 1 for owners in predicted_owners.values()),
+        "position": position_metrics,
     }
 
 
 def evaluate(ground_truth, predictions):
     ground_truth = validate_ground_truth(ground_truth)
-    prediction_index = {_key(item): item for item in predictions.get("predictions", [])}
+    prediction_items = predictions.get("predictions", [])
+    for index, item in enumerate(prediction_items):
+        _floor_position(item, f"prediction {index}")
+    prediction_index = {_key(item): item for item in prediction_items}
     rows = []
     for annotation in ground_truth["annotations"]:
         prediction = prediction_index.get(_key(annotation), {})
+        actual_position = _floor_position(annotation, "annotation")
+        predicted_position = _floor_position(prediction, "prediction")
         rows.append(
             {
                 **annotation,
                 "predicted_global_id": prediction.get("global_id"),
+                "position_error_m": (
+                    math.dist(actual_position, predicted_position)
+                    if actual_position is not None and predicted_position is not None
+                    else None
+                ),
             }
         )
     if not rows:
@@ -231,7 +298,12 @@ def evaluate(ground_truth, predictions):
         "format_version": FORMAT_VERSION,
         "metrics": _metrics(rows, ground_truth.get("handoffs", [])),
         "groups": groups,
-        "notes": ["IDF1 uses optimal one-to-one identity assignment.", "HOTA is not computed."],
+        "notes": [
+            "Position error compares paired floor coordinates in meters; missing predictions reduce coverage.",
+            "Position P90 uses nearest-rank percentile.",
+            "IDF1 uses optimal one-to-one identity assignment.",
+            "HOTA is not computed.",
+        ],
     }
 
 
@@ -248,6 +320,8 @@ def markdown_report(result):
         f"- 漏交接率：{metrics['missed_handoff_rate']}",
         f"- ID switches：{metrics['id_switches']}",
         f"- IDF1：{metrics['idf1']}",
+        f"- 地图位置真值标注：{metrics['position']['annotated']}，成功匹配：{metrics['position']['evaluated']}，覆盖率：{metrics['position']['coverage']}",
+        f"- 地图位置误差（米）：中位数 {metrics['position']['median_error_m']}，P90 {metrics['position']['p90_error_m']}，最大 {metrics['position']['max_error_m']}",
         "",
         "> 本报告不计算 HOTA，也不把自定义指标称为标准 HOTA。",
         "",
@@ -258,7 +332,9 @@ def markdown_report(result):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate recorded MTMC predictions")
     parser.add_argument("--ground-truth", required=True)
-    parser.add_argument("--predictions", required=True)
+    predictions_source = parser.add_mutually_exclusive_group(required=True)
+    predictions_source.add_argument("--predictions", help="Evaluator predictions JSON")
+    predictions_source.add_argument("--diagnostic-jsonl", help="Output of scripts/diagnose_recorded_tracking.py")
     parser.add_argument("--output", required=True, help="Output path without extension")
     parser.add_argument(
         "--session",
@@ -270,7 +346,12 @@ def main(argv=None):
         ground_truth = apply_session_timestamps(
             ground_truth, load_session_timestamps(args.session)
         )
-    result = evaluate(ground_truth, _load(args.predictions))
+    predictions = (
+        _load(args.predictions)
+        if args.predictions
+        else load_diagnostic_predictions(args.diagnostic_jsonl)
+    )
+    result = evaluate(ground_truth, predictions)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.with_suffix(".json").write_text(

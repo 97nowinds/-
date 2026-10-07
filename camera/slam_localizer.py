@@ -36,6 +36,7 @@ class SlamLocalizer:
         self.reference_keypoints = None
         self.reference_descriptors = None
         self.map_from_reference = None
+        self.metric_anchored = False
         self.last_transform = None
         self.last_seen_at = None
         self.last_seen_monotonic = None
@@ -67,6 +68,7 @@ class SlamLocalizer:
             self.reference_keypoints = None
             self.reference_descriptors = None
             self.map_from_reference = None
+            self.metric_anchored = False
             self.last_transform = None
             self.last_seen_at = None
             self.last_seen_monotonic = None
@@ -117,7 +119,10 @@ class SlamLocalizer:
         transform, mask = cv2.findHomography(image_points, map_points, cv2.RANSAC, 3.0)
         if transform is None or mask is None or int(mask.sum()) < self.min_markers:
             return False
-        return self._set_reference(gray, transform)
+        if not self._set_reference(gray, transform):
+            return False
+        self.metric_anchored = True
+        return True
 
     def _track_from_reference(self, gray):
         if self.reference_descriptors is None or self.map_from_reference is None:
@@ -214,6 +219,7 @@ class SlamLocalizer:
                 "status": self.status,
                 "dictionary": self.dictionary_name,
                 "configured_markers": len(self.marker_map),
+                "metric_anchored": self.metric_anchored,
                 "visible_markers": self.marker_count,
                 "matches": self.last_matches,
                 "inliers": self.last_inliers,

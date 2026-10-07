@@ -20,7 +20,10 @@ class AssociationObservation:
     direction: tuple = None
     person_class: str = "person"
     geometry_trusted: bool = True
+    image_anchor: dict = None
     excluded_global_ids: set = field(default_factory=set)
+    handoff_exit_grace: dict = field(default_factory=dict)
+    clothing_tone: str = None
 
 
 @dataclass
@@ -36,6 +39,9 @@ class AssociationTarget:
     person_id: str = None
     geometry_trusted: bool = True
     source_local_id: int = None
+    image_anchor: dict = None
+    recent_exit_gates: dict = field(default_factory=dict)
+    clothing_tone: str = None
 
 
 def _cosine(first, second):
@@ -119,13 +125,29 @@ class BatchAssociator:
         self.transitions = list(transitions or [])
         self.calibration_status = calibration_status
         for transition in self.transitions:
-            if "simultaneous_reid_threshold" not in transition:
-                continue
-            threshold = float(transition["simultaneous_reid_threshold"])
-            if not 0.0 <= threshold <= 1.0:
-                raise ValueError(
-                    "camera transition simultaneous_reid_threshold must be between 0 and 1"
-                )
+            if "simultaneous_reid_threshold" in transition:
+                threshold = float(transition["simultaneous_reid_threshold"])
+                if not 0.0 <= threshold <= 1.0:
+                    raise ValueError(
+                        "camera transition simultaneous_reid_threshold must be between 0 and 1"
+                    )
+            for camera_id, gate in (transition.get("image_handoff_gates") or {}).items():
+                if not isinstance(camera_id, str) or not isinstance(gate, dict):
+                    raise ValueError("image_handoff_gates must map camera ids to objects")
+                for direction in ("entry", "exit"):
+                    value = gate.get(direction)
+                    if value is None:
+                        continue
+                    points = value.get("points") if isinstance(value, dict) else None
+                    if not isinstance(points, list) or len(points) < 3:
+                        raise ValueError("handoff gate must contain at least three normalized points")
+                    for point in points:
+                        if (
+                            not isinstance(point, (list, tuple))
+                            or len(point) != 2
+                            or not all(isinstance(item, (int, float)) and 0.0 <= item <= 1.0 for item in point)
+                        ):
+                            raise ValueError("handoff gate points must be normalized x/y pairs")
 
     def _transition(self, source, target):
         if source == target:
@@ -143,6 +165,44 @@ class BatchAssociator:
             if direct or reverse:
                 return transition
         return None
+
+    @staticmethod
+    def _point_in_polygon(point, points):
+        if point is None:
+            return False
+        x, y = float(point.get("x", -1.0)), float(point.get("y", -1.0))
+        inside = False
+        previous = points[-1]
+        for current in points:
+            current_x, current_y = float(current[0]), float(current[1])
+            previous_x, previous_y = float(previous[0]), float(previous[1])
+            crosses = (current_y > y) != (previous_y > y)
+            if crosses and x < (previous_x - current_x) * (y - current_y) / (previous_y - current_y) + current_x:
+                inside = not inside
+            previous = current
+        return inside
+
+    def _inside_handoff_gate(self, transition, camera_id, direction, anchor):
+        gate = (transition.get("image_handoff_gates") or {}).get(camera_id, {}).get(direction)
+        if gate is None:
+            return True
+        return self._point_in_polygon(anchor, gate["points"])
+
+    def exit_gate_destinations(self, camera_id, anchor):
+        """Return adjacent cameras whose source exit was just observed."""
+        destinations = set()
+        for transition in self.transitions:
+            if transition.get("from") == camera_id:
+                other = transition.get("to")
+            elif transition.get("bidirectional", False) and transition.get("to") == camera_id:
+                other = transition.get("from")
+            else:
+                continue
+            if other and self._inside_handoff_gate(
+                transition, camera_id, "exit", anchor
+            ):
+                destinations.add(other)
+        return destinations
 
     def _gallery_score(self, observation, target):
         if observation.gallery is not None and target.gallery is not None:
@@ -171,9 +231,52 @@ class BatchAssociator:
             return {**evaluation, "eligible": False, "reason": "class_not_person"}
         if target.global_id in observation.excluded_global_ids:
             return {**evaluation, "eligible": False, "reason": "previously_distinct_same_camera_people"}
+        if (
+            observation.clothing_tone in {"dark", "light"}
+            and target.clothing_tone in {"dark", "light"}
+            and observation.clothing_tone != target.clothing_tone
+        ):
+            return {
+                **evaluation,
+                "eligible": False,
+                "reason": "clothing_tone_mismatch",
+                "source_clothing_tone": target.clothing_tone,
+                "target_clothing_tone": observation.clothing_tone,
+            }
         transition = self._transition(target.camera_id, observation.camera_id)
         if transition is None:
             return {**evaluation, "eligible": False, "reason": "topology_rejected"}
+        source_in_gate = self._inside_handoff_gate(
+            transition, target.camera_id, "exit", target.image_anchor
+        )
+        recent_exit_at = (target.recent_exit_gates or {}).get(
+            observation.camera_id
+        )
+        source_exit_recent = bool(
+            recent_exit_at is not None
+            and 0.0
+            <= float(observation.monotonic_time) - float(recent_exit_at)
+            <= float(self.association["handoff_exit_memory_seconds"])
+        )
+        source_exit_grace = bool(
+            target.global_id in observation.handoff_exit_grace
+            and float(observation.monotonic_time)
+            <= float(observation.handoff_exit_grace[target.global_id])
+        )
+        source_exit_recent = source_exit_recent or source_exit_grace
+        target_in_gate = self._inside_handoff_gate(
+            transition, observation.camera_id, "entry", observation.image_anchor
+        )
+        evaluation.update(
+            source_in_handoff_gate=source_in_gate,
+            source_exit_gate_recent=source_exit_recent,
+            source_exit_gate_grace=source_exit_grace,
+            target_in_handoff_gate=target_in_gate,
+        )
+        if not source_in_gate and not source_exit_recent:
+            return {**evaluation, "eligible": False, "reason": "source_not_in_handoff_exit_gate"}
+        if not target_in_gate:
+            return {**evaluation, "eligible": False, "reason": "target_not_in_handoff_entry_gate"}
         if observation.camera_id in target.active_camera_ids:
             return {**evaluation, "eligible": False, "reason": "simultaneous_same_camera_conflict"}
         simultaneous = bool(target.active_camera_ids)

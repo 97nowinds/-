@@ -266,6 +266,8 @@ http://127.0.0.1:5173/recordings?api=http://127.0.0.1:15000
 - `attributes` 中的 `occluded`、`registered`、`crowd_size`；
 - `handoffs` 中的人员、源/目标摄像头和交接时间区间。
 
+要量化地图位置误差，可在人工标注行附加实测地面坐标 `"floor_position_m": {"x": 3.2, "y": 1.5}`，单位米，原点与 `floor_map.json` 一致；对应预测行也填入系统当时发布的 `floor_position_m`。评估器按摄像头、帧号和本地轨迹 ID 配对，输出位置标注覆盖率、欧氏距离误差的中位数、P90 和最大值。未配对或缺少预测坐标的标注只降低覆盖率，不会被当成零误差。坐标真值应来自现场实测的地面点，不能直接取现有示意地图或系统预测值作为真值。
+
 预测文件格式参考 `config/predictions.example.json`。运行：
 
 ```powershell
@@ -277,6 +279,8 @@ http://127.0.0.1:5173/recordings?api=http://127.0.0.1:15000
 ```
 
 `--session` 会读取 `info.json` 和各路 `*_timestamps.csv`，校验标注帧确实存在，并把 recorder 的 host_receive 时间补入只有帧号的标注。输出机器可读 JSON 和人可读 Markdown，包含跨摄交接成功率、错误身份继承率、漏交接率、ID switches、IDF1，以及按摄像头对、人数、遮挡和注册状态分组的结果。本工具没有把自定义指标称为 HOTA；当前未固定并接入标准 HOTA 依赖。空标注会明确输出“尚无真实评测数据”，不会生成虚假成绩。
+
+若已用 `scripts/diagnose_recorded_tracking.py` 对同一录像生成逐帧 JSONL，可在上面的命令中以 `--diagnostic-jsonl <诊断文件.jsonl>` 替换 `--predictions`。评估器会直接提取每帧本地轨迹 ID、global ID 和投影坐标，避免手工填写系统预测值。人工标注的 `local_detection.local_id` 必须对应这次离线重放的轨迹 ID；算法或配置变化后应重新生成诊断文件。
 
 ## 成员接口接入
 
@@ -299,6 +303,16 @@ python .\scripts\test_member_connection.py --event-id "connection.test:<双方�
 该脚本依次检查 `/health`，将同一 `connection.test` 和使用固定合成身份、64×36 无人物 JPEG 的 `snapshot.ready` 分别投递两次，检查 `status: acknowledged` 和相同 `receipt_id`，再查询全局和 `cam_2` 的 `interaction-results/latest`。输出包含各请求的 HTTP 状态和完整 JSON 响应，但不会输出 Authorization 请求头。`/health` 不携带 Token，其余请求只由服务端添加 Bearer 鉴权。一次性 Token 测试结束后必须撤销；当前测试事件不会发送真实人物、真实姓名、人脸、位置、监控画面或生物特征。
 
 成员接收端启用图片分析后，可使用 `member_integration.build_synthetic_snapshot_frame_event()` 生成符合 `lab-handoff-1.1` 的低频 `snapshot.frame`。该构造器仍只引用上述无人物测试 JPEG，发送前必须先完成 `snapshot.ready` 契约和幂等性验证。
+
+### 仪器交互位置评分
+
+演示地图每 5 秒显示一次当前人物点，不绘制历史拖尾；后台检测、MTMC 关联和地图坐标仍按原频率运行。成员返回的仪器交互结果只用于演示位置选择，不改写原始 MTMC 轨迹。当前 `config/instruments.json` 的 `instruments` 数组为空，收到现场实测仪器点后按以下格式填写（坐标使用 `floor_map.json` 的米制坐标系）：
+
+```json
+{"instruments": [{"instrument_id": "仪器唯一ID", "name": "仪器名称", "x_m": 0.0, "y_m": 0.0, "zone": "主通道", "confidence": 1.0}]}
+```
+
+成员的 `results` 中每条使用事件需要提供 `instrument_id`、`interaction_label`（如“正在使用”）、`interaction_confidence`（0～1）、`observed_at`（带时区的 ISO 时间），以及与地图人员一致的 `person_id` 或 `global_id`/`track_id`。同名人员或仅有摄像头 ID 不能定位到具体目标。评分为 `0.5×交互置信度 + 0.2×身份匹配 + 0.2×时效 + 0.1×仪器锚点置信度`；事件超过 5 秒、交互置信度低于 0.8、身份不匹配或位置超出地图时不采用。通常总分需达到 0.85；若正式标定位置与仪器点相差超过 2 米，则需达到 0.95。采用时地图保留 `visual_position` 作为对照，并显示仪器定位分数。当前成员服务未配置时，地图继续使用视觉定位。
 
 ## 当前已知限制
 

@@ -38,6 +38,10 @@ class IdentityHandoff:
                 "updated_at": time.monotonic(),
             }
 
+    def reset_replay_cycle(self):
+        with self.lock:
+            self.observations.clear()
+
     def inherit(self, camera_id, appearance):
         now = time.monotonic()
         with self.lock:

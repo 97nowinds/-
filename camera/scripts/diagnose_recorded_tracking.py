@@ -70,6 +70,11 @@ def main():
                 location = floor.project_track(cid, track['box'], frame.shape)
                 track['position'] = location['position']
                 track['position_estimated'] = bool(location.get('estimated'))
+                x, y, width, height = track['box']
+                track['image_anchor'] = {
+                    'x': (x + width * .5) / frame.shape[1],
+                    'y': min(y + height, frame.shape[0] - 1) / frame.shape[0],
+                }
             ids = last_ids[cid] if held else coordinator.update_batch(cid, tracks=tracks, frame=frame, monotonic_time=stamp-start+1, unix_time=stamp)
             last_ids[cid] = ids
             report = {'camera_id': cid, 'frame_index': index, 'seconds': round(stamp-start, 4), 'held': held, 'tracks': [{**t, 'global_id': ids[t['track_id']]} for t in tracks]}

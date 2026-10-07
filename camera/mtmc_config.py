@@ -25,6 +25,15 @@ DEFAULT_CONFIG = {
         # association or geometric camera fusion.
         "map_position_predict_seconds": 1.2,
         "map_position_predict_max_distance_m": 0.65,
+        # Map publication is decoupled from model inference.  A lower value
+        # refreshes the visible map from the newest track state without asking
+        # YOLO, ReID or ArcFace to process extra frames.
+        "map_publish_interval_seconds": 0.2,
+        # A camera handoff is a short-lived state transition, not a reason to
+        # alternate the displayed map coordinate on every incoming frame.
+        "handoff_target_confirmations": 2,
+        "handoff_transition_seconds": 0.6,
+        "handoff_wait_seconds": 0.8,
     },
     "reid": {
         "gallery_capacity": 12,
@@ -47,6 +56,10 @@ DEFAULT_CONFIG = {
         "same_camera_relink_match_margin": 0.08,
         "identity_retention_seconds": 90.0,
         "pending_ttl_seconds": 3.0,
+        # A source track may legitimately disappear immediately after it has
+        # crossed a narrow image-space exit gate. Preserve that observation
+        # briefly so the target cannot be forced to create a new global ID.
+        "handoff_exit_memory_seconds": 3.0,
         "high_confidence_score": 0.78,
         "medium_confidence_score": 0.62,
         "weights": {"reid": 0.65, "time": 0.20, "geometry": 0.10, "motion": 0.05},
@@ -103,6 +116,10 @@ def validate_config(config):
         "calibration.map_position_hold_seconds": (0.0, 30.0, False),
         "calibration.map_position_predict_seconds": (0.0, 5.0, False),
         "calibration.map_position_predict_max_distance_m": (0.0, 3.0, False),
+        "calibration.map_publish_interval_seconds": (0.02, 2.0, False),
+        "calibration.handoff_target_confirmations": (1, 10, True),
+        "calibration.handoff_transition_seconds": (0.05, 5.0, False),
+        "calibration.handoff_wait_seconds": (0.05, 5.0, False),
         "reid.gallery_capacity": (1, 100, True),
         "reid.min_sample_quality": (0.0, 1.0, False),
         "reid.duplicate_similarity": (0.0, 1.0, False),
@@ -121,6 +138,7 @@ def validate_config(config):
         "association.same_camera_relink_match_margin": (0.0, 1.0, False),
         "association.identity_retention_seconds": (1.0, 86400.0, False),
         "association.pending_ttl_seconds": (0.1, 60.0, False),
+        "association.handoff_exit_memory_seconds": (0.1, 20.0, False),
         "association.high_confidence_score": (0.0, 1.0, False),
         "association.medium_confidence_score": (0.0, 1.0, False),
         "counting.confirmation_seconds": (0.0, 30.0, False),

@@ -43,6 +43,7 @@ class SlamLocalizerTests(unittest.TestCase):
         position = localizer.project_pixel((450, 300))
 
         self.assertEqual(state["status"], "anchored")
+        self.assertTrue(state["metric_anchored"])
         self.assertEqual(state["visible_markers"], 4)
         self.assertAlmostEqual(position["x"], 5.0, delta=0.15)
         self.assertAlmostEqual(position["y"], 3.0, delta=0.15)
@@ -69,6 +70,7 @@ class SlamLocalizerTests(unittest.TestCase):
         position = localizer.project_pixel((450, 300))
 
         self.assertEqual(state["status"], "relative_reference")
+        self.assertFalse(state["metric_anchored"])
         self.assertEqual(position, {"x": 450.0, "y": 300.0})
 
 

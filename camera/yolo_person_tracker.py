@@ -268,6 +268,7 @@ class CrossCameraTrackCoordinator:
         self.person_locks = {}
         self.pending = {}
         self.redirects = {}
+        self.redirect_limit = max(64, int(reid_config.get("redirect_limit", 256)))
         self.active_local_ids_by_camera = {}
         self.distinct_global_pairs = {}
         self.stream_timestamps = {}
@@ -329,6 +330,40 @@ class CrossCameraTrackCoordinator:
         denominator = float(np.linalg.norm(first) * np.linalg.norm(second))
         return float(np.dot(first, second) / denominator) if denominator > 1e-8 else -1.0
 
+    @staticmethod
+    def clothing_tone(frame, box):
+        """Use only clear dark/light torso evidence to veto an impossible match."""
+        if frame is None or getattr(frame, "ndim", 0) != 3:
+            return None
+        x, y, width, height = (int(value) for value in box)
+        if width < 24 or height < 60:
+            return None
+        x1 = max(0, x + int(width * 0.25))
+        x2 = min(frame.shape[1], x + int(width * 0.75))
+        y1 = max(0, y + int(height * 0.16))
+        y2 = min(frame.shape[0], y + int(height * 0.54))
+        if x2 - x1 < 10 or y2 - y1 < 20:
+            return None
+        torso = frame[y1:y2, x1:x2]
+        brightness = float(np.median(np.max(torso, axis=2)))
+        if brightness <= 85.0:
+            return "dark"
+        if brightness >= 165.0:
+            return "light"
+        return None
+
+    @staticmethod
+    def _dominant_clothing_tone(votes):
+        dark = int((votes or {}).get("dark", 0))
+        light = int((votes or {}).get("light", 0))
+        if max(dark, light) < 2:
+            return None
+        if dark >= 3 * light:
+            return "dark"
+        if light >= 3 * dark:
+            return "light"
+        return None
+
     def _is_overlap(self, position, camera_id=None, other_camera_id=None):
         if (
             not self.floor_map
@@ -389,6 +424,38 @@ class CrossCameraTrackCoordinator:
                 fields.pop("unix_time", None)
             return self.event_store.record(event, **fields)
         return None
+
+    def handoff_gates(self, camera_id):
+        """Return configured image-space entry/exit gates for video overlays."""
+        gates = []
+        seen = set()
+        for transition in self.transitions:
+            gate = (transition.get("image_handoff_gates") or {}).get(camera_id)
+            if not gate:
+                continue
+            other_camera = (
+                transition.get("to")
+                if transition.get("from") == camera_id
+                else transition.get("from")
+            )
+            for direction in ("exit", "entry"):
+                value = gate.get(direction)
+                if isinstance(value, dict) and value.get("points"):
+                    signature = tuple(
+                        (round(float(point[0]), 5), round(float(point[1]), 5))
+                        for point in value["points"]
+                    )
+                    if signature in seen:
+                        continue
+                    seen.add(signature)
+                    gates.append(
+                        {
+                            "direction": direction,
+                            "points": value["points"],
+                            "other_camera": other_camera,
+                        }
+                    )
+        return gates
 
     def _new_global(
         self,
@@ -534,6 +601,12 @@ class CrossCameraTrackCoordinator:
             if box is None:
                 continue
             for column, (global_id, target, age) in enumerate(candidates):
+                if (
+                    item.get("clothing_tone") in {"dark", "light"}
+                    and target.get("clothing_tone") in {"dark", "light"}
+                    and item["clothing_tone"] != target["clothing_tone"]
+                ):
+                    continue
                 target_box = target["box"]
                 iou = YoloPersonTracker.box_iou(box, target_box)
                 scale = max(box[2], box[3], target_box[2], target_box[3], 1)
@@ -872,6 +945,11 @@ class CrossCameraTrackCoordinator:
             kept["count_confirmed"] = bool(
                 kept.get("count_confirmed") or removed.get("count_confirmed")
             )
+            votes = kept.setdefault("clothing_tone_votes", {"dark": 0, "light": 0})
+            for tone, count in (removed.get("clothing_tone_votes") or {}).items():
+                if tone in votes:
+                    votes[tone] += int(count)
+            kept["clothing_tone"] = self._dominant_clothing_tone(votes)
         removed_identity = self.global_identities.pop(remove_id, None)
         if removed_identity:
             current = self.global_identities.get(keep_id)
@@ -893,6 +971,8 @@ class CrossCameraTrackCoordinator:
         elif keep_gallery is not None and remove_gallery is not None:
             keep_gallery.merge(remove_gallery)
         self.redirects[remove_id] = keep_id
+        while len(self.redirects) > self.redirect_limit:
+            self.redirects.pop(next(iter(self.redirects)))
         for pair, seen_at in list(self.distinct_global_pairs.items()):
             if remove_id in pair:
                 self.distinct_global_pairs.pop(pair)
@@ -1059,6 +1139,8 @@ class CrossCameraTrackCoordinator:
             )
         }
         prepared = []
+        track_inputs = []
+        refresh_inputs = []
         for track in tracks:
             local_id = int(track["track_id"])
             box = tuple(track["box"])
@@ -1073,11 +1155,32 @@ class CrossCameraTrackCoordinator:
             )
             # Crossing bodies produce mixed crops. Keep the last clean gallery
             # until separation, including the legacy single-vector fallback.
-            if not occluded and (
+            needs_refresh = not occluded and (
                 cached is None or monotonic_time - cached[1] >= self.feature_refresh_seconds
-            ):
-                quality = BodyQualityScorer.assess(frame, box)
-                appearance = self.feature_extractor.extract(frame, box)
+            )
+            quality = BodyQualityScorer.assess(frame, box) if needs_refresh else None
+            track_inputs.append((track, local_id, box, key, gallery, quality))
+            if needs_refresh:
+                refresh_inputs.append((local_id, box))
+
+        refreshed = {}
+        if refresh_inputs:
+            boxes = [box for _local_id, box in refresh_inputs]
+            extract_batch = getattr(self.feature_extractor, "extract_batch", None)
+            if callable(extract_batch):
+                features = extract_batch(frame, boxes)
+            else:
+                # Test doubles and external embedders may still expose only the
+                # original one-person API.
+                features = [self.feature_extractor.extract(frame, box) for box in boxes]
+            refreshed = {
+                local_id: feature
+                for (local_id, _box), feature in zip(refresh_inputs, features)
+            }
+
+        for track, local_id, box, key, gallery, quality in track_inputs:
+            if quality is not None:
+                appearance = refreshed.get(local_id)
                 if appearance is not None:
                     gallery.add(
                         appearance,
@@ -1119,6 +1222,8 @@ class CrossCameraTrackCoordinator:
                     "direction": direction,
                     "gallery": gallery,
                     "appearance": appearance,
+                    "image_anchor": track.get("image_anchor"),
+                    "clothing_tone": self.clothing_tone(frame, box),
                 }
             )
         prepared.sort(key=lambda item: (str(camera_id), int(item["local_id"])))
@@ -1186,6 +1291,17 @@ class CrossCameraTrackCoordinator:
                         self._camera_geometry_allowed(camera_id)
                         and item["geometry_trusted"]
                     ),
+                    image_anchor=item.get("image_anchor"),
+                    clothing_tone=item.get("clothing_tone"),
+                    handoff_exit_grace=(
+                        {
+                            self.global_tracks[bound_id]["handoff_grace_source"]:
+                            self.global_tracks[bound_id]["handoff_grace_until"]
+                        }
+                        if bound_id in self.global_tracks
+                        and self.global_tracks[bound_id].get("handoff_grace_source")
+                        else {}
+                    ),
                     excluded_global_ids={
                         other for pair in self.distinct_global_pairs
                         if bound_id in pair for other in pair if other != bound_id
@@ -1218,6 +1334,9 @@ class CrossCameraTrackCoordinator:
                             and target.get("geometry_trusted", True)
                         ),
                         source_local_id=target.get("local_id"),
+                        image_anchor=target.get("image_anchor"),
+                        recent_exit_gates=dict(target.get("exit_gate_seen_at") or {}),
+                        clothing_tone=target.get("clothing_tone"),
                     )
                 )
             decisions, evaluations = self.batch_associator.associate(
@@ -1225,6 +1344,20 @@ class CrossCameraTrackCoordinator:
                 targets,
                 stream_skew_seconds=stream_skew_seconds,
             )
+            overlap_sources_by_local = defaultdict(set)
+            for evaluation in evaluations:
+                if (
+                    evaluation.get("reason")
+                    == "simultaneous_cross_camera_without_formal_overlap"
+                    and evaluation.get("target_in_handoff_gate")
+                    and (
+                        evaluation.get("source_in_handoff_gate")
+                        or evaluation.get("source_exit_gate_recent")
+                    )
+                ):
+                    overlap_sources_by_local[int(evaluation["target_local_id"])].add(
+                        evaluation["source_global_id"]
+                    )
             for evaluation in evaluations:
                 # Persist cross-camera evidence, not the expected same-camera
                 # owner conflicts produced on every normal tracking frame.
@@ -1248,6 +1381,7 @@ class CrossCameraTrackCoordinator:
                 decision = decision_by_local[observation.local_id]
                 previous_id = self.local_bindings.get(key)
                 candidate_id = decision.get("candidate_global_id")
+                created_global_id = False
                 if decision.get("accepted") and candidate_id in self.global_tracks:
                     global_id = candidate_id
                     self.global_tracks[global_id]["association_confirmed"] = True
@@ -1314,6 +1448,20 @@ class CrossCameraTrackCoordinator:
                         unix_time=unix_time,
                         confidence="low",
                     )
+                    created_global_id = True
+                blocked_sources = overlap_sources_by_local.get(observation.local_id)
+                if created_global_id and blocked_sources:
+                    # Keep an ambiguous one-frame ID off the map while the
+                    # active source camera finishes its handoff. The detection
+                    # box remains visible and association rules stay strict.
+                    self.global_tracks[global_id]["handoff_wait_until"] = monotonic_time + 2.0
+                    if len(blocked_sources) == 1:
+                        self.global_tracks[global_id]["handoff_grace_source"] = next(
+                            iter(blocked_sources)
+                        )
+                        self.global_tracks[global_id]["handoff_grace_until"] = (
+                            monotonic_time + 2.0
+                        )
                 self.local_bindings[key] = global_id
                 results[observation.local_id] = global_id
                 recorded = {**decision, "global_id": global_id}
@@ -1344,12 +1492,29 @@ class CrossCameraTrackCoordinator:
                         "position": item["position"],
                         "geometry_trusted": item["geometry_trusted"],
                         "box": item["box"],
+                        "image_anchor": item.get("image_anchor"),
                         "local_id": item["local_id"],
                         "direction": item["direction"],
                         "last_seen": monotonic_time,
                         "in_overlap": self._is_overlap(item["position"], camera_id),
                     }
                 )
+                if item.get("clothing_tone") in {"dark", "light"}:
+                    votes = target.setdefault(
+                        "clothing_tone_votes", {"dark": 0, "light": 0}
+                    )
+                    votes[item["clothing_tone"]] += 1
+                    target["clothing_tone"] = self._dominant_clothing_tone(votes)
+                exit_gate_seen_at = target.setdefault("exit_gate_seen_at", {})
+                for destination in self.batch_associator.exit_gate_destinations(
+                    camera_id, item.get("image_anchor")
+                ):
+                    exit_gate_seen_at[destination] = monotonic_time
+                for destination, seen_at in list(exit_gate_seen_at.items()):
+                    if monotonic_time - float(seen_at) > float(
+                        self.mtmc_config["association"]["handoff_exit_memory_seconds"]
+                    ):
+                        exit_gate_seen_at.pop(destination, None)
                 target["observation_count"] = int(target.get("observation_count", 0)) + 1
             return results
 
@@ -1390,6 +1555,14 @@ class CrossCameraTrackCoordinator:
             if first_gallery is None:
                 continue
             for second_id in active_ids[index + 1 :]:
+                first_tone = self.global_tracks[first_id].get("clothing_tone")
+                second_tone = self.global_tracks[second_id].get("clothing_tone")
+                if (
+                    first_tone in {"dark", "light"}
+                    and second_tone in {"dark", "light"}
+                    and first_tone != second_tone
+                ):
+                    continue
                 if not any(
                     self._transition_gap(first_camera, second_camera) is not None
                     for first_camera in active_cameras[first_id]
@@ -1502,10 +1675,12 @@ class CrossCameraTrackCoordinator:
             "count_duplicate_reid_score": duplicate_score,
         }
 
-    def track_diagnostics(self, camera_id, local_id):
+    def track_diagnostics(self, camera_id, local_id, now=None):
         key = (camera_id, int(local_id))
+        now = time.monotonic() if now is None else float(now)
         with self.lock:
             global_id = self.local_bindings.get(key)
+            target = self.global_tracks.get(global_id) or {}
             gallery = self.local_galleries.get(key)
             recent = next(
                 (
@@ -1522,18 +1697,21 @@ class CrossCameraTrackCoordinator:
                 "confidence": (recent or {}).get("confidence", "existing"),
                 "final_match_score": (recent or {}).get("final_score"),
                 "pending": global_id in self.pending,
+                "handoff_waiting": now < float(target.get("handoff_wait_until", 0.0)),
                 **self._count_state(global_id),
             }
 
     def diagnostics(self):
         with self.lock:
+            recent_redirects = dict(list(self.redirects.items())[-50:])
             return {
                 "algorithm_version": self.mtmc_config["algorithm_version"],
                 "association_algorithm": ASSOCIATION_ALGORITHM,
                 "active_global_tracks": len(self.global_tracks),
                 "pending_associations": len(self.pending),
                 "batch_window_reservations": len(self.association_reservations),
-                "redirects": dict(self.redirects),
+                "redirect_count": len(self.redirects),
+                "recent_redirects": recent_redirects,
                 "counting_duplicate_groups": self._count_duplicate_groups(),
                 "recent_associations": list(self.recent_associations)[-30:],
                 "event_summary": self.event_store.summary() if self.event_store else None,
@@ -1679,6 +1857,22 @@ class CrossCameraTrackCoordinator:
                 self.local_galleries.pop(key, None)
                 self.local_motion.pop(key, None)
             self.active_local_ids_by_camera.pop(camera_id, None)
+
+    def reset_replay_cycle(self):
+        """Discard all cross-camera evidence at a recording loop boundary."""
+        with self.lock:
+            for state in (
+                self.local_bindings, self.local_features, self.local_galleries,
+                self.local_motion, self.global_galleries, self.global_tracks,
+                self.global_identities, self.person_locks, self.pending,
+                self.redirects, self.active_local_ids_by_camera,
+                self.distinct_global_pairs, self.stream_timestamps,
+                self.association_reservations,
+            ):
+                state.clear()
+            self.recent_associations.clear()
+            self.last_merge_rejection_reason = None
+            # Keep next_id monotonic so a new loop cannot reuse an old ID.
 
     def forget_local(self, camera_id, local_id):
         """Release one camera-local binding without disturbing its peers."""

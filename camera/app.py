@@ -101,11 +101,13 @@ YOLO_TRACK_HOLD_SECONDS = 0.8
 FACE_SCORE_THRESHOLD = 0.25
 FACE_NMS_THRESHOLD = 0.30
 FACE_TOP_K = 5000
-# 地图状态允许最多约 200 ms 的显示延迟，避免每个视频帧都触发地图计算和接口刷新。
-MAP_PUBLISH_INTERVAL_SECONDS = 0.2
 # ORB feature matching is substantially more expensive than map publication.
 # Keep the last valid transform for projection between SLAM updates.
 SLAM_UPDATE_INTERVAL_SECONDS = 0.5
+INFERENCE_WATCHDOG_SECONDS = max(
+    5.0, float(os.environ.get("LAB_INFERENCE_WATCHDOG_SECONDS", "15"))
+)
+INFERENCE_WATCHDOG_EXIT_CODE = 70
 ANNOTATION_LOCK = threading.RLock()
 REGISTRATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 RECORDING_PATH_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -374,6 +376,7 @@ class CameraWorker:
         recorder,
         floor_map,
         coordinator,
+        map_publish_interval_seconds=0.2,
     ):
         self.camera = camera
         self.face_store = face_store
@@ -381,6 +384,7 @@ class CameraWorker:
         self.recorder = recorder
         self.floor_map = floor_map
         self.coordinator = coordinator
+        self.map_publish_interval_seconds = float(map_publish_interval_seconds)
         self.face_recognition_ready = (
             face_store.modern.available and bool(face_store.modern_features)
             if FACE_RECOGNITION_ENGINE == "arcface"
@@ -478,6 +482,8 @@ class CameraWorker:
         self.processing_latency_ms = None
         self.inference_started_at = None
         self.inference_ended_at = None
+        self.inference_started_monotonic = None
+        self.inference_ended_monotonic = None
         self.status_published_at = None
         self.last_capture_monotonic = None
         self.last_frame_monotonic = None
@@ -513,6 +519,8 @@ class CameraWorker:
         self.replay_cycle = 0
         self.replay_duration_seconds = None
         self.replay_finished = False
+        self.replay_cycle_barrier = None
+        self.processing_lock = threading.RLock()
         self.capture_condition = threading.Condition()
         self.latest_capture = None
         self.capture_history = deque(maxlen=16 if self.replay_enabled else 1)
@@ -573,7 +581,21 @@ class CameraWorker:
                 capture = None
                 if self.replay_enabled:
                     if self.replay_loop:
-                        self.replay_cycle += 1
+                        with self.processing_lock:
+                            self.replay_cycle += 1
+                            self.end_current_track()
+                            with self.capture_condition:
+                                self.latest_capture = None
+                                self.capture_history.clear()
+                                self.capture_condition.notify_all()
+                        if self.replay_cycle_barrier is not None:
+                            try:
+                                self.replay_cycle_barrier.wait(
+                                    timeout=max(30.0, 2.0 * self.replay_duration_seconds)
+                                )
+                            except threading.BrokenBarrierError:
+                                self.status = "replay_sync_error"
+                                self.replay_finished = True
                         continue
                     self.replay_finished = True
                     self.status = "replay_complete"
@@ -619,6 +641,7 @@ class CameraWorker:
                     captured_at,
                     captured_monotonic,
                     frame,
+                    self.replay_cycle if self.replay_enabled else None,
                 )
                 self.capture_history.append(self.latest_capture)
                 self.capture_condition.notify_all()
@@ -645,37 +668,45 @@ class CameraWorker:
             if capture is None:
                 continue
 
-            sequence, generation, captured_at, captured_monotonic, frame = capture
-            if generation != processed_generation:
-                self.reset_processing_state()
-                processed_generation = generation
-            if processed_sequence:
-                self.dropped_frames += max(0, sequence - processed_sequence - 1)
-            processed_sequence = sequence
+            sequence, generation, captured_at, captured_monotonic, frame, captured_cycle = capture
+            with self.processing_lock:
+                # An EOF may be reached while this frame waits for inference.
+                # Never let an old-cycle frame recreate IDs after the barrier.
+                if self.replay_enabled and captured_cycle != self.replay_cycle:
+                    processed_sequence = sequence
+                    continue
+                if generation != processed_generation:
+                    self.reset_processing_state()
+                    processed_generation = generation
+                if processed_sequence:
+                    self.dropped_frames += max(0, sequence - processed_sequence - 1)
+                processed_sequence = sequence
 
-            frame = self.resize(frame)
-            self.frame_counter += 1
-            inference_started_at = time.time()
-            inference_started_monotonic = time.monotonic()
-            self.inference_started_at = inference_started_at
-            self.record_frame(inference_started_at, inference_started_monotonic)
-            display = self.process(
-                frame,
-                frame_unix_time=captured_at,
-                frame_monotonic_time=captured_monotonic,
-            )
-            self.inference_ended_at = time.time()
-            if generation != self.capture_generation or self.status != "running":
-                continue
-            with self.display_condition:
-                self.frame = frame
-                self.display_frame = display
-                self.processing_latency_ms = round(
-                    (time.monotonic() - captured_monotonic) * 1000.0, 1
+                frame = self.resize(frame)
+                self.frame_counter += 1
+                inference_started_at = time.time()
+                inference_started_monotonic = time.monotonic()
+                self.inference_started_at = inference_started_at
+                self.inference_started_monotonic = inference_started_monotonic
+                self.record_frame(inference_started_at, inference_started_monotonic)
+                display = self.process(
+                    frame,
+                    frame_unix_time=captured_at,
+                    frame_monotonic_time=captured_monotonic,
                 )
-                self.status_published_at = time.time()
-                self.display_sequence += 1
-                self.display_condition.notify_all()
+                self.inference_ended_at = time.time()
+                self.inference_ended_monotonic = time.monotonic()
+                if generation != self.capture_generation or self.status != "running":
+                    continue
+                with self.display_condition:
+                    self.frame = frame
+                    self.display_frame = display
+                    self.processing_latency_ms = round(
+                        (time.monotonic() - captured_monotonic) * 1000.0, 1
+                    )
+                    self.status_published_at = time.time()
+                    self.display_sequence += 1
+                    self.display_condition.notify_all()
 
     def reset_processing_state(self):
         self.slam.reset()
@@ -721,8 +752,9 @@ class CameraWorker:
                 capture = self.latest_capture
 
             frame = None
+            preview_capture_at = None
             if capture is not None and capture[0] > encoded_capture_sequence:
-                sequence, _generation, _captured_at, captured_monotonic, raw_frame = capture
+                sequence, _generation, preview_capture_at, captured_monotonic, raw_frame, _cycle = capture
                 frame = self.resize(raw_frame.copy())
                 frame = self.render_async_preview(frame, captured_monotonic)
                 encoded_capture_sequence = sequence
@@ -762,7 +794,11 @@ class CameraWorker:
                     ".jpg", output, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
                 )
                 if ok:
-                    profiles[remote] = (jpeg_sequence, encoded.tobytes())
+                    host_to_jpeg_ms = (
+                        round(max(0.0, time.time() - preview_capture_at) * 1000.0, 1)
+                        if preview_capture_at is not None else None
+                    )
+                    profiles[remote] = (jpeg_sequence, encoded.tobytes(), host_to_jpeg_ms)
             with self.jpeg_condition:
                 self.jpeg_frames.update(profiles)
                 self.jpeg_condition.notify_all()
@@ -1257,7 +1293,12 @@ class CameraWorker:
             self.camera["id"], box, frame_shape
         )
         anchor = location.get("image_anchor")
-        if location.get("position") is not None and not location.get("estimated") and anchor:
+        if (
+            location.get("position") is not None
+            and not location.get("estimated")
+            and anchor
+            and self.slam_state.get("metric_anchored", False)
+        ):
             foot = (
                 float(anchor["x"]) * frame_shape[1],
                 float(anchor["y"]) * frame_shape[0],
@@ -1287,6 +1328,33 @@ class CameraWorker:
         frame_unix_time = time.time() if frame_unix_time is None else float(frame_unix_time)
         now = time.monotonic() if frame_monotonic_time is None else float(frame_monotonic_time)
         self.current_frame_monotonic = now
+        # Image-space handoff gates are deliberately shown on the replay/live
+        # overlay. They are association constraints, not map calibration
+        # points, so an operator can directly verify the intended doorway.
+        for gate in self.coordinator.handoff_gates(self.camera["id"]):
+            points = np.asarray(
+                [
+                    (
+                        int(round(float(point[0]) * frame.shape[1])),
+                        int(round(float(point[1]) * frame.shape[0])),
+                    )
+                    for point in gate["points"]
+                ],
+                dtype=np.int32,
+            ).reshape((-1, 1, 2))
+            color = (200, 120, 255)
+            cv2.polylines(display, [points], True, color, 2, cv2.LINE_AA)
+            label_at = tuple(points[0, 0])
+            cv2.putText(
+                display,
+                "HANDOFF GATE",
+                (label_at[0], max(20, label_at[1] - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
         if now - self.last_slam_at >= SLAM_UPDATE_INTERVAL_SECONDS:
             self.slam_state = self.slam.update(
                 frame,
@@ -1406,6 +1474,12 @@ class CameraWorker:
             height = max(1, min(height, frame.shape[0] - y))
             box = (x, y, width, height)
             location = self.locate_box(box, frame.shape)
+            # Handoff gates describe pixels in the camera image, independently
+            # of whether the floor map can place the feet on an aisle.
+            handoff_anchor = {
+                "x": (x + width * 0.5) / frame.shape[1],
+                "y": min(y + height, frame.shape[0] - 1) / frame.shape[0],
+            }
             # A fixed tracking anchor is only meaningful for one person at a
             # doorway. Publishing that same coordinate for a crowd makes the
             # map falsely collapse multiple workers into one point.
@@ -1430,6 +1504,7 @@ class CameraWorker:
                     "position": position,
                     "position_estimated": bool(location.get("estimated")),
                     "localization": location,
+                    "image_anchor": handoff_anchor,
                 }
             )
         if should_infer and not hold_cached_tracks:
@@ -1478,25 +1553,16 @@ class CameraWorker:
                     self.identity = inherited
                     self.identity_track_id = local_id
                     self.handoff_unknown_count = 0
-            trail = self.yolo_trails.update(global_id, foot, now=now)
+            self.yolo_trails.update(global_id, foot, now=now)
             global_number = int(global_id.rsplit("_", 1)[-1])
             color = self.yolo_color(global_number)
             track_identity = (
                 self.track_identities.get(local_id)
             )
             mtmc_diagnostics = self.coordinator.track_diagnostics(
-                self.camera["id"], local_id
+                self.camera["id"], local_id, now=now
             )
 
-            if len(trail) >= 2:
-                cv2.polylines(
-                    display,
-                    [np.asarray(trail, dtype=np.int32).reshape((-1, 1, 2))],
-                    False,
-                    color,
-                    3,
-                    cv2.LINE_AA,
-                )
             cv2.circle(
                 display,
                 foot,
@@ -1532,7 +1598,12 @@ class CameraWorker:
                 cv2.LINE_AA,
             )
 
-            if position is not None:
+            if (
+                should_infer
+                and not hold_cached_tracks
+                and position is not None
+                and not mtmc_diagnostics["handoff_waiting"]
+            ):
                 observations.append(
                     {
                         "camera_id": self.camera["id"],
@@ -1575,6 +1646,8 @@ class CameraWorker:
                     "association_confidence": mtmc_diagnostics["confidence"],
                     "association_score": mtmc_diagnostics["final_match_score"],
                     "association_pending": mtmc_diagnostics["pending"],
+                    "handoff_waiting": mtmc_diagnostics["handoff_waiting"],
+                    "detection_fresh": bool(should_infer and not hold_cached_tracks),
                     "counted": mtmc_diagnostics["counted"],
                     "count_status": mtmc_diagnostics["count_status"],
                     "count_duplicate_of": mtmc_diagnostics.get("count_duplicate_of"),
@@ -1662,10 +1735,18 @@ class CameraWorker:
         self.yolo_trails.prune(now=now)
         if not should_infer or hold_cached_tracks:
             # 非检测帧沿用上一检测结果，不重新生成目标 ID，避免轨迹抖动。
-            published_tracks = cached_tracks
+            published_tracks = [
+                {
+                    **item,
+                    "detection_fresh": bool(
+                        not hold_cached_tracks and item.get("detection_fresh", True)
+                    ),
+                }
+                for item in cached_tracks
+            ]
         should_publish_map = (
             should_infer
-            or now - self.last_map_publish_at >= MAP_PUBLISH_INTERVAL_SECONDS
+            or now - self.last_map_publish_at >= self.map_publish_interval_seconds
         )
         with self.lock:
             self.yolo_tracks = published_tracks
@@ -1673,7 +1754,7 @@ class CameraWorker:
                 self.last_yolo_tracks_at = now
             elif not published_tracks and self.last_yolo_tracks_at is not None and now - self.last_yolo_tracks_at > self.camera["track_hold_seconds"]:
                 self.last_yolo_tracks_at = None
-            if should_publish_map:
+            if should_publish_map and should_infer:
                 self.map_observations = observations
                 self.map_observation = observations[0] if observations else None
                 self.last_map_publish_at = now
@@ -1873,6 +1954,10 @@ class CameraWorker:
             "identities": identities,
             "tracking": tracking,
             "tracked_people": len(yolo_tracks),
+            "detection_age_seconds": (
+                round(max(0.0, now_monotonic - self.last_yolo_tracks_at), 3)
+                if self.last_yolo_tracks_at is not None else None
+            ),
             "counted_people": sum(
                 1 for track in yolo_tracks if track.get("counted", True)
             ),
@@ -1905,7 +1990,7 @@ class CameraWorker:
             ),
             "inference_ms": self.yolo_inference_ms,
             "track_hold_ms": int(self.camera["track_hold_seconds"] * 1000),
-            "map_publish_interval_ms": int(MAP_PUBLISH_INTERVAL_SECONDS * 1000),
+            "map_publish_interval_ms": int(self.map_publish_interval_seconds * 1000),
             "map_observation": map_observation,
             "map_observations": map_observations,
             "slam": dict(self.slam_state),
@@ -1993,6 +2078,7 @@ class CameraManager:
                 self.recorder,
                 self.floor_map,
                 self.coordinator,
+                self.mtmc_config["calibration"]["map_publish_interval_seconds"],
             )
             for camera in cameras
         }
@@ -2002,8 +2088,73 @@ class CameraManager:
         for worker in self.workers.values():
             worker.replay_start_monotonic = replay_start_monotonic
             worker.replay_start_unix = replay_start_unix
+        replay_workers = [worker for worker in self.workers.values() if worker.replay_loop]
+        if replay_workers:
+            barrier = threading.Barrier(
+                len(replay_workers), action=self._reset_replay_cycle
+            )
+            for worker in replay_workers:
+                worker.replay_cycle_barrier = barrier
+        for worker in self.workers.values():
             worker.start()
         self.environment.start()
+        self.watchdog_seconds = INFERENCE_WATCHDOG_SECONDS
+        self.watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="inference-watchdog",
+            daemon=True,
+        )
+        self.watchdog_thread.start()
+
+    def stalled_workers(self, now=None):
+        """Return camera IDs whose live capture outlived one inference call."""
+        now = time.monotonic() if now is None else float(now)
+        stalled = []
+        for camera_id, worker in self.workers.items():
+            started = worker.inference_started_monotonic
+            ended = worker.inference_ended_monotonic
+            capture_at = worker.last_capture_monotonic
+            inference_running = started is not None and (ended is None or started > ended)
+            capture_is_live = capture_at is not None and now - capture_at <= 2.0
+            if (
+                inference_running
+                and capture_is_live
+                and now - started > self.watchdog_seconds
+            ):
+                stalled.append(camera_id)
+        return stalled
+
+    def _watchdog_loop(self):
+        while True:
+            time.sleep(1.0)
+            stalled = self.stalled_workers()
+            if not stalled:
+                continue
+            logging.critical(
+                "Inference watchdog detected a stuck live worker after %.1fs: %s. "
+                "Exiting so the service supervisor can rebuild CUDA/model state.",
+                self.watchdog_seconds,
+                ", ".join(stalled),
+            )
+            os._exit(INFERENCE_WATCHDOG_EXIT_CODE)
+
+    def _reset_replay_cycle(self):
+        """Reset shared identity/map state once all replay cameras reach EOF."""
+        workers = sorted(
+            (worker for worker in self.workers.values() if worker.replay_loop),
+            key=lambda worker: worker.camera["id"],
+        )
+        for worker in workers:
+            worker.processing_lock.acquire()
+        try:
+            self.coordinator.reset_replay_cycle()
+            self.floor_map.reset_replay_cycle()
+            self.handoff.reset_replay_cycle()
+            for worker in workers:
+                worker.end_current_track()
+        finally:
+            for worker in reversed(workers):
+                worker.processing_lock.release()
 
     def stop(self):
         self.environment.stop()
@@ -2041,7 +2192,7 @@ class CameraManager:
             capture_times = []
             for camera_id, worker in self.workers.items():
                 capture = selected[camera_id]
-                _sequence, _generation, captured_at, captured_monotonic, raw_frame = capture
+                _sequence, _generation, captured_at, captured_monotonic, raw_frame, _cycle = capture
                 frame = worker.resize(raw_frame.copy())
                 frame = worker.render_async_preview(frame, captured_monotonic)
                 if frame.shape[1] > 640:
@@ -2069,16 +2220,17 @@ class CameraManager:
             self.synchronized_preview_batches[sync_id] = result
             return result
 
-    def state(self):
-        cameras = [worker.status_payload() for worker in self.workers.values()]
-        observations = [
-            observation
-            for camera in cameras
-            for observation in camera.get("map_observations", [])
-        ]
+    @staticmethod
+    def map_active_tracks(cameras):
+        """Keep recently detected targets, not long-lived preview boxes, on the map."""
         active_tracks_by_id = {}
         for camera in cameras:
             for track in camera.get("yolo_tracks", []):
+                if (
+                    track.get("detection_fresh") is False
+                    and (camera.get("detection_age_seconds") or 0.0) > 0.5
+                ):
+                    continue
                 track_id = track.get("track_id")
                 if not track_id:
                     continue
@@ -2091,6 +2243,15 @@ class CameraManager:
                     active["observed_at"],
                     float(camera.get("inference_ended_at") or camera.get("status_published_at") or time.time()),
                 )
+        return list(active_tracks_by_id.values())
+
+    def state(self, include_diagnostics=True):
+        cameras = [worker.status_payload() for worker in self.workers.values()]
+        observations = [
+            observation
+            for camera in cameras
+            for observation in camera.get("map_observations", [])
+        ]
         return {
             "cameras": cameras,
             "environment": self.environment.status(),
@@ -2100,8 +2261,11 @@ class CameraManager:
                 "inference_device": str(self.reid_embedder.device),
                 "cpu_fallback_allowed": os.environ.get("LAB_ALLOW_CPU_FALLBACK") == "1",
                 "inference_frame_stride": YOLO_FRAME_STRIDE,
-                "map_publish_interval_ms": int(MAP_PUBLISH_INTERVAL_SECONDS * 1000),
-                "frontend_poll_interval_ms": 200,
+                "map_publish_interval_ms": int(
+                    self.mtmc_config["calibration"]["map_publish_interval_seconds"]
+                    * 1000
+                ),
+                "frontend_poll_interval_ms": 500,
                 "face_recognition_engine": (
                     self.face_store.modern.engine
                     if self.face_store.modern.available
@@ -2130,8 +2294,15 @@ class CameraManager:
                 "slam_marker_reacquire": "automatic",
                 "track_hold_ms": int(YOLO_TRACK_HOLD_SECONDS * 1000),
                 "algorithm_version": self.mtmc_config["algorithm_version"],
-                "effective_mtmc_config": public_config(self.mtmc_config),
-                "mtmc_diagnostics": self.coordinator.diagnostics(),
+                "inference_watchdog_seconds": self.watchdog_seconds,
+                **(
+                    {
+                        "effective_mtmc_config": public_config(self.mtmc_config),
+                        "mtmc_diagnostics": self.coordinator.diagnostics(),
+                    }
+                    if include_diagnostics
+                    else {}
+                ),
             },
             "floor_map": self.floor_map.state(
                 observations,
@@ -2141,10 +2312,13 @@ class CameraManager:
                 fusion_max_distance_m=self.mtmc_config["calibration"]["fusion_max_distance_m"],
                 max_map_speed_mps=self.mtmc_config["calibration"]["max_map_speed_mps"],
                 max_motion_gap_seconds=self.mtmc_config["calibration"]["max_motion_gap_seconds"],
-                active_tracks=list(active_tracks_by_id.values()),
+                active_tracks=self.map_active_tracks(cameras),
                 map_position_hold_seconds=self.mtmc_config["calibration"]["map_position_hold_seconds"],
                 map_position_predict_seconds=self.mtmc_config["calibration"]["map_position_predict_seconds"],
                 map_position_predict_max_distance_m=self.mtmc_config["calibration"]["map_position_predict_max_distance_m"],
+                handoff_target_confirmations=self.mtmc_config["calibration"]["handoff_target_confirmations"],
+                handoff_transition_seconds=self.mtmc_config["calibration"]["handoff_transition_seconds"],
+                handoff_wait_seconds=self.mtmc_config["calibration"]["handoff_wait_seconds"],
             ),
         }
 
@@ -2411,8 +2585,12 @@ def mjpeg_stream(worker, remote=False):
             result = worker.wait_for_jpeg(remote, sequence)
             if result is None or result[0] <= sequence:
                 continue
-            sequence, encoded = result
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + encoded + b"\r\n"
+            sequence, encoded, host_to_jpeg_ms = result
+            latency_header = (
+                f"X-Host-To-Jpeg-Ms: {host_to_jpeg_ms}\r\n".encode("ascii")
+                if host_to_jpeg_ms is not None else b""
+            )
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n" + latency_header + b"\r\n" + encoded + b"\r\n"
     finally:
         worker.remove_jpeg_subscriber(remote)
 
@@ -2642,6 +2820,12 @@ def synchronized_replay_frame(camera_id):
 @app.route("/api/state")
 def api_state():
     return jsonify(camera_manager.state())
+
+
+@app.route("/api/dashboard")
+def api_dashboard():
+    """Small, high-frequency payload for the live operator page."""
+    return jsonify(camera_manager.state(include_diagnostics=False))
 
 
 @app.route("/api/environment/ingest", methods=["POST"])

@@ -851,6 +851,19 @@ class FloorMapProjectorTests(unittest.TestCase):
         self.assertEqual(held["localization_state"], "held")
         self.assertEqual(held["position_age_seconds"], 2.5)
 
+    def test_replay_cycle_reset_cannot_hold_previous_loop_position(self):
+        self.projector.state(
+            [{"camera_id": "cam_1", "track_id": "person_1", "position": {"x": 3, "y": 3}, "observed_at": 10}],
+            now=10,
+        )
+        self.projector.reset_replay_cycle()
+        next_loop = self.projector.state(
+            [], now=11,
+            active_tracks=[{"track_id": "person_1", "cameras": ["cam_1"], "observed_at": 11}],
+            map_position_hold_seconds=8,
+        )
+        self.assertEqual(next_loop["people"], [])
+
     def test_two_tracks_predict_independently_during_short_projection_gap(self):
         """A brief map gap must not turn two moving workers into one waiting dot."""
         observations = [
@@ -966,7 +979,126 @@ class FloorMapProjectorTests(unittest.TestCase):
         )["people"][0]
 
         self.assertEqual(person["position_source_camera"], "cam_1")
-        self.assertEqual(person["cameras"], ["cam_1"])
+
+    def test_camera_handoff_waits_then_blends_before_target_takes_display(self):
+        """A short corridor handoff must not bounce between camera maps."""
+        projector = FloorMapProjector(config())
+        first = {
+            "camera_id": "cam_1",
+            "track_id": "global_1",
+            "global_track_id": "global_1",
+            "position": {"x": 2.0, "y": 3.0},
+            "observed_at": 10.0,
+        }
+        initial = projector.state(
+            [first], now=10.0, handoff_target_confirmations=2
+        )["people"][0]
+        self.assertEqual(initial["position_source_camera"], "cam_1")
+
+        target = {
+            "camera_id": "cam_2",
+            "track_id": "global_1",
+            "global_track_id": "global_1",
+            "position": {"x": 7.0, "y": 3.0},
+            "observed_at": 10.1,
+        }
+        waiting = projector.state(
+            [target],
+            now=10.1,
+            handoff_target_confirmations=2,
+            handoff_wait_seconds=0.8,
+            handoff_transition_seconds=0.6,
+        )["people"][0]
+        self.assertEqual(waiting["handoff_state"], "waiting_target_confirmation")
+        self.assertEqual(waiting["position_source_camera"], "cam_1")
+        self.assertEqual(waiting["localization_state"], "held")
+        self.assertEqual(waiting["position_observed_at"], initial["observed_at"])
+        self.assertAlmostEqual(waiting["x"], initial["x"], places=3)
+
+        confirmed_target = {**target, "observed_at": 10.4}
+        transitioning = projector.state(
+            [confirmed_target],
+            now=10.4,
+            handoff_target_confirmations=2,
+            handoff_transition_seconds=0.6,
+        )["people"][0]
+        self.assertEqual(transitioning["handoff_state"], "transitioning")
+        self.assertEqual(transitioning["position_source_camera"], "cam_2")
+        self.assertGreater(transitioning["x"], initial["x"])
+        self.assertLess(transitioning["x"], target["position"]["x"])
+
+    def test_approximate_cross_camera_relocation_breaks_false_map_path(self):
+        floor_config = config()
+        floor_config["calibrated"] = False
+        projector = FloorMapProjector(floor_config)
+        source = {
+            "camera_id": "cam_2", "track_id": "person_1",
+            "position": {"x": 5.5, "y": 5.0}, "observed_at": 10.0,
+        }
+        target = {
+            "camera_id": "cam_1", "track_id": "person_1",
+            "position": {"x": 7.0, "y": 1.6}, "observed_at": 10.2,
+        }
+        projector.state([source], now=10.0, handoff_target_confirmations=2)
+        waiting = projector.state(
+            [target], now=10.2, handoff_target_confirmations=2
+        )["people"][0]
+        repeated = projector.state(
+            [target], now=10.3, handoff_target_confirmations=2
+        )["people"][0]
+        self.assertEqual(waiting["handoff_state"], "waiting_target_confirmation")
+        self.assertEqual(repeated["handoff_state"], "waiting_target_confirmation")
+        self.assertEqual((repeated["x"], repeated["y"]), (waiting["x"], waiting["y"]))
+
+        confirmed = projector.state(
+            [{**target, "observed_at": 10.4}],
+            now=10.4, handoff_target_confirmations=2,
+        )["people"][0]
+        self.assertEqual(confirmed["track_id"], "person_1")
+        self.assertEqual(confirmed["handoff_state"], "relocalized")
+        self.assertTrue(confirmed["position_discontinuity"])
+        self.assertAlmostEqual(confirmed["x"], 7.0)
+        self.assertAlmostEqual(confirmed["y"], 1.6)
+        self.assertFalse(confirmed["corridor_routed"])
+
+        stable = projector.state(
+            [{**target, "observed_at": 10.6}],
+            now=10.6, handoff_target_confirmations=2,
+        )["people"][0]
+        self.assertFalse(stable["position_discontinuity"])
+        self.assertEqual(stable["handoff_state"], "stable")
+
+    def test_old_camera_dot_is_hidden_until_new_camera_localizes(self):
+        floor_config = config()
+        floor_config["calibrated"] = False
+        projector = FloorMapProjector(floor_config)
+        source = {
+            "camera_id": "cam_2", "track_id": "person_1",
+            "position": {"x": 5.0, "y": 5.0}, "observed_at": 10.0,
+        }
+        first = projector.state([source], now=10.0)["people"][0]
+        self.assertTrue(first["map_visible"])
+        no_footpoint = projector.state(
+            [], now=10.3,
+            active_tracks=[{"track_id": "person_1", "cameras": ["cam_1"], "observed_at": 10.3}],
+        )["people"][0]
+        self.assertFalse(no_footpoint["map_visible"])
+        self.assertTrue(no_footpoint["handoff_waiting"])
+        self.assertEqual(no_footpoint["track_id"], "person_1")
+        target = {
+            "camera_id": "cam_1", "track_id": "person_1",
+            "position": {"x": 8.0, "y": 1.6}, "observed_at": 10.4,
+        }
+        waiting = projector.state(
+            [target], now=10.4, handoff_target_confirmations=2
+        )["people"][0]
+        self.assertFalse(waiting["map_visible"])
+        confirmed = projector.state(
+            [{**target, "observed_at": 10.6}],
+            now=10.6, handoff_target_confirmations=2,
+        )["people"][0]
+        self.assertTrue(confirmed["map_visible"])
+        self.assertTrue(confirmed["position_discontinuity"])
 
     def test_repeated_map_poll_does_not_reapply_same_measurement(self):
         projector = FloorMapProjector(config())
@@ -1017,8 +1149,12 @@ class FloorMapProjectorTests(unittest.TestCase):
         config_path = Path(__file__).resolve().parents[1] / "config" / "floor_map.json"
         projector = FloorMapProjector.from_path(config_path)
 
-        # 2026-09-20 recording and operator correction: Cam1 views the secondary aisle.
-        position = projector.project("cam_1", (477, 51, 82, 166), (432, 768, 3))
+        # Latest operator polygon: this footpoint lies inside the marked Cam1
+        # secondary aisle instead of relying on the superseded 2026-09-20 box.
+        position = projector.project(
+            "cam_1", (0.72 * 768, 0.45 * 432, 0.08 * 768, 0.20 * 432),
+            (432, 768, 3),
+        )
         main_aisle = next(
             zone for zone in projector.config["zones"] if zone["id"] == "secondary_aisle"
         )

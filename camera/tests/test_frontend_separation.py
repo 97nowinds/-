@@ -49,7 +49,7 @@ class FrontendSeparationTests(unittest.TestCase):
     def test_frontend_calls_configured_backend(self):
         source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("__LAB_API_BASE__", source)
-        self.assertIn("${API_BASE}/api/state", source)
+        self.assertIn("${API_BASE}/api/dashboard", source)
         self.assertIn("${API_BASE}/video/", source)
 
     def test_monitoring_page_separates_capture_preview_and_ai_fps(self):
@@ -435,6 +435,16 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn('"deduplicated_tracks"', tracker)
         self.assertIn("${tracked} 轨 / ${counted} 已确认", frontend)
 
+    def test_live_dashboard_uses_compact_low_frequency_state(self):
+        backend = (ROOT / "app.py").read_text(encoding="utf-8")
+        frontend = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('@app.route("/api/dashboard")', backend)
+        self.assertIn("state(include_diagnostics=False)", backend)
+        self.assertIn("`${API_BASE}/api/dashboard`", frontend)
+        self.assertIn("DASHBOARD_REFRESH_INTERVAL_MS = 500", frontend)
+        self.assertIn("INFERENCE_WATCHDOG_SECONDS", backend)
+
     def test_person_detection_is_not_discarded_when_footpoint_is_unavailable(self):
         backend = (ROOT / "app.py").read_text(encoding="utf-8")
 
@@ -453,7 +463,7 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn('" · 脚点估算"', script)
         self.assertIn('? "estimated"', script)
 
-    def test_approximate_map_only_enables_observed_entrance_cam2_overlap(self):
+    def test_approximate_map_enables_observed_entrance_overlaps(self):
         floor_map = json.loads((ROOT / "config" / "floor_map.json").read_text(encoding="utf-8"))
         transitions = floor_map["camera_transitions"]
 
@@ -463,12 +473,13 @@ class FrontendSeparationTests(unittest.TestCase):
         validated = [
             item for item in transitions if item["simultaneous_overlap_validated"]
         ]
-        self.assertEqual(len(validated), 1)
         self.assertEqual(
-            {validated[0]["from"], validated[0]["to"]},
-            {"cam_entrance", "cam_2"},
+            {(item["from"], item["to"]) for item in validated},
+            {("cam_entrance", "cam_1"), ("cam_entrance", "cam_2")},
         )
-        self.assertEqual(validated[0]["simultaneous_reid_threshold"], 0.95)
+        self.assertTrue(
+            all(item["simultaneous_reid_threshold"] == 0.95 for item in validated)
+        )
 
     def test_state_reports_arcface_gallery_completion_counts(self):
         backend = (ROOT / "app.py").read_text(encoding="utf-8")
@@ -476,15 +487,13 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn('"arcface_gallery_required_features"', backend)
         self.assertIn('"arcface_gallery_feature_counts"', backend)
 
-    def test_map_trail_stays_continuous_during_short_localization_hold(self):
+    def test_demo_map_shows_only_points_every_five_seconds(self):
         script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
 
-        self.assertIn("floorTrailLastSeen", script)
-        self.assertIn("now - lastSeenAt > 4500", script)
-        self.assertNotIn("last.source !== person.position_source_camera", script)
-        self.assertIn("person.position_estimated", script)
-        self.assertIn("定位保持", script)
-        self.assertIn("breakBefore", script)
+        self.assertIn("MAP_DISPLAY_INTERVAL_MS = 5000", script)
+        self.assertIn("nextMapDisplayAt = performance.now() + MAP_DISPLAY_INTERVAL_MS", script)
+        self.assertIn("mapPoint(floorMap, [person.x, person.y])", script)
+        self.assertNotIn('createSvg("polyline"', script)
 
     def test_monitoring_page_has_recording_dialog_and_api_controls(self):
         template = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")

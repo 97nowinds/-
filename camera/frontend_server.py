@@ -34,6 +34,7 @@ ANNOTATE_TEMPLATE = ROOT / "templates" / "annotate.html"
 FACES_TEMPLATE = ROOT / "templates" / "faces.html"
 RECORDINGS_TEMPLATE = ROOT / "templates" / "recordings.html"
 STATIC = ROOT / "static"
+INSTRUMENT_CONFIG = ROOT / "config" / "instruments.json"
 
 # Contains no camera content or people. This lets the handoff consumer verify
 # its allowlist, MIME checks and download path before real frames are shared.
@@ -483,6 +484,9 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         if route == "/api/interaction-results/latest":
             self._proxy_interaction_results(parsed.query)
             return
+        if route == "/api/instruments/anchors":
+            self._send_json(json.loads(INSTRUMENT_CONFIG.read_text(encoding="utf-8")))
+            return
         if route == "/":
             self._send_html(TEMPLATE, requested_api)
             return
@@ -502,6 +506,7 @@ class FrontendHandler(SimpleHTTPRequestHandler):
                 content_type = {
                     ".css": "text/css; charset=utf-8",
                     ".js": "application/javascript; charset=utf-8",
+                    ".json": "application/json; charset=utf-8",
                 }.get(candidate.suffix, "application/octet-stream")
                 self._send_file(candidate, content_type)
                 return

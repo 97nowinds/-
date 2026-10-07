@@ -1,8 +1,10 @@
 import unittest
+from pathlib import Path
 
 import numpy as np
 
 from association import AssociationObservation, AssociationTarget, BatchAssociator
+from floor_map import FloorMapProjector
 from mtmc_config import load_mtmc_config
 from reid_gallery import TrackFeatureGallery
 
@@ -92,6 +94,146 @@ class BatchAssociationTests(unittest.TestCase):
         self.assertFalse(decisions[0]["accepted"])
         self.assertEqual(evaluations[0]["reason"], "topology_rejected")
 
+    def test_handoff_requires_source_exit_and_target_entry_gates(self):
+        transitions = [{
+            "from": "cam_1", "to": "cam_2", "max_gap_seconds": 8,
+            "image_handoff_gates": {
+                "cam_1": {"exit": {"points": [[0.7, 0.7], [1, 0.7], [1, 1], [0.7, 1]]}},
+                "cam_2": {"entry": {"points": [[0, 0], [0.3, 0], [0.3, 0.3], [0, 0.3]]}},
+            },
+        }]
+        associator = BatchAssociator(self.config, transitions, "approximate")
+        observation = self.observation(10, [1, 0])
+        target = self.target("person_1", [1, 0])
+        observation.image_anchor = {"x": 0.15, "y": 0.15}
+        target.image_anchor = {"x": 0.5, "y": 0.5}
+
+        rejected, evaluations = associator.associate([observation], [target])
+        self.assertFalse(rejected[0]["accepted"])
+        self.assertEqual(evaluations[0]["reason"], "source_not_in_handoff_exit_gate")
+
+        target.image_anchor = {"x": 0.85, "y": 0.85}
+        accepted, evaluations = associator.associate([observation], [target])
+        self.assertTrue(accepted[0]["accepted"])
+        self.assertTrue(evaluations[0]["source_in_handoff_gate"])
+        self.assertTrue(evaluations[0]["target_in_handoff_gate"])
+
+    def test_recent_source_exit_gate_survives_short_source_track_loss(self):
+        transition = {
+            "from": "cam_1", "to": "cam_2", "max_gap_seconds": 2.0,
+            "image_handoff_gates": {
+                "cam_1": {"exit": {"points": [[0, 0], [0.5, 0], [0.5, 1], [0, 1]]}},
+                "cam_2": {"entry": {"points": [[0.5, 0], [1, 0], [1, 1], [0.5, 1]]}},
+            },
+        }
+        associator = BatchAssociator(self.config, [transition])
+        observation = AssociationObservation(
+            camera_id="cam_2", local_id=2, monotonic_time=11.0,
+            appearance=np.array([1.0, 0.0]), image_anchor={"x": 0.8, "y": 0.5},
+        )
+        target = AssociationTarget(
+            global_id="person_1", camera_id="cam_1", last_seen=10.9,
+            appearance=np.array([1.0, 0.0]), image_anchor={"x": 0.8, "y": 0.5},
+            recent_exit_gates={"cam_2": 10.7},
+        )
+        evaluation = associator.evaluate(observation, target)
+        self.assertTrue(evaluation["eligible"])
+        self.assertFalse(evaluation["source_in_handoff_gate"])
+        self.assertTrue(evaluation["source_exit_gate_recent"])
+
+    def test_handoff_exit_grace_is_limited_to_original_source_and_deadline(self):
+        transition = {
+            "from": "cam_2", "to": "cam_1", "max_gap_seconds": 8.0,
+            "image_handoff_gates": {
+                "cam_2": {"exit": {"points": [[0, 0], [0.4, 0], [0.4, 1], [0, 1]]}},
+                "cam_1": {"entry": {"points": [[0, 0], [0.4, 0], [0.4, 1], [0, 1]]}},
+            },
+        }
+        associator = BatchAssociator(self.config, [transition], "approximate")
+        observation = AssociationObservation(
+            camera_id="cam_1", local_id=1, monotonic_time=4.1,
+            appearance=np.array([1.0, 0.0]), image_anchor={"x": 0.2, "y": 0.5},
+            handoff_exit_grace={"person_1": 5.0},
+        )
+        original = AssociationTarget(
+            global_id="person_1", camera_id="cam_2", last_seen=3.8,
+            appearance=np.array([1.0, 0.0]), image_anchor={"x": 0.8, "y": 0.5},
+            recent_exit_gates={"cam_1": 1.0},
+        )
+        other = AssociationTarget(
+            global_id="person_2", camera_id="cam_2", last_seen=3.8,
+            appearance=np.array([1.0, 0.0]), image_anchor={"x": 0.8, "y": 0.5},
+            recent_exit_gates={"cam_1": 1.0},
+        )
+        self.assertTrue(associator.evaluate(observation, original)["eligible"])
+        self.assertTrue(associator.evaluate(observation, original)["source_exit_gate_grace"])
+        self.assertEqual(
+            associator.evaluate(observation, other)["reason"],
+            "source_not_in_handoff_exit_gate",
+        )
+        observation.monotonic_time = 5.1
+        self.assertEqual(
+            associator.evaluate(observation, original)["reason"],
+            "source_not_in_handoff_exit_gate",
+        )
+
+    def test_recorded_cam1_ingress_is_eligible_even_without_map_position(self):
+        floor = FloorMapProjector.from_path(
+            Path(__file__).resolve().parents[1] / "config" / "floor_map.json"
+        )
+        transitions = floor.config["camera_transitions"]
+        associator = BatchAssociator(self.config, transitions, "approximate")
+        for source_camera, anchor in (
+            ("cam_2", {"x": (33 + 99 / 2) / 768, "y": (62 + 366) / 432}),
+            ("cam_entrance", {"x": (134 + 116 / 2) / 768, "y": (75 + 352) / 432}),
+        ):
+            with self.subTest(source_camera=source_camera):
+                observation = self.observation(10, [1, 0], camera="cam_1", now=11)
+                observation.image_anchor = anchor
+                observation.position = None
+                target = self.target("person_1", [1, 0], camera=source_camera, seen=10.9)
+                target.recent_exit_gates = {"cam_1": 10.8}
+                # Cam2 has already lost the white track; the entrance still
+                # sees the black track during its physical overlap with Cam1.
+                target.active_camera_ids = (
+                    {source_camera} if source_camera == "cam_entrance" else set()
+                )
+                evaluation = associator.evaluate(observation, target)
+                self.assertTrue(evaluation["eligible"])
+                self.assertTrue(evaluation["target_in_handoff_gate"])
+                self.assertTrue(evaluation["source_exit_gate_recent"])
+
+                observation.image_anchor = {"x": 0.77, "y": 0.60}
+                wrong_person = associator.evaluate(observation, target)
+                self.assertEqual(wrong_person["reason"], "target_not_in_handoff_entry_gate")
+
+                observation.image_anchor = {"x": anchor["x"], "y": 431 / 432}
+                self.assertTrue(associator.evaluate(observation, target)["eligible"])
+
+    def test_recorded_entrance_ingress_matches_cam2_before_cam1(self):
+        floor = FloorMapProjector.from_path(
+            Path(__file__).resolve().parents[1] / "config" / "floor_map.json"
+        )
+        associator = BatchAssociator(
+            self.config, floor.config["camera_transitions"], "approximate"
+        )
+        observation = self.observation(24, [1, 0], camera="cam_entrance", now=11)
+        observation.image_anchor = {
+            "x": (19 + 111 / 2) / 960,
+            "y": (98 + 438) / 540,
+        }
+        observation.position = None
+        target = self.target("black_shirt", [1, 0], camera="cam_2", seen=10.9)
+        target.recent_exit_gates = {"cam_entrance": 10.8}
+        target.active_camera_ids = {"cam_2"}
+        self.assertTrue(associator.evaluate(observation, target)["eligible"])
+
+        observation.image_anchor = {"x": (255 + 88 / 2) / 960, "y": (1 + 185) / 540}
+        self.assertEqual(
+            associator.evaluate(observation, target)["reason"],
+            "target_not_in_handoff_entry_gate",
+        )
+
     def test_formal_geometry_rejects_impossible_distance(self):
         associator = BatchAssociator(self.config, self.transitions, "formal")
         observation = self.observation(10, [1, 0])
@@ -114,6 +256,26 @@ class BatchAssociationTests(unittest.TestCase):
             evaluations[0]["reason"],
             "simultaneous_cross_camera_without_formal_overlap",
         )
+
+    def test_clear_dark_light_conflict_rejects_even_perfect_reid(self):
+        associator = BatchAssociator(
+            self.config,
+            [{"from": "cam_2", "to": "cam_entrance", "max_gap_seconds": 8,
+              "simultaneous_overlap_validated": True}],
+            "approximate",
+        )
+        observation = self.observation(10, [1, 0], camera="cam_entrance", now=2)
+        observation.clothing_tone = "light"
+        target = self.target("person_1", [1, 0], camera="cam_2", seen=2)
+        target.clothing_tone = "dark"
+        target.active_camera_ids = {"cam_2"}
+
+        decision, evaluations = associator.associate([observation], [target])
+
+        self.assertFalse(decision[0]["accepted"])
+        self.assertEqual(evaluations[0]["reason"], "clothing_tone_mismatch")
+        observation.clothing_tone = "dark"
+        self.assertTrue(associator.associate([observation], [target])[0][0]["accepted"])
 
     def test_manually_validated_overlap_allows_strong_reid_only_match(self):
         transitions = [

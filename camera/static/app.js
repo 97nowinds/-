@@ -60,8 +60,12 @@ const remoteStream = location.hostname.startsWith("100.") ||
   new URLSearchParams(location.search).get("remote") === "1";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const FLOOR_VIEWBOX = {width: 1200, height: 700};
+const MAP_DISPLAY_INTERVAL_MS = 5000;
+let nextMapDisplayAt = 0;
 const floorTrails = new Map();
 const floorTrailLastSeen = new Map();
+const floorTrailPendingBreak = new Set();
+let lastRenderedReplayCycle = null;
 let floorMapSignature = "";
 let latestRecording = null;
 let latestCameras = [];
@@ -71,6 +75,8 @@ let floorPeopleListSignature = "";
 let eventFeedSignature = "";
 let latestInteractionEvents = [];
 let latestInteractionErrors = [];
+let instrumentAnchors = [];
+let instrumentAnchorsFetchedAt = 0;
 let interactionFetchPending = false;
 let interactionLastFetchMs = 0;
 let synchronizedReplayEnabled = false;
@@ -102,6 +108,14 @@ function updateDashboardClock() {
 
 updateDashboardClock();
 window.setInterval(updateDashboardClock, 1000);
+
+// The map backend publishes the newest confirmed track state every 50 ms.
+// Video preview has its own stream and the demonstration map intentionally
+// samples a point every five seconds. A 2 Hz compact status refresh keeps
+// controls responsive without making JSON parsing compete with MJPEG decode.
+const DASHBOARD_REFRESH_INTERVAL_MS = 500;
+const SERVICE_DISCONNECT_FAILURES = 3;
+let consecutiveStateFailures = 0;
 
 function formatElapsed(seconds) {
   const total = Math.max(0, Math.floor(Number(seconds) || 0));
@@ -248,14 +262,17 @@ function floorMapLabel(item) {
 
 async function fetchState() {
   const [response, hardwareResponse] = await Promise.all([
-    fetch(`${API_BASE}/api/state`, {cache: "no-store"}),
+    fetch(`${API_BASE}/api/dashboard`, {cache: "no-store"}),
     HARDWARE_URL
       ? fetch(HARDWARE_URL, {cache: "no-store"}).catch(() => null)
       : Promise.resolve(null),
   ]);
   if (!response.ok) throw new Error("状态接口不可用");
   const state = await response.json();
-  if (hardwareResponse?.ok) state.environment = await hardwareResponse.json();
+  if (hardwareResponse?.ok) {
+    const environment = await hardwareResponse.json().catch(() => null);
+    if (environment) state.environment = environment;
+  }
   state.interaction_events = latestInteractionEvents;
   state.interaction_errors = latestInteractionErrors;
   return state;
@@ -263,6 +280,13 @@ async function fetchState() {
 
 function refreshInteractionResults() {
   const now = Date.now();
+  if (now - instrumentAnchorsFetchedAt >= 30000) {
+    instrumentAnchorsFetchedAt = now;
+    fetch("/api/instruments/anchors", {cache: "no-store"})
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("instrument anchors unavailable")))
+      .then((payload) => { instrumentAnchors = Array.isArray(payload?.instruments) ? payload.instruments : []; })
+      .catch(() => { instrumentAnchors = []; });
+  }
   if (interactionFetchPending || now - interactionLastFetchMs < 1000) return;
   interactionFetchPending = true;
   interactionLastFetchMs = now;
@@ -415,13 +439,24 @@ function updateFloorTrails(floorMap) {
   const activeIds = new Set();
   for (const person of floorMap.people || []) {
     activeIds.add(person.track_id);
+    if (person.map_visible === false) {
+      floorTrailPendingBreak.add(person.track_id);
+      continue;
+    }
     const history = floorTrails.get(person.track_id) || [];
     const last = history.at(-1);
     const lastSeenAt = floorTrailLastSeen.get(person.track_id);
     const breakBefore = Boolean(
-      last && lastSeenAt && now - lastSeenAt > 4500
+      last && (
+        (lastSeenAt && now - lastSeenAt > 4500) ||
+        person.position_discontinuity ||
+        floorTrailPendingBreak.has(person.track_id) ||
+        (last.source && person.position_source_camera &&
+          last.source !== person.position_source_camera &&
+          Math.hypot(person.x - last.x, person.y - last.y) > 1.5)
+      )
     );
-    const moved = !last || Math.hypot(person.x - last.x, person.y - last.y) >= 0.08;
+    const moved = !last || breakBefore || Math.hypot(person.x - last.x, person.y - last.y) >= 0.08;
     if (moved || breakBefore) {
       history.push({
         x: person.x,
@@ -432,12 +467,14 @@ function updateFloorTrails(floorMap) {
       });
     }
     floorTrailLastSeen.set(person.track_id, now);
+    floorTrailPendingBreak.delete(person.track_id);
     floorTrails.set(person.track_id, history.filter((point) => now - point.at < 30000).slice(-30));
   }
   for (const [trackId, history] of floorTrails) {
     if (!activeIds.has(trackId) && (!history.length || now - history.at(-1).at > 10000)) {
       floorTrails.delete(trackId);
       floorTrailLastSeen.delete(trackId);
+      floorTrailPendingBreak.delete(trackId);
     }
   }
 }
@@ -446,7 +483,7 @@ function renderFloorMap(floorMap) {
   if (!floorMap) return;
   renderFloorPlan(floorMap);
   updateFloorTrails(floorMap);
-  floorMapMode.textContent = floorMap.calibrated ? "四点标定" : "示意映射";
+  floorMapMode.textContent = floorMap.calibrated ? "四点标定 · 5秒采样" : "示意映射 · 5秒采样";
   floorMapMode.className = floorMap.calibrated ? "calibrated" : "schematic";
   const countedPeople = Number.isFinite(Number(floorMap.counted_people))
     ? Number(floorMap.counted_people)
@@ -455,32 +492,8 @@ function renderFloorMap(floorMap) {
   floorMapPeopleLayer.replaceChildren();
   floorMapTrailsLayer.replaceChildren();
 
-  for (const [trackId, history] of floorTrails) {
-    if (history.length < 2) continue;
-    const active = floorMap.people.find((person) => person.track_id === trackId);
-    const segments = [];
-    let segment = [];
-    for (const point of history) {
-      if (point.breakBefore && segment.length) {
-        segments.push(segment);
-        segment = [];
-      }
-      segment.push(point);
-    }
-    if (segment.length) segments.push(segment);
-    for (const pointsInSegment of segments.filter((points) => points.length >= 2)) {
-      const points = pointsInSegment.map((point) => {
-        const mapped = mapPoint(floorMap, [point.x, point.y]);
-        return `${mapped.x},${mapped.y}`;
-      }).join(" ");
-      floorMapTrailsLayer.appendChild(createSvg("polyline", {
-        points,
-        class: `map-trail ${active?.identified ? "identified" : "unknown"}`,
-      }));
-    }
-  }
-
   for (const person of floorMap.people) {
+    if (person.map_visible === false) continue;
     const point = mapPoint(floorMap, [person.x, person.y]);
     const estimatedPositionClass = person.localization_state === "held"
       ? "held"
@@ -492,6 +505,7 @@ function renderFloorMap(floorMap) {
     const group = createSvg("g", {
       class: `map-person ${person.identified ? "identified" : "unknown"} ${estimatedPositionClass}`,
       transform: `translate(${point.x} ${point.y})`,
+      "data-map-track": person.track_id,
     });
     group.appendChild(createSvg("circle", {r: 42, class: "map-person-halo"}));
     group.appendChild(createSvg("circle", {r: 25, class: "map-person-dot"}));
@@ -508,6 +522,8 @@ function renderFloorMap(floorMap) {
     person.identity_lock_status,
     person.count_status,
     person.counted,
+    person.handoff_waiting,
+    person.map_visible,
   ]));
   if (nextFloorPeopleListSignature === floorPeopleListSignature) return;
   floorPeopleListSignature = nextFloorPeopleListSignature;
@@ -516,7 +532,7 @@ function renderFloorMap(floorMap) {
       <div class="floor-person-row">
         <span class="floor-person-indicator ${person.identified ? "identified" : "unknown"}"></span>
         <strong>${escapeHtml(personLabel(person))}</strong>
-        <span class="floor-person-location">${escapeHtml(["内侧通道", "后端操作区"].includes(person.zone) ? "侧向通道" : person.zone)} · ${escapeHtml(person.cameras.join(" + "))}${person.localization_state === "predicted" ? " · 短暂预测" : person.localization_state === "held" ? " · 定位保持" : person.position_estimated ? " · 脚点估算" : ""}</span>
+        <span class="floor-person-location">${escapeHtml(person.map_visible === false ? "位置待确认" : ["内侧通道", "后端操作区"].includes(person.zone) ? "侧向通道" : person.zone)} · ${escapeHtml(person.cameras.join(" + "))}${person.position_source === "instrument_anchor" ? ` · ${escapeHtml(person.instrument_name)}仪器定位 ${person.position_score.toFixed(2)}` : person.handoff_waiting ? " · 跨摄定位中" : person.localization_state === "predicted" ? " · 短暂预测" : person.localization_state === "held" ? " · 定位保持" : person.position_estimated ? " · 脚点估算" : ""}</span>
         <span class="floor-person-lock ${person.identity_lock_status === "locked" ? "locked" : "visual"}">${person.identity_lock_status === "locked" ? "已锁定" : person.count_status === "duplicate_suppressed" ? "跨摄疑似重复 · 不计数" : person.counted === false ? "临时候选 · 不计数" : "视觉追踪"}</span>
       </div>
     `).join("")
@@ -774,6 +790,17 @@ function configureSynchronizedReplay(state) {
 function update(state) {
   if (videoGrid.children.length !== state.cameras.length) renderInitial(state);
   configureSynchronizedReplay(state);
+  const replayCycles = state.cameras.map((camera) => camera.replay?.enabled ? camera.replay.cycle : null);
+  if (replayCycles.length && replayCycles.every((cycle) => cycle != null && cycle === replayCycles[0])) {
+    const cycle = replayCycles[0];
+    if (lastRenderedReplayCycle != null && cycle !== lastRenderedReplayCycle) {
+      floorTrails.clear();
+      floorTrailLastSeen.clear();
+      floorTrailPendingBreak.clear();
+      nextMapDisplayAt = 0;
+    }
+    lastRenderedReplayCycle = cycle;
+  }
   renderPeopleList(state.people || []);
   const runningCount = state.cameras.filter((camera) => camera.status === "running").length;
   cameraSummary.textContent = `${runningCount}/${state.cameras.length} 路正常`;
@@ -784,7 +811,10 @@ function update(state) {
   handoffSummary.textContent = handoff
     ? `${handoff.identity.handoff_from_camera} → ${handoff.id} · ${identityText(handoff.identity)}`
     : "等待重叠区继承";
-  renderFloorMap(state.floor_map);
+  if (performance.now() >= nextMapDisplayAt) {
+    renderFloorMap(InstrumentLocation.apply(state.floor_map, latestInteractionEvents, instrumentAnchors));
+    nextMapDisplayAt = performance.now() + MAP_DISPLAY_INTERVAL_MS;
+  }
   renderRecording(state.recording, state.cameras);
   renderEnvironment(state.environment);
   renderEventFeed(state);
@@ -800,20 +830,32 @@ function update(state) {
     const latency = camera.processing_latency_ms == null ? "-" : camera.processing_latency_ms;
     card.querySelector(".camera-fps").textContent = `采 ${camera.capture_fps || 0}/显 ${camera.preview_fps || 0}/算 ${camera.fps || 0} FPS · ${latency}ms · 丢 ${camera.dropped_frames || 0}`;
   }
-  serviceState.textContent = "服务在线";
-  serviceState.className = "service-state online";
 }
 
 async function refresh() {
   try {
     refreshInteractionResults();
-    update(await fetchState());
+    let state;
+    try {
+      state = await fetchState();
+    } catch (error) {
+      consecutiveStateFailures += 1;
+      const disconnected = consecutiveStateFailures >= SERVICE_DISCONNECT_FAILURES;
+      serviceState.textContent = disconnected ? "服务断开" : "刷新延迟";
+      serviceState.className = `service-state ${disconnected ? "error" : "delayed"}`;
+      return;
+    }
+    consecutiveStateFailures = 0;
+    update(state);
+    serviceState.textContent = "服务在线";
+    serviceState.className = "service-state online";
   } catch (error) {
-    serviceState.textContent = "服务断开";
-    serviceState.className = "service-state error";
+    // A rendering error does not indicate that the state API is disconnected.
+    console.error("监控页面刷新失败", error);
   } finally {
-    // 与后端 200 ms 地图发布节奏对齐；录像画面由独立的同步批次循环更新。
-    window.setTimeout(refresh, 200);
+    // Video preview uses its own synchronized loop.  This is only state/map
+    // refresh and must stay below the backend's 50 ms publication rate.
+    window.setTimeout(refresh, DASHBOARD_REFRESH_INTERVAL_MS);
   }
 }
 
