@@ -34,19 +34,20 @@
       "bidirectional": true,
       "image_handoff_gates": {
         "cam_entrance": {
-          "entry": {"points": [[0.54691, 0.47813], [0.746, 0.47813], [0.746, 0.97896], [0.54691, 0.97896]]},
-          "exit": {"points": [[0.54691, 0.47813], [0.746, 0.47813], [0.746, 0.97896], [0.54691, 0.97896]]}
+          "entry": {"points": [[0.54691, 0.47813], [0.746, 0.47813], [0.746, 1.0], [0.54691, 1.0]]},
+          "exit": {"points": [[0.54691, 0.47813], [0.746, 0.47813], [0.746, 1.0], [0.54691, 1.0]]}
         },
         "cam_1": {
-          "entry": {"points": [[0.05, 0.79], [0.50, 0.79], [0.72, 1.0], [0.05, 1.0]]},
+          "entry": {"points": [[0.05, 0.79], [0.5, 0.79], [0.72, 1.0], [0.05, 1.0]]},
           "exit": {"points": [[0.38, 0.9503], [0.65818, 0.92444], [0.75273, 0.38788], [0.67455, 0.34263]]}
         }
       },
       "simultaneous_overlap_validated": true,
-      "simultaneous_reid_threshold": 0.95,
+      "simultaneous_reid_threshold": 0.75,
       "spatial_handoff_max_age_seconds": 3,
       "spatial_handoff_max_distance_m": 12.0,
-      "spatial_handoff_similarity_threshold": 0.35
+      "spatial_handoff_similarity_threshold": 0.35,
+      "image_handoff_routes": [{"id": "front_to_rear", "image_handoff_gates": {"cam_1": {"entry": {"points": [[0.05, 0.79], [0.5, 0.79], [0.72, 1], [0.05, 1]]}, "exit": {"points": [[0.05, 0.79], [0.5, 0.79], [0.72, 1], [0.05, 1]]}}, "cam_entrance": {"entry": {"points": [[0, 0.25], [0.29, 0.25], [0.29, 0.6], [0, 0.6]]}, "exit": {"points": [[0, 0.25], [0.29, 0.25], [0.29, 0.6], [0, 0.6]]}}}}, {"id": "secondary", "temporal_overlap_min_similarity": 0.62, "image_handoff_gates": {"cam_1": {"entry": {"points": [[0, 0], [0.24, 0], [0.24, 0.65], [0, 0.65]]}, "exit": {"points": [[0, 0], [0.24, 0], [0.24, 0.65], [0, 0.65]]}}, "cam_entrance": {"entry": {"points": [[0, 0.55], [0.29, 0.55], [0.29, 1], [0, 1]]}, "exit": {"points": [[0, 0.55], [0.29, 0.55], [0.29, 1], [0, 1]]}}}}]
     },
     {
       "from": "cam_entrance",
@@ -56,7 +57,7 @@
       "image_handoff_gates": {
         "cam_entrance": {
           "entry": {"points": [[0.0, 0.55], [0.45, 0.55], [0.5, 1.0], [0.0, 1.0]]},
-          "exit": {"points": [[0.54691, 0.47813], [0.746, 0.47813], [0.746, 0.97896], [0.54691, 0.97896]]}
+          "exit": {"points": [[0.54691, 0.47813], [0.746, 0.47813], [0.746, 1.0], [0.54691, 1.0]]}
         },
         "cam_2": {
           "entry": {"points": [[0.5074, 0.44726], [0.83721, 0.44726], [0.7315, 1.0], [0.5074, 1.0]]},
@@ -64,10 +65,11 @@
         }
       },
       "simultaneous_overlap_validated": true,
-      "simultaneous_reid_threshold": 0.95,
+      "simultaneous_reid_threshold": 0.75,
       "spatial_handoff_max_age_seconds": 3,
       "spatial_handoff_max_distance_m": 2.5,
-      "spatial_handoff_similarity_threshold": 0.35
+      "spatial_handoff_similarity_threshold": 0.35,
+      "image_handoff_routes": [{"id": "secondary", "image_handoff_gates": {"cam_2": {"entry": {"points": [[0.5, 0.24], [0.7, 0.24], [0.7, 0.52], [0.5, 0.52]]}, "exit": {"points": [[0.5, 0.24], [0.7, 0.24], [0.7, 0.52], [0.5, 0.52]]}}, "cam_entrance": {"entry": {"points": [[0, 0.25], [0.29, 0.25], [0.29, 0.6], [0, 0.6]]}, "exit": {"points": [[0, 0.25], [0.29, 0.25], [0.29, 0.6], [0, 0.6]]}}}}]
     },
     {
       "from": "cam_1",
@@ -76,7 +78,7 @@
       "bidirectional": true,
       "image_handoff_gates": {
         "cam_1": {
-          "entry": {"points": [[0.05, 0.79], [0.50, 0.79], [0.72, 1.0], [0.05, 1.0]]},
+          "entry": {"points": [[0.05, 0.79], [0.5, 0.79], [0.72, 1.0], [0.05, 1.0]]},
           "exit": {"points": [[0.38, 0.9503], [0.65818, 0.92444], [0.75273, 0.38788], [0.67455, 0.34263]]}
         },
         "cam_2": {
@@ -84,7 +86,9 @@
           "exit": {"points": [[0.5074, 0.44726], [0.83721, 0.44726], [0.7315, 1.0], [0.5074, 1.0]]}
         }
       },
-      "simultaneous_overlap_validated": false
+      "simultaneous_overlap_validated": false,
+      "simultaneous_reid_threshold": 0.75,
+      "image_handoff_routes": [{"id": "secondary", "simultaneous_overlap_validated": true, "simultaneous_reid_threshold": 0.75, "temporal_overlap_min_similarity": 0.62, "image_handoff_gates": {"cam_1": {"entry": {"points": [[0, 0], [0.24, 0], [0.24, 0.65], [0, 0.65]]}, "exit": {"points": [[0, 0], [0.24, 0], [0.24, 0.65], [0, 0.65]]}}, "cam_2": {"entry": {"points": [[0.5, 0.24], [0.7, 0.24], [0.7, 0.52], [0.5, 0.52]]}, "exit": {"points": [[0.5, 0.24], [0.7, 0.24], [0.7, 0.52], [0.5, 0.52]]}}}}]
     }
   ],
   "zones": [

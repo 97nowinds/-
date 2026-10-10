@@ -1,12 +1,24 @@
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from mtmc_events import AssociationEventStore
 
 
 class AssociationEventStoreTests(unittest.TestCase):
+    def test_async_writer_flushes_ordered_events_on_close(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', {'LAB_ASYNC_EVENT_WRITES': '1'}):
+            path = Path(directory) / 'events.jsonl'
+            store = AssociationEventStore(path)
+            for i in range(50):
+                store.record('create', global_id=f'person_{i}')
+            store.close()
+            rows = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+            self.assertEqual([r['sequence'] for r in rows], list(range(1,51)))
+            self.assertIsNone(store.summary()['write_error'])
+
     def test_records_and_restores_history_without_live_state(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.jsonl"

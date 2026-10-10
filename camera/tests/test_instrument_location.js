@@ -13,6 +13,19 @@ const event = {
   interaction_confidence: 0.98, observed_at: "2026-09-24T12:59:59Z",
 };
 
+test("unmatched exact result cannot borrow the raw track id for map fusion", () => {
+  const result = evaluate(person, {...event, track_id: person.track_id,
+    handoff_match_status: "unmatched"}, anchor, now);
+  assert.equal(result, null);
+});
+
+test("matched result uses resolved global id rather than camera local track id", () => {
+  assert.notEqual(evaluate(person, {...event, track_id: "7",
+    handoff_match_status: "matched"}, anchor, now), null);
+  assert.equal(evaluate(person, {...event, global_id: "other-global", track_id: person.track_id,
+    handoff_match_status: "matched"}, anchor, now), null);
+});
+
 test("confirmed instrument use can override an approximate map point", () => {
   const floorMap = {width_m: 12, height_m: 7, people: [person]};
   const result = apply(floorMap, [event], [anchor], now).people[0];

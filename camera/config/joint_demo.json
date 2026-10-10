@@ -1,0 +1,20 @@
+{
+  "scope": "joint-demo-minimal-r1",
+  "image_base": "http://192.168.31.127:5175",
+  "jpeg_retention_seconds": 60,
+  "location_max_delta_seconds": 1.0,
+  "bbox_max_delta_seconds": 1.0,
+  "hd_pair_max_delta_seconds": 0.5,
+  "inference_start_max_age_seconds": 2.0,
+  "result_ttl_seconds": 5.0,
+  "sync_refresh_seconds": null,
+  "sync_valid_seconds": null,
+  "sync_max_uncertainty_ms": null,
+  "sync_jump_limit_ms": null,
+  "result_publish_max_age_seconds": null,
+  "alignment": {},
+  "zone_revision": null,
+  "receiver_schema_file": null,
+  "alignment_verified": false,
+  "automatic_enabled": false
+}

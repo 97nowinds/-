@@ -2,6 +2,9 @@
 
 from collections import Counter, deque
 import json
+import atexit
+import os
+import queue
 from pathlib import Path
 import threading
 import time
@@ -36,6 +39,35 @@ class AssociationEventStore:
         self.next_sequence = 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._load_history()
+        self.write_queue = None
+        self.write_error = None
+        if os.environ.get("LAB_ASYNC_EVENT_WRITES") == "1":
+            self.write_queue = queue.Queue()
+            self.writer = threading.Thread(target=self._write_loop, daemon=True, name="mtmc-event-writer")
+            self.writer.start()
+            atexit.register(self.close)
+
+    def _write_loop(self):
+        try:
+            with self.path.open("a", encoding="utf-8") as handle:
+                while True:
+                    line = self.write_queue.get()
+                    if line is None:
+                        handle.flush()
+                        self.write_queue.task_done()
+                        return
+                    handle.write(line)
+                    # Batch queued events into one flush on the network filesystem.
+                    if self.write_queue.empty():
+                        handle.flush()
+                    self.write_queue.task_done()
+        except Exception as error:
+            self.write_error = str(error)
+
+    def close(self):
+        if self.write_queue is not None and self.writer.is_alive():
+            self.write_queue.put(None)
+            self.writer.join(timeout=10)
 
     def _load_history(self):
         if not self.path.exists():
@@ -76,8 +108,14 @@ class AssociationEventStore:
                 }
             )
             self.next_sequence += 1
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+            line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+            if self.write_queue is not None:
+                if self.write_error:
+                    raise OSError(self.write_error)
+                self.write_queue.put(line)
+            else:
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
             self.events.append(event)
             return dict(event)
 
@@ -107,4 +145,6 @@ class AssociationEventStore:
                 "top_rejection_reasons": dict(rejection_reasons.most_common(8)),
                 "persistence": "jsonl_history_only",
                 "live_tracks_restored": False,
+                "write_pending": self.write_queue.qsize() if self.write_queue is not None else 0,
+                "write_error": self.write_error,
             }

@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>实验室智能安全监测大屏</title>
+    <link rel="stylesheet" href="/static/styles.css?v=state-retry-20260923">
+    <script src="/static/instrument_location.js"></script>
+      <link rel="stylesheet" href="/static/display.css?v=original-layout-20261009">
+  </head>
+  <body class="presentation-only">
+    <main class="app-shell dashboard-shell">
+      <header class="topbar display-topbar">
+        <div class="display-clock" aria-label="当前时间">
+          <strong id="dashboardTime">--:--:--</strong>
+          <span id="dashboardDate">----年--月--日</span>
+        </div>
+        <div class="display-title">
+          <span>LABORATORY INTELLIGENT MONITORING</span>
+          <h1>实验室智能安全监测大屏</h1>
+          <p>人员识别 · 跨镜追踪 · 仪器交互 · 环境安全</p>
+        </div>
+        <div class="topbar-actions">
+          <button id="recordingControlButton" class="tool-link recording-launch" type="button">
+            <span class="recording-dot" aria-hidden="true"></span>
+            <span id="recordingControlLabel">录像</span>
+          </button>
+          <a id="recordingReviewLink" class="tool-link" href="/recordings">路线复核</a>
+          <a id="faceCaptureLink" class="tool-link" href="/faces">人脸采集</a>
+          <a id="calibrationLink" class="tool-link" href="/annotate">地图四点标定</a>
+          <span id="serviceState" class="service-state">连接中</span>
+        </div>
+      </header>
+
+      <section class="dashboard-layout">
+        <div class="display-main">
+          <aside class="floor-map-panel display-panel">
+          <header>
+            <div>
+              <span class="panel-index">01</span>
+              <h2>实验室实时位置</h2>
+              <span class="panel-caption">LIVE POSITION MAP</span>
+            </div>
+            <div class="map-header-status">
+              <span id="floorMapMode">示意映射</span>
+              <strong id="floorMapCount">0 人</strong>
+            </div>
+          </header>
+          <div class="floor-map-viewport">
+            <svg id="floorMapSvg" viewBox="0 0 1200 700" role="img" aria-label="实验室人员实时位置俯视图">
+              <g id="floorMapStatic"></g>
+              <g id="floorMapTrails"></g>
+              <g id="floorMapPeople"></g>
+            </svg>
+          </div>
+          <div class="floor-map-legend" aria-label="地图图例">
+            <span><i class="legend-person identified"></i>已确认</span>
+            <span><i class="legend-person unknown"></i>未注册</span>
+            <span><i class="legend-overlap"></i>重叠区</span>
+          </div>
+          <div id="floorMapPeopleList" class="floor-map-people-list">
+            <span class="empty">当前没有活动目标</span>
+          </div>
+          </aside>
+        </div>
+
+        <aside class="information-rail" aria-label="综合信息提示">
+          <section class="summary-grid display-panel">
+            <header class="rail-panel-header">
+              <h2>运行概览</h2>
+              <span>SYSTEM OVERVIEW</span>
+            </header>
+            <article>
+              <span>摄像头状态</span>
+              <strong id="cameraSummary">检查中</strong>
+            </article>
+            <article>
+              <span>当前识别身份</span>
+              <strong id="identitySummary">尚未确认</strong>
+            </article>
+            <article>
+              <span>跨镜头状态</span>
+              <strong id="handoffSummary">等待目标</strong>
+            </article>
+          </section>
+
+          <section class="environment-panel display-panel" aria-labelledby="environmentTitle">
+            <header>
+              <div>
+                <h2 id="environmentTitle">环境与火情监测</h2>
+                <span id="environmentDevice">HAFS 硬件未配置</span>
+              </div>
+              <strong id="environmentStatus" class="environment-status disabled">未接入</strong>
+            </header>
+            <div class="environment-grid">
+              <article>
+                <span>温度</span>
+                <strong id="temperatureValue">--.- ℃</strong>
+                <small id="temperatureState">等待 DHT 数据</small>
+              </article>
+              <article>
+                <span>湿度</span>
+                <strong id="humidityValue">--.- %</strong>
+                <small id="humidityState">等待 DHT 数据</small>
+              </article>
+              <article id="flameCard" class="flame-card">
+                <span>火焰触点</span>
+                <strong id="flameValue">未知</strong>
+                <small id="flameState">等待硬件状态</small>
+              </article>
+            </div>
+          </section>
+
+          <section class="event-panel display-panel">
+            <header class="rail-panel-header">
+              <h2>信息提示</h2>
+              <span>LIVE NOTIFICATIONS</span>
+            </header>
+            <div id="eventFeed" class="event-feed" aria-live="polite">
+              <div class="event-placeholder">等待实时状态数据</div>
+            </div>
+          </section>
+
+          <section class="people-panel display-panel">
+            <header>
+              <h2>已注册人员</h2>
+              <span>原有样本库</span>
+            </header>
+            <div id="peopleList" class="people-list"></div>
+          </section>
+        </aside>
+      </section>
+
+      <footer class="display-footer">
+        <span>AI VISION SAFETY PLATFORM</span>
+        <span>人员位置 · 仪器交互 · 环境状态持续更新</span>
+      </footer>
+    </main>
+
+    <dialog id="recordingDialog" class="recording-dialog" aria-labelledby="recordingDialogTitle">
+      <form id="recordingForm" class="recording-form">
+        <header class="recording-dialog-header">
+          <div>
+            <span class="recording-eyebrow">DatasetRecorder</span>
+            <h2 id="recordingDialogTitle">多摄像头同步录像</h2>
+          </div>
+          <button id="recordingCloseButton" class="dialog-close" type="button" aria-label="关闭">×</button>
+        </header>
+
+        <div id="recordingBanner" class="recording-banner idle" role="status">
+          <span class="recording-status-dot" aria-hidden="true"></span>
+          <div>
+            <strong id="recordingStatusTitle">尚未开始录像</strong>
+            <span id="recordingStatusDetail">开始前会检查所有摄像头是否在线</span>
+          </div>
+          <time id="recordingElapsed">00:00</time>
+        </div>
+
+        <div id="recordingCameraList" class="recording-camera-list" aria-label="录像摄像头状态"></div>
+
+        <label class="recording-field">
+          <span>录像编号</span>
+          <input id="recordingSubjectId" name="subject_id" type="text" maxlength="40"
+            pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,39}" placeholder="例如 base_ent_cam1_01" required>
+          <small>仅允许字母、数字、下划线和短横线，作为录像目录名称。</small>
+        </label>
+
+        <label class="recording-field">
+          <span>路线与备注</span>
+          <textarea id="recordingNotes" name="notes" maxlength="300" rows="3"
+            placeholder="例如 worker_001，cam_entrance → cam_1，单人基准"></textarea>
+        </label>
+
+        <div id="recordingSessionDetails" class="recording-session-details" hidden>
+          <div><span>会话</span><strong id="recordingSessionId">—</strong></div>
+          <div><span>保存目录</span><strong id="recordingDirectory">—</strong></div>
+          <div><span>已写入</span><strong id="recordingFrameCount">0 帧</strong></div>
+        </div>
+
+        <p id="recordingError" class="recording-error" role="alert" hidden></p>
+
+        <footer class="recording-actions">
+          <button id="recordingCancelButton" class="secondary-button" type="button">关闭</button>
+          <button id="recordingStopButton" class="recording-stop-button" type="button" hidden>停止并保存</button>
+          <button id="recordingStartButton" class="recording-start-button" type="submit">开始三路录像</button>
+        </footer>
+      </form>
+    </dialog>
+    <script src="/static/app.js?v=display-no-video-20261009"></script>
+  </body>
+</html>

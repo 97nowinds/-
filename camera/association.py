@@ -1,6 +1,6 @@
 """Deterministic, one-to-one association for small multi-camera batches."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 
 import numpy as np
@@ -24,6 +24,8 @@ class AssociationObservation:
     excluded_global_ids: set = field(default_factory=set)
     handoff_exit_grace: dict = field(default_factory=dict)
     clothing_tone: str = None
+    box: tuple = None
+    recent_entry_gates: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -42,6 +44,9 @@ class AssociationTarget:
     image_anchor: dict = None
     recent_exit_gates: dict = field(default_factory=dict)
     clothing_tone: str = None
+    camera_observations: dict = field(default_factory=dict)
+    box: tuple = None
+    pixel_velocity: tuple = None
 
 
 def _cosine(first, second):
@@ -125,6 +130,21 @@ class BatchAssociator:
         self.transitions = list(transitions or [])
         self.calibration_status = calibration_status
         for transition in self.transitions:
+            route_ids = set()
+            for route in transition.get("image_handoff_routes", []):
+                route_id = route.get("id")
+                if not isinstance(route_id, str) or not route_id or "|" in route_id or route_id in route_ids:
+                    raise ValueError("handoff route ids must be unique nonempty strings without |")
+                route_ids.add(route_id)
+                for camera_id in (transition.get("from"), transition.get("to")):
+                    gates = route.get("image_handoff_gates", {}).get(camera_id, {})
+                    if not all(gates.get(direction) for direction in ("entry", "exit")):
+                        raise ValueError("paired handoff routes require both cameras' entry and exit gates")
+        for transition in [variant for item in self.transitions for _, variant in self._handoff_routes(item)]:
+            if "temporal_overlap_min_similarity" in transition:
+                threshold = float(transition["temporal_overlap_min_similarity"])
+                if not self.reid["medium_similarity"] <= threshold <= float(transition.get("simultaneous_reid_threshold", self.reid["high_similarity"])):
+                    raise ValueError("temporal overlap threshold must be between medium and simultaneous high similarity")
             if "simultaneous_reid_threshold" in transition:
                 threshold = float(transition["simultaneous_reid_threshold"])
                 if not 0.0 <= threshold <= 1.0:
@@ -138,16 +158,19 @@ class BatchAssociator:
                     value = gate.get(direction)
                     if value is None:
                         continue
-                    points = value.get("points") if isinstance(value, dict) else None
-                    if not isinstance(points, list) or len(points) < 3:
+                    polygons = self._gate_polygons(value)
+                    if not polygons:
                         raise ValueError("handoff gate must contain at least three normalized points")
-                    for point in points:
-                        if (
-                            not isinstance(point, (list, tuple))
-                            or len(point) != 2
-                            or not all(isinstance(item, (int, float)) and 0.0 <= item <= 1.0 for item in point)
-                        ):
-                            raise ValueError("handoff gate points must be normalized x/y pairs")
+                    for points in polygons:
+                        if not isinstance(points, list) or len(points) < 3:
+                            raise ValueError("handoff gate must contain at least three normalized points")
+                        for point in points:
+                            if (
+                                not isinstance(point, (list, tuple))
+                                or len(point) != 2
+                                or not all(isinstance(item, (int, float)) and 0.0 <= item <= 1.0 for item in point)
+                            ):
+                                raise ValueError("handoff gate points must be normalized x/y pairs")
 
     def _transition(self, source, target):
         if source == target:
@@ -186,7 +209,23 @@ class BatchAssociator:
         gate = (transition.get("image_handoff_gates") or {}).get(camera_id, {}).get(direction)
         if gate is None:
             return True
-        return self._point_in_polygon(anchor, gate["points"])
+        return any(self._point_in_polygon(anchor, points) for points in self._gate_polygons(gate))
+
+    @staticmethod
+    def _handoff_routes(transition):
+        return [(None, transition)] + [
+            (route["id"], {**transition, **route})
+            for route in transition.get("image_handoff_routes", [])
+        ]
+
+    @staticmethod
+    def _gate_polygons(gate):
+        if not isinstance(gate, dict):
+            return []
+        polygons = list(gate.get("additional_polygons") or [])
+        if "points" in gate:
+            polygons.insert(0, gate["points"])
+        return polygons
 
     def exit_gate_destinations(self, camera_id, anchor):
         """Return adjacent cameras whose source exit was just observed."""
@@ -198,11 +237,24 @@ class BatchAssociator:
                 other = transition.get("from")
             else:
                 continue
-            if other and self._inside_handoff_gate(
-                transition, camera_id, "exit", anchor
-            ):
-                destinations.add(other)
+            for route_id, variant in self._handoff_routes(transition):
+                if other and self._inside_handoff_gate(variant, camera_id, "exit", anchor):
+                    destinations.add(other if route_id is None else f"{other}|{route_id}")
         return destinations
+
+    def entry_gate_sources(self, camera_id, anchor):
+        sources = set()
+        for transition in self.transitions:
+            if transition.get("to") == camera_id:
+                other = transition.get("from")
+            elif transition.get("bidirectional", False) and transition.get("from") == camera_id:
+                other = transition.get("to")
+            else:
+                continue
+            for route_id, variant in self._handoff_routes(transition):
+                if other and self._inside_handoff_gate(variant, camera_id, "entry", anchor):
+                    sources.add(other if route_id is None else f"{other}|{route_id}")
+        return sources
 
     def _gallery_score(self, observation, target):
         if observation.gallery is not None and target.gallery is not None:
@@ -219,6 +271,27 @@ class BatchAssociator:
         }
 
     def evaluate(self, observation, target, stream_skew_seconds=0.0):
+        # A shared global ID can be observed by several cameras. Another
+        # camera's latest update must not erase this source's real exit/box.
+        if target.camera_observations:
+            evaluations = []
+            for camera_id, source in target.camera_observations.items():
+                variant = replace(
+                    target, camera_id=camera_id, camera_observations={},
+                    **{name: source[name] for name in (
+                        "last_seen", "position", "direction", "geometry_trusted",
+                        "source_local_id", "image_anchor", "recent_exit_gates",
+                        "clothing_tone", "appearance", "box", "pixel_velocity",
+                    ) if name in source},
+                )
+                evaluations.append(self.evaluate(observation, variant, stream_skew_seconds))
+            eligible = [item for item in evaluations if item.get("eligible")]
+            if eligible:
+                return max(eligible, key=lambda item: item["final_score"])
+            return next(
+                (item for item in evaluations if item["source_camera"] == target.camera_id),
+                evaluations[0],
+            )
         evaluation = {
             "source_camera": target.camera_id,
             "target_camera": observation.camera_id,
@@ -246,32 +319,36 @@ class BatchAssociator:
         transition = self._transition(target.camera_id, observation.camera_id)
         if transition is None:
             return {**evaluation, "eligible": False, "reason": "topology_rejected"}
-        source_in_gate = self._inside_handoff_gate(
-            transition, target.camera_id, "exit", target.image_anchor
+        gate_options = []
+        for route_id, variant in self._handoff_routes(transition):
+            source_gate = self._inside_handoff_gate(variant, target.camera_id, "exit", target.image_anchor)
+            target_gate = self._inside_handoff_gate(variant, observation.camera_id, "entry", observation.image_anchor)
+            entry_key = target.camera_id if route_id is None else f"{target.camera_id}|{route_id}"
+            entry_at = observation.recent_entry_gates.get(entry_key)
+            if entry_at is not None and 0.0 <= observation.monotonic_time - entry_at <= self.association.get("handoff_entry_memory_seconds", 3.0):
+                target_gate = True
+            exit_key = observation.camera_id if route_id is None else f"{observation.camera_id}|{route_id}"
+            recent_exit_at = (target.recent_exit_gates or {}).get(exit_key)
+            recent = bool(recent_exit_at is not None and 0.0 <= float(observation.monotonic_time) - float(recent_exit_at) <= self.association["handoff_exit_memory_seconds"])
+            gate_options.append((source_gate, target_gate, recent, route_id))
+        source_in_gate, target_in_gate, source_exit_recent, route_id = max(
+            gate_options, key=lambda option: (bool((option[0] or option[2]) and option[1]), bool(option[0] or option[2]), bool(option[1]))
         )
-        recent_exit_at = (target.recent_exit_gates or {}).get(
-            observation.camera_id
-        )
-        source_exit_recent = bool(
-            recent_exit_at is not None
-            and 0.0
-            <= float(observation.monotonic_time) - float(recent_exit_at)
-            <= float(self.association["handoff_exit_memory_seconds"])
-        )
+        # Overlap evidence applies to the matched route, not every doorway
+        # between the same pair of cameras.
+        transition = next(variant for candidate_route, variant in self._handoff_routes(transition) if candidate_route == route_id)
         source_exit_grace = bool(
             target.global_id in observation.handoff_exit_grace
             and float(observation.monotonic_time)
             <= float(observation.handoff_exit_grace[target.global_id])
         )
         source_exit_recent = source_exit_recent or source_exit_grace
-        target_in_gate = self._inside_handoff_gate(
-            transition, observation.camera_id, "entry", observation.image_anchor
-        )
         evaluation.update(
             source_in_handoff_gate=source_in_gate,
             source_exit_gate_recent=source_exit_recent,
             source_exit_gate_grace=source_exit_grace,
             target_in_handoff_gate=target_in_gate,
+            handoff_route=route_id or "main",
         )
         if not source_in_gate and not source_exit_recent:
             return {**evaluation, "eligible": False, "reason": "source_not_in_handoff_exit_gate"}
@@ -296,6 +373,21 @@ class BatchAssociator:
                 return {**evaluation, "eligible": False, "reason": "negative_time_gap"}
         if age > max_gap:
             return {**evaluation, "eligible": False, "reason": "candidate_expired", "time_gap_seconds": age}
+        if transition.get("same_camera") and observation.box is not None and target.box is not None:
+            old_box, new_box = target.box, observation.box
+            scale = max(old_box[2], old_box[3], new_box[2], new_box[3], 1)
+            dx = new_box[0] + new_box[2] / 2 - old_box[0] - old_box[2] / 2
+            dy = new_box[1] + new_box[3] / 2 - old_box[1] - old_box[3] / 2
+            maximum = self.association["same_camera_relink_max_center_ratio"]
+            if math.hypot(dx, dy) / scale > maximum:
+                return {**evaluation, "eligible": False, "reason": "same_camera_pixel_motion_rejected"}
+            if target.pixel_velocity is not None:
+                px, py = (value * age for value in target.pixel_velocity)
+                displacement = math.hypot(px, py)
+                if displacement > scale:
+                    px, py = px * scale / displacement, py * scale / displacement
+                if math.hypot(dx - px, dy - py) / scale > maximum:
+                    return {**evaluation, "eligible": False, "reason": "same_camera_pixel_motion_rejected"}
         reid_score, reid_details = self._gallery_score(observation, target)
         if reid_score is None or reid_score < self.reid["medium_similarity"]:
             return {
@@ -309,11 +401,17 @@ class BatchAssociator:
         simultaneous_reid_threshold = float(
             transition.get("simultaneous_reid_threshold", self.reid["high_similarity"])
         )
+        temporal_overlap_min = transition.get("temporal_overlap_min_similarity")
+        temporal_overlap = bool(
+            simultaneous and validated_overlap and temporal_overlap_min is not None
+            and reid_score >= float(temporal_overlap_min)
+        )
         if (
             simultaneous
             and self.calibration_status != "formal"
             and validated_overlap
             and reid_score < simultaneous_reid_threshold
+            and not temporal_overlap
         ):
             return {
                 **evaluation,
@@ -370,6 +468,8 @@ class BatchAssociator:
             "motion_score": components.get("motion"),
             "geometry_used": geometry_used,
             "simultaneous_overlap_validated": validated_overlap,
+            "source_currently_active": simultaneous,
+            "temporal_overlap_min_similarity": float(temporal_overlap_min) if temporal_overlap else None,
             "final_score": round(float(final_score), 6),
         }
 

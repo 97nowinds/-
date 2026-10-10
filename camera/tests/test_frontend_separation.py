@@ -131,7 +131,9 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn('"error": str(error)[:500]', server)
         self.assertIn('"connection.test:synthetic-round2-001"', server)
         self.assertIn("build_synthetic_snapshot_ready_event()", server)
-        self.assertNotIn("Authorization", server)
+        bootstrap = server.split('def _send_html', 1)[1].split('def do_GET', 1)[0]
+        self.assertNotIn("Authorization", bootstrap)
+        self.assertNotIn("TOKEN", bootstrap)
 
     def test_synthetic_round_three_is_fixed_to_five_empty_frames_at_one_hz(self):
         server = (ROOT / "frontend_server.py").read_text(encoding="utf-8")
@@ -187,7 +189,7 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn("interval_seconds=1.0", server)
         self.assertIn('"LAB_MEMBER_RECEIVER_IP", "192.168.31.189"', server)
         self.assertIn("live snapshot access denied", server)
-        self.assertIn('"LAB_MEMBER_LIVE_PUBLISH_ENABLED", "1"', server)
+        self.assertIn('"LAB_MEMBER_LIVE_PUBLISH_ENABLED", "0"', server)
         self.assertIn("build_monitoring_snapshot_frame_event", server)
         self.assertIn('state="idle_no_tracks"', server)
         self.assertIn('self._update(state="complete")', server)
@@ -487,11 +489,11 @@ class FrontendSeparationTests(unittest.TestCase):
         self.assertIn('"arcface_gallery_required_features"', backend)
         self.assertIn('"arcface_gallery_feature_counts"', backend)
 
-    def test_demo_map_shows_only_points_every_five_seconds(self):
+    def test_live_map_updates_from_each_dashboard_snapshot(self):
         script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
 
-        self.assertIn("MAP_DISPLAY_INTERVAL_MS = 5000", script)
-        self.assertIn("nextMapDisplayAt = performance.now() + MAP_DISPLAY_INTERVAL_MS", script)
+        self.assertNotIn("nextMapDisplayAt", script)
+        self.assertIn("实时更新", script)
         self.assertIn("mapPoint(floorMap, [person.x, person.y])", script)
         self.assertNotIn('createSvg("polyline"', script)
 

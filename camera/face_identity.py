@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import threading
 import time
@@ -52,6 +53,7 @@ class ModernFaceEngine:
                 root=str(self.model_root),
                 allowed_modules=["detection", "recognition"],
                 providers=selected_providers,
+                sess_options=self._session_options(onnxruntime),
             )
             self.providers = list(selected_providers)
             ctx_id = 0 if "CUDAExecutionProvider" in selected_providers else -1
@@ -60,6 +62,13 @@ class ModernFaceEngine:
         except Exception as error:
             self.error = str(error)
             self.analysis = None
+
+    @staticmethod
+    def _session_options(onnxruntime):
+        options = onnxruntime.SessionOptions()
+        options.intra_op_num_threads = max(1, int(os.environ.get("LAB_INFERENCE_THREADS", "2")))
+        options.inter_op_num_threads = 1
+        return options
 
     @property
     def available(self):

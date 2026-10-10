@@ -1,5 +1,6 @@
 param(
     [string]$BackendUrl = "http://127.0.0.1:15000",
+    [string]$PythonPath,
     [int]$Port = 5173,
     [switch]$ConfigureMemberIntegration,
     [switch]$GuiTokenPrompt,
@@ -15,6 +16,9 @@ if (-not (Test-Path -LiteralPath $venvRoot)) {
     $venvRoot = Join-Path (Split-Path -Parent $projectRoot) ".venv"
 }
 $python = Join-Path $venvRoot "Scripts\python.exe"
+if ($PythonPath) {
+    $python = $PythonPath
+}
 $server = Join-Path $projectRoot "frontend_server.py"
 
 function Read-MemberTokenFromDialog {
@@ -98,6 +102,9 @@ if ($ConfigureMemberIntegration) {
     }
 }
 
+if ($DisableLivePublisher) {
+    $env:LAB_MEMBER_LIVE_PUBLISH_ENABLED = "0"
+}
 Set-Location $projectRoot
 Write-Host "Standalone laboratory frontend" -ForegroundColor Cyan
 Write-Host "Python: $python" -ForegroundColor DarkGray

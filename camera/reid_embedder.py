@@ -1,4 +1,5 @@
 import threading
+import os
 from pathlib import Path
 
 import cv2
@@ -7,6 +8,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torchvision.models import resnet50
+from osnet_reid import osnet_x1_0
 
 
 class IBN(nn.Module):
@@ -58,27 +60,42 @@ class ReIDEmbedder:
     """从完整人体框提取归一化 Re-ID 特征，供跨摄像头余弦匹配。"""
 
     def __init__(self, weight_path, device=None):
+        torch.set_num_threads(max(1, int(os.environ.get("LAB_INFERENCE_THREADS", "2"))))
+        cv2.setNumThreads(1)
         self.weight_path = Path(weight_path)
         if not self.weight_path.is_file():
             raise FileNotFoundError(f"Re-ID 权重不存在：{self.weight_path}")
         self.device = torch.device(
             device or ("cuda:0" if torch.cuda.is_available() else "cpu")
         )
-        self.model = ReIDNetwork()
-        state = torch.load(self.weight_path, map_location="cpu")
-        usable = {
-            key: value
-            for key, value in state.items()
-            if key.startswith("base.") or key.startswith("bottleneck.")
-        }
-        missing, unexpected = self.model.load_state_dict(usable, strict=False)
-        allowed_missing = {"base.fc.weight", "base.fc.bias"}
-        if set(missing) - allowed_missing or unexpected:
-            raise RuntimeError(
-                f"Re-ID 权重与网络不匹配，missing={missing}, unexpected={unexpected}"
-            )
+        state = torch.load(self.weight_path, map_location="cpu", weights_only=True)
+        state = state.get("state_dict", state)
+        state = {key.removeprefix("module."): value for key, value in state.items()}
+        self.validate_trained_statistics(state)
+        if "conv1.conv.weight" in state:
+            self.model = osnet_x1_0(num_classes=int(state["classifier.weight"].shape[0]), pretrained=False)
+            self.model.load_state_dict(state, strict=True)
+            self.backend = "OSNet-x1.0 MSMT17"
+            self.feature_dim = 512
+        else:
+            self.model = ReIDNetwork()
+            usable = {key: value for key, value in state.items() if key.startswith(("base.", "bottleneck."))}
+            missing, unexpected = self.model.load_state_dict(usable, strict=False)
+            if set(missing) - {"base.fc.weight", "base.fc.bias"} or unexpected:
+                raise RuntimeError(f"Re-ID 权重与网络不匹配，missing={missing}, unexpected={unexpected}")
+            self.backend = "ResNet50-IBN"
+            self.feature_dim = 2048
         self.model.to(self.device).eval()
         self.lock = threading.RLock()
+
+    @staticmethod
+    def validate_trained_statistics(state):
+        means = [value for key, value in state.items() if key.endswith("running_mean")]
+        variances = [value for key, value in state.items() if key.endswith("running_var")]
+        if not means or not variances:
+            raise RuntimeError("Re-ID checkpoint is missing normalization statistics")
+        if all(torch.count_nonzero(value).item() == 0 for value in means) and all(torch.all(value == 1).item() for value in variances):
+            raise RuntimeError("Re-ID checkpoint has only initial normalization statistics; refusing unreliable identity features")
 
     @staticmethod
     def crop_person(frame, box):
@@ -118,20 +135,29 @@ class ReIDEmbedder:
         boxes = list(boxes)
         if not boxes:
             return []
+        return self.extract_crops([self.crop_person(frame, box) for box in boxes])
+
+    def extract_crops(self, crops):
+        """Batch actual ROIs from different observations in one model call.
+
+        Invalid crops retain None at their original index. This is internal
+        inference only; images and embeddings are never sent by this method.
+        """
+        if not crops:
+            return []
         valid_indices = []
         tensors = []
-        for index, box in enumerate(boxes):
-            crop = self.crop_person(frame, box)
+        for index, crop in enumerate(crops):
             if crop is None or crop.shape[0] < 32 or crop.shape[1] < 12:
                 continue
             valid_indices.append(index)
             tensors.append(self.preprocess(crop))
-        features = [None] * len(boxes)
+        features = [None] * len(crops)
         if not tensors:
             return features
         inputs = torch.cat(tensors, dim=0).to(self.device)
         with self.lock, torch.inference_mode():
-            batch = self.model(inputs).cpu().numpy().astype(np.float32)
+            batch = F.normalize(self.model(inputs), p=2, dim=1).cpu().numpy().astype(np.float32)
         for index, feature in zip(valid_indices, batch):
             features[index] = feature
         return features

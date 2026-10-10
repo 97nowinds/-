@@ -1,0 +1,14 @@
+tracker_type: bytetrack
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.20
+track_buffer: 60
+match_thresh: 0.80
+fuse_score: true
+guarded_lost_low: true
+lost_low_max_seconds: 0.8
+lost_low_min_similarity: 0.86
+lost_low_margin: 0.10
+lost_low_confirmations: 3
+lost_low_min_duration: 0.08
+lost_low_use_flow: true

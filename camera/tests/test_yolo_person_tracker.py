@@ -93,7 +93,7 @@ class YoloPersonTrackerTests(unittest.TestCase):
 
         self.assertIsNone(tracker.model.predictor)
 
-    def test_deduplicates_highly_overlapping_tracker_boxes(self):
+    def test_distinct_ids_survive_heavy_occlusion_overlap(self):
         tracks = [
             {"track_id": 7, "box": (10, 20, 40, 100), "confidence": 0.91},
             {"track_id": 8, "box": (11, 21, 40, 100), "confidence": 0.84},
@@ -102,7 +102,14 @@ class YoloPersonTrackerTests(unittest.TestCase):
 
         deduplicated = YoloPersonTracker.deduplicate_tracks(tracks)
 
-        self.assertEqual([track["track_id"] for track in deduplicated], [7, 9])
+        self.assertEqual([track["track_id"] for track in deduplicated], [7, 8, 9])
+
+    def test_duplicate_boxes_of_same_id_are_suppressed(self):
+        tracks = [
+            {"track_id": 7, "box": (10, 20, 40, 100), "confidence": 0.91},
+            {"track_id": 7, "box": (11, 21, 40, 100), "confidence": 0.84},
+        ]
+        self.assertEqual(YoloPersonTracker.deduplicate_tracks(tracks), [tracks[0]])
 
     def test_partially_overlapping_people_are_not_deduplicated(self):
         tracks = [
@@ -493,6 +500,30 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         self.assertTrue(coordinator.track_diagnostics("cam_1", 1)["counted"])
         self.assertEqual(coordinator.diagnostics()["counting_duplicate_groups"], [])
 
+    def test_counting_preserves_same_camera_evidence_despite_identical_appearance(self):
+        coordinator = self.coordinator(self.TransitionFloorMap())
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        frame[20:80, 10:90] = (20, 80, 180)
+        tracks = [
+            {"track_id": 1, "box": (10, 20, 30, 60), "position": None},
+            {"track_id": 2, "box": (60, 20, 30, 60), "position": None},
+        ]
+        for now in (1.0, 1.8, 2.6):
+            ids = coordinator.update_batch("cam_entrance", tracks, frame, monotonic_time=now)
+        # A third view with identical clothing must not transitively join
+        # the two people that the entrance camera saw simultaneously.
+        coordinator.update_batch("cam_1", tracks[:1], frame, monotonic_time=2.7)
+        groups = coordinator.diagnostics()["counting_duplicate_groups"]
+        for group in groups:
+            self.assertFalse(set(ids.values()).issubset(group["member_global_ids"]))
+        # The exclusion survives even after the original view leaves.
+        coordinator.active_local_ids_by_camera["cam_entrance"] = set()
+        coordinator.active_local_ids_by_camera["cam_1"] = {1}
+        coordinator.local_bindings[("cam_2", 2)] = ids[2]
+        coordinator.active_local_ids_by_camera["cam_2"] = {2}
+        for group in coordinator._count_duplicate_groups():
+            self.assertFalse(set(ids.values()).issubset(group["member_global_ids"]))
+
     def test_same_camera_reacquisition_does_not_block_late_cross_camera_merge(self):
         coordinator = self.coordinator(self.TransitionFloorMap())
         frame = np.zeros((100, 100, 3), dtype=np.uint8)
@@ -744,6 +775,91 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
 
         self.assertNotEqual(late, first)
 
+    def test_long_occlusion_requires_repeated_evidence_before_identity_restore(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.full((120, 220, 3), (20, 80, 180), dtype=np.uint8)
+        old = coordinator.update_batch("cam_1", [{"track_id": 1, "box": (20, 20, 40, 80)}], frame, monotonic_time=1)[1]
+        coordinator.set_identity(old, {"known": True, "person_id": "test_person", "name": "test_name"}, "cam_1", now=1)
+        recovered = []
+        for now in (5, 5.12, 5.25):
+            result = coordinator.update_batch("cam_1", [{"track_id": 11, "box": (25, 20, 40, 80)}], frame, monotonic_time=now)
+            recovered.append(result[11])
+        self.assertNotEqual(recovered[0], old)
+        self.assertIsNone(coordinator.identity_for(recovered[0], "cam_1", now=5))
+        self.assertNotEqual(recovered[1], old)
+        self.assertEqual(recovered[2], old)
+        self.assertEqual(coordinator.identity_for(old, "cam_1", now=5.25)["person_id"], "test_person")
+
+    def test_other_camera_update_does_not_erase_same_camera_recovery_box(self):
+        class Overlap:
+            config = {"calibrated": False, "zones": [], "camera_transitions": [
+                {"from": "cam_1", "to": "cam_2", "bidirectional": True,
+                 "max_gap_seconds": 8, "simultaneous_overlap_validated": True},
+            ]}
+        coordinator = self.coordinator(Overlap())
+        frame = np.full((120, 220, 3), (20, 80, 180), dtype=np.uint8)
+        old = coordinator.update_batch("cam_1", [{"track_id": 1, "box": (20, 20, 40, 80)}], frame, monotonic_time=1)[1]
+        other = coordinator.update_batch("cam_2", [{"track_id": 2, "box": (150, 20, 40, 80)}], frame, monotonic_time=1.1)[2]
+        self.assertEqual(other, old)
+        new = coordinator.update_batch("cam_1", [{"track_id": 11, "box": (25, 20, 40, 80)}], frame, monotonic_time=1.3)[11]
+        self.assertEqual(new, old)
+
+    def test_medium_handoff_requires_five_fresh_observations(self):
+        coordinator = self.coordinator(self.TransitionFloorMap())
+        source = np.full((120, 220, 3), (100, 0, 0), dtype=np.uint8)
+        target = np.full((120, 220, 3), (70, 71, 0), dtype=np.uint8)
+        box = (20, 20, 40, 80)
+        original = coordinator.update_batch("cam_entrance", [{"track_id": 1, "box": box}], source, monotonic_time=1)[1]
+        coordinator.set_identity(original, {"known": True, "person_id": "test_person", "name": "test_name"}, "cam_entrance", now=1)
+        coordinator.update_batch("cam_entrance", [], source, monotonic_time=1.1)
+        results = []
+        for now in (2, 2.1, 2.2, 2.3, 2.4):
+            results.append(coordinator.update_batch("cam_1", [{"track_id": 9, "box": box}], target, monotonic_time=now)[9])
+        self.assertTrue(all(item != original for item in results[:4]))
+        self.assertEqual(results[4], original)
+        self.assertEqual(coordinator.identity_for(original, "cam_1", now=2.4)["person_id"], "test_person")
+
+    def test_partial_body_cannot_immediately_steal_returning_identity(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.full((120, 220, 3), (20, 80, 180), dtype=np.uint8)
+        original = coordinator.update_batch("cam_1", [{"track_id": 1, "box": (20, 20, 40, 80)}], frame, monotonic_time=1)[1]
+        partial = coordinator.update_batch("cam_1", [{"track_id": 11, "box": (25, 20, 40, 40)}], frame, monotonic_time=1.2)[11]
+        self.assertNotEqual(partial, original)
+        returning = coordinator.update_batch("cam_1", [{"track_id": 1, "box": (20, 20, 40, 80)}, {"track_id": 11, "box": (25, 20, 40, 40)}], frame, monotonic_time=1.3)
+        self.assertEqual(returning[1], original)
+        self.assertNotEqual(returning[11], original)
+
+    def _temporal_overlap_case(self, ambiguous=False):
+        class Overlap:
+            config = {"calibrated": False, "zones": [], "camera_transitions": [{
+                "from": "cam_entrance", "to": "cam_1", "max_gap_seconds": 20,
+                "simultaneous_overlap_validated": True, "simultaneous_reid_threshold": .75,
+                "temporal_overlap_min_similarity": .62,
+            }]}
+        coordinator = self.coordinator(Overlap())
+        source = np.full((120, 220, 3), (100, 0, 0), dtype=np.uint8)
+        target = np.full((120, 220, 3), (65, 76, 0), dtype=np.uint8)
+        source_tracks = [{"track_id": 1, "box": (20, 20, 40, 80)}]
+        if ambiguous:
+            source_tracks.append({"track_id": 2, "box": (120, 20, 40, 80)})
+        original = coordinator.update_batch("cam_entrance", source_tracks, source, monotonic_time=1)[1]
+        coordinator.set_identity(original, {"known": True, "person_id": "test_person", "name": "test_name"}, "cam_entrance", now=1)
+        results = []
+        for now in (2, 2.2, 2.4, 2.6, 2.8, 3.1):
+            coordinator.update_batch("cam_entrance", source_tracks, source, monotonic_time=now-.01)
+            results.append(coordinator.update_batch("cam_1", [{"track_id": 9, "box": (20, 20, 40, 80)}], target, monotonic_time=now)[9])
+        return coordinator, original, results
+
+    def test_validated_overlap_medium_match_waits_one_second(self):
+        coordinator, original, results = self._temporal_overlap_case()
+        self.assertTrue(all(item != original for item in results[:5]))
+        self.assertEqual(results[-1], original)
+        self.assertEqual(coordinator.identity_for(original, "cam_1", now=3.1)["person_id"], "test_person")
+
+    def test_temporal_overlap_does_not_resolve_equal_appearance_candidates(self):
+        _, original, results = self._temporal_overlap_case(ambiguous=True)
+        self.assertTrue(all(item != original for item in results))
+
     def test_crossing_crops_do_not_overwrite_clean_features(self):
         coordinator = self.coordinator(self.UncalibratedFloorMap())
         frame = np.zeros((100, 160, 3), dtype=np.uint8)
@@ -759,6 +875,75 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         for key, feature in features.items():
             np.testing.assert_array_equal(coordinator.local_features[key][0], feature)
             self.assertEqual(coordinator.local_features[key][1], 1)
+
+    def test_low_quality_body_does_not_create_fallback_identity_evidence(self):
+        from unittest.mock import patch
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.full((100, 160, 3), (20, 80, 180), dtype=np.uint8)
+        with patch("yolo_person_tracker.BodyQualityScorer.assess", return_value={"score": 0.1}):
+            coordinator.update_batch("cam_1", [{"track_id": 1, "box": (10, 20, 40, 60)}], frame, monotonic_time=1)
+        self.assertIsNone(coordinator.local_galleries[("cam_1", 1)].representative)
+        self.assertNotIn(("cam_1", 1), coordinator.local_features)
+
+    def test_recovered_partial_body_preserves_clean_gallery_and_sample_time(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.full((120, 160, 3), (20, 80, 180), dtype=np.uint8)
+        old = [{"track_id": 1, "box": (10, 20, 40, 80)}]
+        original = coordinator.update_batch("cam_1", old, frame, monotonic_time=1)[1]
+        feature, sample_time = coordinator.local_features[("cam_1", 1)]
+        fragment = [{"track_id": 1, "box": (10, 20, 40, 60), "partial_body": True}]
+        changed = np.full_like(frame, (180, 80, 20))
+        recovered = coordinator.update_batch("cam_1", fragment, changed, monotonic_time=2)[1]
+        self.assertEqual(recovered, original)
+        np.testing.assert_array_equal(coordinator.local_features[("cam_1", 1)][0], feature)
+        self.assertEqual(coordinator.local_features[("cam_1", 1)][1], sample_time)
+
+    def test_new_occluded_fragment_remains_eligible_for_later_recovery(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.full((100, 160, 3), (20, 80, 180), dtype=np.uint8)
+        old = [{"track_id": 1, "box": (10, 20, 40, 60)}]
+        original = coordinator.update_batch("cam_1", old, frame, monotonic_time=1)[1]
+        fragment = {"track_id": 2, "box": (12, 22, 40, 60)}
+        mixed = coordinator.update_batch("cam_1", old+[fragment], frame, monotonic_time=1.1)
+        self.assertNotEqual(mixed[2], original)
+        self.assertIn(("cam_1", 2), coordinator.local_recovery_pending)
+        self.assertNotIn(frozenset((original, mixed[2])), coordinator.distinct_global_pairs)
+        recovered = coordinator.update_batch("cam_1", [fragment], frame, monotonic_time=1.3)
+        self.assertEqual(recovered[2], original)
+        self.assertNotIn(("cam_1", 2), coordinator.local_recovery_pending)
+
+    def test_pending_occluded_person_cannot_recover_by_distance_alone(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        red = np.full((100, 160, 3), (0, 0, 180), dtype=np.uint8)
+        blue = np.full((100, 160, 3), (180, 0, 0), dtype=np.uint8)
+        old = [{"track_id": 1, "box": (10, 20, 40, 60)}]
+        original = coordinator.update_batch("cam_1", old, red, monotonic_time=1)[1]
+        newcomer = {"track_id": 2, "box": (12, 22, 40, 60)}
+        coordinator.update_batch("cam_1", old+[newcomer], blue, monotonic_time=1.1)
+        result = coordinator.update_batch("cam_1", [newcomer], blue, monotonic_time=1.3)
+        self.assertNotEqual(result[2], original)
+
+    def test_recovery_pending_is_cleared_by_camera_and_replay_reset(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        coordinator.local_recovery_pending[("cam_1", 9)] = 1
+        coordinator.forget_camera("cam_1")
+        self.assertFalse(coordinator.local_recovery_pending)
+        coordinator.local_recovery_pending[("cam_2", 9)] = 1
+        coordinator.reset_replay_cycle()
+        self.assertFalse(coordinator.local_recovery_pending)
+
+    def test_rejected_body_keeps_clean_feature_observation_time(self):
+        from unittest.mock import patch
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        frame = np.full((100, 160, 3), (20, 80, 180), dtype=np.uint8)
+        tracks = [{"track_id": 1, "box": (10, 20, 40, 60)}]
+        with patch("yolo_person_tracker.BodyQualityScorer.assess", return_value={"score": 0.9}):
+            coordinator.update_batch("cam_1", tracks, frame, monotonic_time=1)
+        original = coordinator.local_features[("cam_1", 1)][0].copy()
+        with patch("yolo_person_tracker.BodyQualityScorer.assess", return_value={"score": 0.1}):
+            coordinator.update_batch("cam_1", tracks, frame, monotonic_time=2)
+        np.testing.assert_array_equal(coordinator.local_features[("cam_1", 1)][0], original)
+        self.assertEqual(coordinator.local_features[("cam_1", 1)][1], 1)
 
     def test_one_frame_occlusion_cannot_merge_previously_distinct_people(self):
         coordinator = self.coordinator(self.UncalibratedFloorMap())

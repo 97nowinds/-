@@ -163,14 +163,17 @@ class TrackFeatureGallery:
                 "top_k": 0,
                 "quality": 0.0,
             }
-        pairs = []
-        for first in self.samples:
-            for second in other.samples:
-                similarity = float(np.dot(first.feature, second.feature))
-                quality = float(np.sqrt(first.quality * second.quality))
-                pairs.append((similarity, quality))
-        pairs.sort(key=lambda item: item[0], reverse=True)
-        selected = pairs[: min(self.top_k, len(pairs))]
+        # Compare galleries in one native matrix operation. Repeated Python
+        # loops under the coordinator lock also stalled capture timestamp
+        # publication and unrelated cameras.
+        first_vectors = np.asarray([sample.feature for sample in self.samples])
+        second_vectors = np.asarray([sample.feature for sample in other.samples])
+        similarities = (first_vectors @ second_vectors.T).reshape(-1)
+        first_quality = np.asarray([sample.quality for sample in self.samples], dtype=np.float64)
+        second_quality = np.asarray([sample.quality for sample in other.samples], dtype=np.float64)
+        qualities = np.sqrt(first_quality[:, None] * second_quality[None, :]).reshape(-1)
+        indices = np.argsort(-similarities, kind="stable")[:self.top_k]
+        selected = [(float(similarities[index]), float(qualities[index])) for index in indices]
         total_quality = sum(quality for _, quality in selected)
         score = (
             sum(similarity * quality for similarity, quality in selected) / total_quality
@@ -180,7 +183,7 @@ class TrackFeatureGallery:
         return {
             "score": round(float(score), 6),
             "best_score": round(float(selected[0][0]), 6),
-            "pair_count": len(pairs),
+            "pair_count": len(similarities),
             "top_k": len(selected),
             "quality": round(float(total_quality / len(selected)), 4),
         }

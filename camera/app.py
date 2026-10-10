@@ -1,4 +1,7 @@
 import atexit
+import base64
+from copy import deepcopy
+import uuid
 import csv
 import hashlib
 import json
@@ -9,6 +12,8 @@ import shutil
 import tempfile
 import threading
 import time
+from handoff_transport import AuthoritySync, bearer_authorized, load_demo_config
+from map_handoff import map_snapshot
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
@@ -79,7 +84,7 @@ FACE_MODEL_PATH = BASE_DIR / "models" / "face_detection_yunet_2023mar.onnx"
 FACE_RECOGNITION_MODEL_PATH = BASE_DIR / "models" / "face_recognition_sface_2021dec.onnx"
 MODERN_FACE_MODEL_ROOT = BASE_DIR / "models" / "insightface"
 FACE_RECOGNITION_ENGINE = os.environ.get("LAB_FACE_ENGINE", "arcface").strip().lower()
-REID_MODEL_PATH = BASE_DIR.parent / "person_track" / "weights" / "reID" / "719rank1.pth"
+REID_MODEL_PATH = Path(os.environ.get("LAB_REID_MODEL_PATH", BASE_DIR / "models" / "osnet_x1_0_msmt17.pth"))
 FRAME_WIDTH = 960
 RTSP_OPEN_TIMEOUT_MS = 5000
 RTSP_READ_TIMEOUT_MS = 3000
@@ -434,6 +439,7 @@ class CameraWorker:
             confidence=self.camera["yolo_confidence"],
             image_size=self.camera["yolo_image_size"],
             tracker_config=self.camera["yolo_tracker_config"],
+            reid_embedder=self.coordinator.feature_extractor,
         )
         self.yolo_trails = TrackTrailStore(max_points=90, stale_seconds=3.0)
         self.yolo_tracks = []
@@ -485,6 +491,13 @@ class CameraWorker:
         self.inference_started_monotonic = None
         self.inference_ended_monotonic = None
         self.status_published_at = None
+        self.handoff_session = uuid.uuid4().hex
+        self.handoff_sequence = 0
+        self.frozen_handoff = None
+        self.handoff_sync = AuthoritySync('capture-' + self.handoff_session,
+            load_demo_config(), os.environ.get('LAB_HANDOFF_SYNC_READ_TOKEN', ''))
+        if os.environ.get('LAB_HANDOFF_FREEZE_ENABLED', '0') == '1':
+            self.handoff_sync.start()
         self.last_capture_monotonic = None
         self.last_frame_monotonic = None
         self.current_frame_monotonic = None
@@ -682,6 +695,7 @@ class CameraWorker:
                     self.dropped_frames += max(0, sequence - processed_sequence - 1)
                 processed_sequence = sequence
 
+                self.handoff_source_dimensions = (frame.shape[1], frame.shape[0])
                 frame = self.resize(frame)
                 self.frame_counter += 1
                 inference_started_at = time.time()
@@ -709,6 +723,7 @@ class CameraWorker:
                     self.display_condition.notify_all()
 
     def reset_processing_state(self):
+        self.frozen_handoff = None
         self.slam.reset()
         self.slam_state = self.slam.status_payload()
         self.yolo_tracker.reset()
@@ -859,7 +874,7 @@ class CameraWorker:
             cv2.rectangle(frame, (x, y), (x + width, y + height), color, 3)
             cv2.putText(
                 frame,
-                f"{label} | {confidence:.0%}",
+                f"{track.get('track_id', local_id)} {label} | {confidence:.0%}",
                 (x, max(62, y - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.62,
@@ -906,6 +921,8 @@ class CameraWorker:
                         RTSP_OPEN_TIMEOUT_MS,
                         cv2.CAP_PROP_READ_TIMEOUT_MSEC,
                         RTSP_READ_TIMEOUT_MS,
+                        cv2.CAP_PROP_N_THREADS,
+                        2,
                     ],
                 )
             except (TypeError, cv2.error):
@@ -1324,6 +1341,8 @@ class CameraWorker:
         )
 
     def process(self, frame, frame_unix_time=None, frame_monotonic_time=None):
+        stage_started = time.perf_counter()
+        self.pipeline_stage_ms = {}
         display = frame.copy()
         frame_unix_time = time.time() if frame_unix_time is None else float(frame_unix_time)
         now = time.monotonic() if frame_monotonic_time is None else float(frame_monotonic_time)
@@ -1355,6 +1374,7 @@ class CameraWorker:
                 1,
                 cv2.LINE_AA,
             )
+        slam_started = time.perf_counter()
         if now - self.last_slam_at >= SLAM_UPDATE_INTERVAL_SECONDS:
             self.slam_state = self.slam.update(
                 frame,
@@ -1367,6 +1387,7 @@ class CameraWorker:
             self.last_slam_at = now
         # 只在每路摄像头配置的抽样帧运行 YOLO。非抽样帧使用上一批检测框绘制画面，
         # 这样视频流仍然连续，而检测模型不再被每一帧调用。
+        self.pipeline_stage_ms["slam"] = round((time.perf_counter() - slam_started) * 1000, 1)
         effective_yolo_stride = (
             min(2, self.camera["yolo_frame_stride"])
             if self.replay_enabled
@@ -1381,7 +1402,7 @@ class CameraWorker:
         if should_infer:
             started_at = time.perf_counter()
             try:
-                tracks = self.yolo_tracker.track(frame)
+                tracks = self.yolo_tracker.track(frame, observed_at=frame_unix_time)
                 self.yolo_error = None
             except Exception as error:
                 tracks = []
@@ -1397,6 +1418,7 @@ class CameraWorker:
                     "track_id": item["local_id"],
                     "box": item["box"],
                     "confidence": item["confidence"],
+                    "partial_body": bool(item.get("partial_body")),
                 }
                 for item in cached_tracks
             ]
@@ -1432,6 +1454,7 @@ class CameraWorker:
                     "track_id": item["local_id"],
                     "box": item["box"],
                     "confidence": item["confidence"],
+                    "partial_body": bool(item.get("partial_body")),
                 }
                 for item in cached_tracks
             ]
@@ -1474,12 +1497,19 @@ class CameraWorker:
             height = max(1, min(height, frame.shape[0] - y))
             box = (x, y, width, height)
             location = self.locate_box(box, frame.shape)
+            if track.get("partial_body"):
+                location = {**location, "position": None, "estimated": False,
+                    "quality": "unavailable", "image_anchor": None,
+                    "footpoint_visible": False,
+                    "reason": "partial body recovery; feet not observed"}
             # Handoff gates describe pixels in the camera image, independently
             # of whether the floor map can place the feet on an aisle.
             handoff_anchor = {
                 "x": (x + width * 0.5) / frame.shape[1],
                 "y": min(y + height, frame.shape[0] - 1) / frame.shape[0],
             }
+            if track.get("partial_body"):
+                handoff_anchor = None
             # A fixed tracking anchor is only meaningful for one person at a
             # doorway. Publishing that same coordinate for a crowd makes the
             # map falsely collapse multiple workers into one point.
@@ -1507,6 +1537,7 @@ class CameraWorker:
                     "image_anchor": handoff_anchor,
                 }
             )
+        association_started = time.perf_counter()
         if should_infer and not hold_cached_tracks:
             batch_global_ids = self.coordinator.update_batch(
                 self.camera["id"],
@@ -1520,6 +1551,7 @@ class CameraWorker:
         else:
             batch_global_ids = cached_global_ids
 
+        self.pipeline_stage_ms["association"] = round((time.perf_counter() - association_started) * 1000, 1)
         for track in prepared_tracks:
             local_id = track["track_id"]
             x, y, width, height = track["box"]
@@ -1589,7 +1621,7 @@ class CameraWorker:
                 label_color = color
             cv2.putText(
                 display,
-                f"{display_label} | {track['confidence']:.0%}",
+                f"{global_id} {display_label} | {track['confidence']:.0%}",
                 (x, max(62, y - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.62,
@@ -1642,6 +1674,7 @@ class CameraWorker:
                     "local_id": local_id,
                     "box": box,
                     "confidence": track["confidence"],
+                    "partial_body": bool(track.get("partial_body")),
                     "reid_gallery": mtmc_diagnostics["gallery"],
                     "association_confidence": mtmc_diagnostics["confidence"],
                     "association_score": mtmc_diagnostics["final_match_score"],
@@ -1758,6 +1791,34 @@ class CameraWorker:
                 self.map_observations = observations
                 self.map_observation = observations[0] if observations else None
                 self.last_map_publish_at = now
+
+        # Only real successful detections may freeze evidence. Cached/held
+        # boxes are useful for preview continuity, but are not this frame's boxes.
+        if (os.environ.get("LAB_HANDOFF_FREEZE_ENABLED", "0") == "1"
+                and should_infer and not hold_cached_tracks and not self.yolo_error):
+            ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if ok:
+                self.handoff_sequence += 1
+                frame_id = f"{self.handoff_session}-{self.camera['id']}-{self.handoff_sequence}"
+                layout = map_snapshot({'floor_map': self.floor_map.public_config()})
+                evidence = {
+                    'snapshot_id': frame_id, 'source_frame_id': frame_id,
+                    'camera_id': self.camera['id'], 'source_captured_at': frame_unix_time,
+                    'source_occurred_at': time.time(),
+                    'source_clock': 'capture-' + self.handoff_session,
+                    'sync_mapping': self.handoff_sync.current(),
+                    'frame_width': frame.shape[1], 'frame_height': frame.shape[0],
+                    'source_dimensions': list(getattr(self, 'handoff_source_dimensions',
+                                                     (frame.shape[1], frame.shape[0]))),
+                    'map_id': layout['map_id'], 'map_revision': layout['map_revision'],
+                    'camera': {'yolo_tracks': published_tracks,
+                        'identities': self.status_payload()['identities']},
+                    'map_observations': observations,
+                    'timestamp_source': 'recording_replay' if self.replay_enabled else 'host_receive',
+                    'jpeg_base64': base64.b64encode(encoded.tobytes()).decode('ascii'),
+                }
+                with self.lock:
+                    self.frozen_handoff = deepcopy(evidence)
 
         cv2.rectangle(display, (0, 0), (display.shape[1], 40), (20, 23, 27), -1)
         status = "ERROR" if self.yolo_error else f"{len(published_tracks)} PEOPLE"
@@ -1927,6 +1988,7 @@ class CameraWorker:
             "preview_overlay_status": self.preview_overlay_status,
             "frame_age_seconds": round(age, 2) if age is not None else None,
             "capture_age_seconds": round(capture_age, 2) if capture_age is not None else None,
+            "pipeline_stage_ms": dict(getattr(self, "pipeline_stage_ms", {})),
             "processing_latency_ms": self.processing_latency_ms,
             "timestamp_source": "recording_replay" if self.replay_enabled else "host_receive",
             "capture_received_at": self.last_capture_at,
@@ -2007,6 +2069,7 @@ class CameraWorker:
 
     def stop(self):
         self.running = False
+        self.handoff_sync.stop_event.set()
         for condition in (
             self.capture_condition,
             self.display_condition,
@@ -2024,6 +2087,7 @@ class CameraWorker:
 
 class CameraManager:
     def __init__(self, cameras, face_store):
+        os.environ.setdefault("LAB_ASYNC_EVENT_WRITES", "1")
         self.face_store = face_store
         self.floor_map = FloorMapProjector.from_path(FLOOR_MAP_PATH)
         self.mtmc_config = load_mtmc_config(MTMC_CONFIG_PATH)
@@ -2281,8 +2345,11 @@ class CameraManager:
                 "arcface_gallery_missing_ids": sorted(
                     set(self.face_store.people) - set(self.face_store.modern_features)
                 ),
-                "reid_engine": "ResNet50-IBN",
-                "reid_feature_dimensions": 2048,
+                "reid_backend": self.reid_embedder.backend,
+                "reid_feature_dim": self.reid_embedder.feature_dim,
+                "reid_weights": self.reid_embedder.weight_path.name,
+                "reid_engine": self.reid_embedder.backend,
+                "reid_feature_dimensions": self.reid_embedder.feature_dim,
                 "reid_similarity_threshold": self.mtmc_config["reid"]["high_similarity"],
                 "reid_match_margin": self.mtmc_config["reid"]["match_margin"],
                 "reid_feature_refresh_ms": int(self.mtmc_config["reid"]["feature_refresh_seconds"] * 1000),
@@ -2748,9 +2815,35 @@ face_store = FaceIdentityStore(
 )
 camera_manager = CameraManager(load_cameras(), face_store)
 face_registration = FaceRegistrationManager(face_store, camera_manager.workers)
+
+def _sample_live_stacks():
+    import sys, collections
+    counts = collections.Counter()
+    for _ in range(300):
+        time.sleep(.1)
+        for frame in sys._current_frames().values():
+            leaf = frame
+            pipeline = None
+            while frame:
+                if frame.f_code.co_name in ("process_loop", "capture_loop", "encode_loop"):
+                    pipeline = frame.f_code.co_name
+                frame = frame.f_back
+            if pipeline:
+                counts[(pipeline, leaf.f_code.co_filename.rsplit("/",1)[-1], leaf.f_code.co_name, leaf.f_lineno)] += 1
+    Path("/tmp/lab-live-stack-profile.json").write_text(json.dumps([{"stack":k,"samples":v} for k,v in counts.most_common(30)]))
+threading.Thread(target=_sample_live_stacks, daemon=True).start()
+
 atexit.register(camera_manager.stop)
 
 
+@app.route("/display")
+def display():
+    if os.environ.get("LAB_API_ONLY") == "1":
+        return jsonify({"service": "lab-api", "frontend": "http://127.0.0.1:5173/display"})
+    return render_template("display.html")
+
+
+@app.route("/monitor")
 @app.route("/")
 def index():
     if os.environ.get("LAB_API_ONLY") == "1":
@@ -2820,6 +2913,20 @@ def synchronized_replay_frame(camera_id):
 @app.route("/api/state")
 def api_state():
     return jsonify(camera_manager.state())
+
+
+@app.route("/api/handoff/frozen/<camera_id>")
+def api_frozen_handoff(camera_id):
+    if not bearer_authorized(request.headers, os.environ.get('LAB_HANDOFF_IMAGE_READ_TOKEN', '')):
+        return jsonify({'error': 'snapshot read permission required'}), 403
+    worker = camera_manager.workers.get(camera_id)
+    if worker is None:
+        return jsonify({'error': 'camera not found'}), 404
+    with worker.lock:
+        evidence = deepcopy(worker.frozen_handoff)
+    if worker.status != 'running' or evidence is None:
+        return jsonify({'error': 'frozen detection snapshot unavailable'}), 503
+    return jsonify(evidence)
 
 
 @app.route("/api/dashboard")

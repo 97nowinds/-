@@ -39,6 +39,68 @@ class BatchAssociationTests(unittest.TestCase):
         self.assertEqual(mapping(first), mapping(second))
         self.assertEqual(mapping(first), {(1, "person_1"), (2, "person_2")})
 
+    def test_camera_history_uses_actual_source_time_and_exit(self):
+        observation = self.observation(10, [1, 0], now=11)
+        target = self.target("person_1", [1, 0], camera="cam_entrance", seen=10.9)
+        target.camera_observations = {
+            "cam_1": {"last_seen": 10.5, "source_local_id": 3},
+            "cam_entrance": {"last_seen": 10.9},
+        }
+        result = self.associator.evaluate(observation, target)
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["source_camera"], "cam_1")
+        self.assertEqual(result["source_local_id"], 3)
+        self.assertAlmostEqual(result["time_gap_seconds"], 0.5)
+        target.camera_observations["cam_1"]["last_seen"] = 1
+        self.assertFalse(self.associator.evaluate(observation, target)["eligible"])
+
+    def test_recorded_secondary_portals_accept_without_opening_whole_image(self):
+        floor = FloorMapProjector.from_path(Path(__file__).resolve().parents[1] / "config/floor_map.json")
+        associator = BatchAssociator(self.config, floor.config["camera_transitions"], "approximate")
+        observation = self.observation(62, [1, 0], camera="cam_1", now=11)
+        observation.image_anchor = {"x": (5 + 45 / 2) / 768, "y": (12 + 198) / 432}
+        target = self.target("person_1", [1, 0], camera="cam_2", seen=10.9)
+        target.image_anchor = {"x": 0.57, "y": 0.34}
+        target.active_camera_ids = {"cam_2"}
+        result = associator.evaluate(observation, target)
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["handoff_route"], "secondary")
+        self.assertTrue(result["simultaneous_overlap_validated"])
+        target.image_anchor = {"x": 0.65, "y": 0.70}
+        self.assertFalse(associator.evaluate(observation, target)["eligible"])
+        target.image_anchor = {"x": 0.57, "y": 0.34}
+        observation.image_anchor = {"x": 0.9, "y": 0.1}
+        self.assertFalse(associator.evaluate(observation, target)["eligible"])
+
+        # The secondary overlap permission must not authorize the main route.
+        observation.image_anchor = {"x": 0.20, "y": 0.90}
+        target.image_anchor = {"x": 0.65, "y": 0.70}
+        result = associator.evaluate(observation, target)
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["reason"], "simultaneous_cross_camera_without_formal_overlap")
+
+        observation = self.observation(21, [1, 0], camera="cam_2", now=11)
+        observation.image_anchor = {"x": 0.57, "y": 0.34}
+        target = self.target("person_1", [1, 0], camera="cam_entrance", seen=10.9)
+        target.image_anchor = {"x": 0.19, "y": 0.42}
+        self.assertTrue(associator.evaluate(observation, target)["eligible"])
+
+        observation = self.observation(58, [1, 0], camera="cam_entrance", now=11)
+        observation.image_anchor = {"x": 0.19, "y": 0.42}
+        target = self.target("person_1", [1, 0], camera="cam_1", seen=10.9)
+        target.image_anchor = {"x": 0.35, "y": 0.99}
+        self.assertTrue(associator.evaluate(observation, target)["eligible"])
+
+    def test_same_camera_cannot_bypass_pixel_motion_with_high_reid(self):
+        observation = self.observation(10, [1, 0], camera="cam_1", now=2)
+        observation.box = (0, 20, 40, 80)
+        target = self.target("person_1", [1, 0], camera="cam_1", seen=1)
+        target.box = (20, 20, 40, 80)
+        target.pixel_velocity = (200, 0)
+        result = self.associator.evaluate(observation, target)
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["reason"], "same_camera_pixel_motion_rejected")
+
     def test_two_people_cross_one_to_one(self):
         decisions, _ = self.associator.associate(
             [self.observation(10, [1, 0]), self.observation(11, [0, 1])],
@@ -307,7 +369,7 @@ class BatchAssociationTests(unittest.TestCase):
             }
         ]
         associator = BatchAssociator(self.config, transitions, "approximate")
-        observation = self.observation(10, [0.75, 0.6614], camera="cam_2", now=2)
+        observation = self.observation(10, [0.60, 0.80], camera="cam_2", now=2)
         target = self.target("person_1", [1, 0], camera="cam_1", seen=2)
         target.active_camera_ids = {"cam_1"}
 

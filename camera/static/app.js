@@ -50,6 +50,21 @@ const API_BASE = (
 ).replace(/\/$/, "");
 const HARDWARE_URL = window.__LAB_HARDWARE_URL__ || null;
 const INTERACTION_URL = "/api/interaction-results/latest";
+const resultContract = window.__LAB_RESULT_CONTRACT__ || "";
+let latestAnalyses = [];
+const interactionDeadlines = new Map();
+
+function currentInteractionEvents() {
+  if (!resultContract) return latestInteractionEvents;
+  return latestInteractionEvents.filter((item) =>
+    performance.now() < (interactionDeadlines.get(item.analysis_id) || 0));
+}
+
+function evidenceTime(value) {
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime())
+    ? parsed.toLocaleTimeString("zh-CN", {hour12: false}) : "时间未知";
+}
 const faceCaptureLink = document.querySelector("#faceCaptureLink");
 if (faceCaptureLink) faceCaptureLink.href = `/faces?api=${encodeURIComponent(API_BASE)}`;
 const calibrationLink = document.querySelector("#calibrationLink");
@@ -60,8 +75,6 @@ const remoteStream = location.hostname.startsWith("100.") ||
   new URLSearchParams(location.search).get("remote") === "1";
 const SVG_NS = "http://www.w3.org/2000/svg";
 const FLOOR_VIEWBOX = {width: 1200, height: 700};
-const MAP_DISPLAY_INTERVAL_MS = 5000;
-let nextMapDisplayAt = 0;
 const floorTrails = new Map();
 const floorTrailLastSeen = new Map();
 const floorTrailPendingBreak = new Set();
@@ -110,8 +123,8 @@ updateDashboardClock();
 window.setInterval(updateDashboardClock, 1000);
 
 // The map backend publishes the newest confirmed track state every 50 ms.
-// Video preview has its own stream and the demonstration map intentionally
-// samples a point every five seconds. A 2 Hz compact status refresh keeps
+// Video preview has its own stream. Map positions and the personnel panel
+// refresh from the same status snapshot. A 2 Hz compact status refresh keeps
 // controls responsive without making JSON parsing compete with MJPEG decode.
 const DASHBOARD_REFRESH_INTERVAL_MS = 500;
 const SERVICE_DISCONNECT_FAILURES = 3;
@@ -273,8 +286,9 @@ async function fetchState() {
     const environment = await hardwareResponse.json().catch(() => null);
     if (environment) state.environment = environment;
   }
-  state.interaction_events = latestInteractionEvents;
+  state.interaction_events = currentInteractionEvents();
   state.interaction_errors = latestInteractionErrors;
+  state.interaction_analyses = latestAnalyses;
   return state;
 }
 
@@ -290,15 +304,30 @@ function refreshInteractionResults() {
   if (interactionFetchPending || now - interactionLastFetchMs < 1000) return;
   interactionFetchPending = true;
   interactionLastFetchMs = now;
-  fetch(INTERACTION_URL, {cache: "no-store"})
+  const resultUrl = resultContract === "lab-interaction-results-1.2"
+    ? `${INTERACTION_URL}?contract=${encodeURIComponent(resultContract)}` : INTERACTION_URL;
+  const requestedAt = performance.now();
+  fetch(resultUrl, {cache: "no-store"})
     .then((response) => response.ok ? response.json() : Promise.reject(new Error("interaction unavailable")))
     .then((payload) => {
+      if (resultContract && payload?.result_contract !== resultContract) throw new Error("result contract unavailable");
       latestInteractionEvents = Array.isArray(payload) ? payload : Array.isArray(payload?.results) ? payload.results : [];
       latestInteractionErrors = Array.isArray(payload?.errors) ? payload.errors : [];
+      latestAnalyses = Array.isArray(payload?.analyses) ? payload.analyses : [];
+      if (resultContract) {
+        for (const item of latestInteractionEvents) {
+          const remaining = Math.min(5000, Date.parse(item.expires_at) - Date.parse(payload.generated_at))
+            - (performance.now() - requestedAt);
+          const deadline = performance.now() + Math.max(0, Number.isFinite(remaining) ? remaining : 0);
+          interactionDeadlines.set(item.analysis_id,
+            Math.min(interactionDeadlines.get(item.analysis_id) ?? deadline, deadline));
+        }
+      }
     })
     .catch(() => {
       latestInteractionEvents = [];
       latestInteractionErrors = [];
+      latestAnalyses = resultContract ? [{status: "unavailable", reason_code: "receiver_unavailable"}] : [];
     })
     .finally(() => {
       interactionFetchPending = false;
@@ -425,13 +454,14 @@ function renderFloorPlan(floorMap) {
 }
 
 function personLabel(person) {
-  if (person.count_status === "duplicate_suppressed") return "疑似重复（不计数）";
-  if (person.counted === false) return "待确认（不计数）";
+  const trackLabel = person.global_track_id || person.track_id || "";
+  if (person.count_status === "duplicate_suppressed") return `${trackLabel} 疑似重复（不计数）`;
+  if (person.counted === false) return `${trackLabel} 待确认（不计数）`;
   if (!person.identified) {
-    return "未注册目标";
+    return `${trackLabel} 未注册目标`;
   }
   const number = person.person_number ? `${person.person_number}号 ` : "";
-  return `${number}${person.name || "已确认"}`;
+  return `${trackLabel} ${number}${person.name || "已确认"}`;
 }
 
 function updateFloorTrails(floorMap) {
@@ -483,7 +513,7 @@ function renderFloorMap(floorMap) {
   if (!floorMap) return;
   renderFloorPlan(floorMap);
   updateFloorTrails(floorMap);
-  floorMapMode.textContent = floorMap.calibrated ? "四点标定 · 5秒采样" : "示意映射 · 5秒采样";
+  floorMapMode.textContent = floorMap.calibrated ? "四点标定 · 实时更新" : "示意映射 · 实时更新";
   floorMapMode.className = floorMap.calibrated ? "calibrated" : "schematic";
   const countedPeople = Number.isFinite(Number(floorMap.counted_people))
     ? Number(floorMap.counted_people)
@@ -650,11 +680,13 @@ function renderEventFeed(state) {
 
   const rawInteractions = state.interaction_events || state.instrument_interaction?.events || state.interactions || [];
   for (const interaction of Array.isArray(rawInteractions) ? rawInteractions.slice(0, 3) : []) {
-    const interactionSubject = interaction.display_name || interaction.person_name || interaction.track_id || "目标";
+    const interactionSubject = interaction.handoff_match_status
+      ? interaction.display_name || `匿名轨迹 ${interaction.global_id || interaction.track_id || "未知"}`
+      : interaction.display_name || interaction.person_name || interaction.track_id || "目标";
     const interactionAction = interaction.interaction_label || interaction.message || interaction.description || interaction.event || "检测到交互";
     const interactionInstrument = interaction.instrument_name || interaction.instrument_id || "仪器";
     rows.push({
-      time: String(interaction.observed_at || interaction.captured_at || interaction.time || interaction.timestamp || now).slice(11, 19),
+      time: evidenceTime(interaction.observed_at || interaction.captured_at || interaction.time || interaction.timestamp || now),
       text: `${interactionSubject} ${interactionAction} ${interactionInstrument}`,
       tag: interaction.camera_id ? `仪器交互 · ${interaction.camera_id}` : "仪器交互",
       tone: interaction.level === "alarm" ? "alarm" : "normal",
@@ -668,6 +700,14 @@ function renderEventFeed(state) {
       tag: error.camera_id ? `仪器交互 · ${error.camera_id}` : "仪器交互",
       tone: "warning",
     });
+  }
+
+  const statusLabels = {pending: "等待分析", unavailable: "暂不可分析", error: "分析失败", stale: "证据超龄", expired: "结果已过期"};
+  for (const analysis of (state.interaction_analyses || []).slice(0, 3)) {
+    if (analysis.status === "valid" && analysis.is_interacting !== false) continue;
+    rows.push({time: evidenceTime(analysis.captured_at || now),
+      text: `${analysis.display_name || analysis.track_id || "仪器交互"}：${analysis.status === "valid" ? "模型判断未交互" : statusLabels[analysis.status] || "状态未知"} · ${analysis.reason_code || ""}`,
+      tag: "分析状态", tone: "warning"});
   }
 
   if (!rows.length) {
@@ -707,6 +747,7 @@ function renderEventFeed(state) {
 }
 
 function renderInitial(state) {
+  if (!videoGrid) return;
   const synchronizedReplay = state.cameras.length > 0 &&
     state.cameras.every((camera) => camera.replay?.enabled);
   videoGrid.innerHTML = state.cameras.map((camera) => `
@@ -772,6 +813,7 @@ async function refreshSynchronizedReplay() {
 }
 
 function configureSynchronizedReplay(state) {
+  if (!videoGrid) return;
   const enabled = state.cameras.length > 0 &&
     state.cameras.every((camera) => camera.replay?.enabled);
   synchronizedReplayCameraIds = state.cameras.map((camera) => camera.id);
@@ -788,7 +830,7 @@ function configureSynchronizedReplay(state) {
 }
 
 function update(state) {
-  if (videoGrid.children.length !== state.cameras.length) renderInitial(state);
+  if (videoGrid && videoGrid.children.length !== state.cameras.length) renderInitial(state);
   configureSynchronizedReplay(state);
   const replayCycles = state.cameras.map((camera) => camera.replay?.enabled ? camera.replay.cycle : null);
   if (replayCycles.length && replayCycles.every((cycle) => cycle != null && cycle === replayCycles[0])) {
@@ -797,7 +839,6 @@ function update(state) {
       floorTrails.clear();
       floorTrailLastSeen.clear();
       floorTrailPendingBreak.clear();
-      nextMapDisplayAt = 0;
     }
     lastRenderedReplayCycle = cycle;
   }
@@ -811,10 +852,7 @@ function update(state) {
   handoffSummary.textContent = handoff
     ? `${handoff.identity.handoff_from_camera} → ${handoff.id} · ${identityText(handoff.identity)}`
     : "等待重叠区继承";
-  if (performance.now() >= nextMapDisplayAt) {
-    renderFloorMap(InstrumentLocation.apply(state.floor_map, latestInteractionEvents, instrumentAnchors));
-    nextMapDisplayAt = performance.now() + MAP_DISPLAY_INTERVAL_MS;
-  }
+  renderFloorMap(InstrumentLocation.apply(state.floor_map, latestInteractionEvents, instrumentAnchors));
   renderRecording(state.recording, state.cameras);
   renderEnvironment(state.environment);
   renderEventFeed(state);

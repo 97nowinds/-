@@ -1,0 +1,21 @@
+{
+  "$comment": "Proposal only: merge these properties into the receiver's snapshot.frame root schema. This is not the full receiver Schema and is not deployed.",
+  "properties": {
+    "map_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Identity of the coordinate map used by camera.tracks[].location. Optional until both sides enable it."
+    },
+    "map_revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Layout revision returned by /api/handoff/map for the same exported snapshot, not a value read from another map request."
+    }
+  },
+  "dependentRequired": {
+    "map_id": ["map_revision"],
+    "map_revision": ["map_id"]
+  }
+}

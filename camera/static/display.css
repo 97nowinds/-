@@ -1,0 +1,9 @@
+/* Presentation uses the original dashboard; the map fills the former video area. */
+.presentation-only .display-main { grid-template-rows: minmax(0, 1fr); }
+.presentation-only .floor-map-panel { height: 100%; }
+@media (max-width: 980px) {
+  .presentation-only .display-main { min-height: 480px; }
+}
+@media (max-width: 680px) {
+  .presentation-only .display-main { min-height: 360px; }
+}

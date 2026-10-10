@@ -1,0 +1,61 @@
+{
+  "schema_version": "lab-handoff-1.1",
+  "event_id": "snapshot.frame:synthetic-alignment-001",
+  "event_type": "snapshot.frame",
+  "occurred_at": "2026-10-08T05:00:00.100+00:00",
+  "producer": "lab-camera-host",
+  "priority": "normal",
+  "status": "active",
+  "data_classification": "anonymized_monitoring",
+  "snapshot_id": "synthetic-alignment-001",
+  "captured_at": "2026-10-08T05:00:00.100+00:00",
+  "camera": {
+    "camera_id": "cam_2",
+    "frame_width": 64,
+    "frame_height": 36,
+    "image_url": "http://192.168.31.127:5174/api/handoff/test.jpg",
+    "tracks": [
+      {
+        "track_id": "7",
+        "global_id": "synthetic-global-1",
+        "local_track_id": 7,
+        "person_id": "synthetic-person-1",
+        "display_name": "synthetic-A",
+        "bbox": [
+          5,
+          4,
+          8,
+          20
+        ],
+        "bbox_format": "xywh_pixels",
+        "confidence": 0.9,
+        "observed_at": "2026-10-08T05:00:00.100+00:00",
+        "location": {
+          "x_m": 4.2,
+          "y_m": 1.8,
+          "quality": "medium",
+          "trajectory_status": "stationary",
+          "observed_at": "2026-10-08T05:00:00.000+00:00"
+        }
+      },
+      {
+        "track_id": "8",
+        "global_id": "synthetic-global-2",
+        "local_track_id": 8,
+        "person_id": null,
+        "display_name": null,
+        "bbox": [
+          25,
+          4,
+          8,
+          20
+        ],
+        "bbox_format": "xywh_pixels",
+        "confidence": 0.85,
+        "observed_at": "2026-10-08T05:00:00.100+00:00"
+      }
+    ]
+  },
+  "map_id": "synthetic-map",
+  "map_revision": "synthetic-revision"
+}

@@ -11,9 +11,14 @@ from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
+from handoff_transport import iso_time, load_demo_config
+from joint_demo import build_joint_event
+from joint_results import JointResultProjection
 
 from hardware_serial import EnvironmentSerialMonitor, discover_hardware_port
+from map_handoff import read_snapshot
+from handoff_result_index import SnapshotTrackIndex
 from member_integration import (
     MemberIntegrationConfigError,
     MemberIntegrationTransportError,
@@ -30,6 +35,7 @@ from member_integration import (
 
 ROOT = Path(__file__).resolve().parent
 TEMPLATE = ROOT / "templates" / "index.html"
+DISPLAY_TEMPLATE = ROOT / "templates" / "display.html"
 ANNOTATE_TEMPLATE = ROOT / "templates" / "annotate.html"
 FACES_TEMPLATE = ROOT / "templates" / "faces.html"
 RECORDINGS_TEMPLATE = ROOT / "templates" / "recordings.html"
@@ -105,14 +111,9 @@ class LiveSnapshotPublisher:
         self.camera_id = camera_id
         self.interval_seconds = max(0.25, float(interval_seconds))
         self.max_frames = int(max_frames) if max_frames else None
-        self.position_match_tolerance_seconds = max(
-            0.05,
-            min(
-                5.0,
-                float(os.environ.get("LAB_MEMBER_POSITION_MAX_DELTA_SECONDS", "0.75")),
-            ),
-        )
+        self.position_match_tolerance_seconds = load_demo_config()['location_max_delta_seconds']
         self.position_history = defaultdict(lambda: deque(maxlen=120))
+        self.result_index = SnapshotTrackIndex()
         self.stop_event = threading.Event()
         self.thread = None
         self._lock = threading.Lock()
@@ -191,7 +192,9 @@ class LiveSnapshotPublisher:
         for person in floor_people or []:
             if not isinstance(person, dict):
                 continue
-            observed_unix = self._unix_time(person.get("observed_at"))
+            observed_unix = self._unix_time(
+                person.get("position_observed_at", person.get("observed_at"))
+            )
             try:
                 x_m = float(person["x"])
                 y_m = float(person["y"])
@@ -252,10 +255,13 @@ class LiveSnapshotPublisher:
         max_location_delta_seconds=0.75,
     ):
         candidates_by_id = defaultdict(list)
+        alias_owners = defaultdict(set)
         for person in floor_people or []:
             if not isinstance(person, dict):
                 continue
-            observed_unix = cls._unix_time(person.get("observed_at"))
+            observed_unix = cls._unix_time(
+                person.get("position_observed_at", person.get("observed_at"))
+            )
             try:
                 x_m = float(person["x"])
                 y_m = float(person["y"])
@@ -275,6 +281,7 @@ class LiveSnapshotPublisher:
                 "association_conflict": bool(person.get("association_conflict")),
             }
             for alias in cls._person_aliases(person):
+                alias_owners[alias].add(str(person.get("track_id") or id(person)))
                 candidates_by_id[alias].append(sample)
         for alias, history in (position_history or {}).items():
             candidates_by_id[str(alias)].extend(history)
@@ -304,7 +311,22 @@ class LiveSnapshotPublisher:
                 "confidence": min(1.0, max(0.0, float(track.get("confidence") or 0.0))),
                 "observed_at": observed_at,
             }
+            identities = [identity for identity in camera.get("identities") or []
+                          if identity.get("local_id") == track.get("local_id")
+                          and identity.get("global_track_id") == global_id
+                          and identity.get("identity_lock_status") == "locked"
+                          and identity.get("person_id")]
+            if len(identities) == 1:
+                item["person_id"] = identities[0]["person_id"]
+                item["display_name"] = identities[0].get("name")
             candidates = candidates_by_id.get(global_id) or []
+            if len(alias_owners.get(global_id, ())) > 1:
+                candidates = []
+            # Held/conflicted positions are not current instrument candidates.
+            # Keep their original timestamps in the map API, omit them here.
+            candidates = [sample for sample in candidates
+                          if not sample.get("association_conflict")
+                          and sample.get("localization_state") not in {"held", "predicted"}]
             nearest = (
                 min(candidates, key=lambda sample: abs(sample["unix_time"] - captured_unix))
                 if candidates and captured_unix is not None
@@ -329,43 +351,72 @@ class LiveSnapshotPublisher:
         return result
 
     def _publish_once(self):
-        state = self._state()
-        camera = next(
-            (item for item in state.get("cameras", []) if item.get("id") == self.camera_id),
-            None,
-        )
-        if not camera or camera.get("status") != "running":
-            raise RuntimeError(f"{self.camera_id} is not running")
-        floor_people = (state.get("floor_map") or {}).get("people") or []
-        self._remember_floor_people(floor_people)
-        jpeg = _read_live_jpeg(self.server.api_base, self.camera_id)
-        width, height = _jpeg_dimensions(jpeg)
-        capture_unix = self._unix_time(camera.get("capture_received_at"))
-        now = datetime.now(timezone.utc)
-        captured_at = (
-            datetime.fromtimestamp(capture_unix, timezone.utc).isoformat(timespec="milliseconds")
-            if capture_unix is not None
-            else now.isoformat(timespec="milliseconds")
-        )
-        unique = now.strftime("%Y%m%dT%H%M%S%fZ")
-        snapshot_id = f"live-{self.camera_id}-{unique}"
-        image_url = f"{self.server.live_public_base}/api/handoff/live/{snapshot_id}.jpg"
-        event = build_monitoring_snapshot_frame_event(
-            event_id=f"snapshot.frame:{snapshot_id}",
-            snapshot_id=snapshot_id,
-            camera_id=self.camera_id,
-            captured_at=captured_at,
-            image_url=image_url,
-            frame_width=width,
-            frame_height=height,
-            tracks=self._tracks(
-                camera,
-                captured_at,
-                position_history=self.position_history,
-                max_location_delta_seconds=self.position_match_tolerance_seconds,
-            ),
-        )
+        config = load_demo_config()
+        if not config.get('automatic_enabled'):
+            self._update(state='awaiting_alignment_acceptance', last_error=None)
+            return
+        token = os.environ.get('LAB_HANDOFF_IMAGE_READ_TOKEN', '')
+        if not token:
+            raise ValueError('snapshot read credential required')
+        pending = getattr(self, '_pending_event', None)
+        if pending and time.monotonic() >= self._pending_deadline:
+            self._last_snapshot_id = pending['snapshot_id']
+            self._pending_event = pending = None
+        if pending:
+            sync_until = self._unix_time(pending['camera']['timing']['sync_valid_until'])
+            captured = self._unix_time(pending['captured_at'])
+            if time.time() >= sync_until or time.time() - captured > config['inference_start_max_age_seconds']:
+                self._last_snapshot_id = pending['snapshot_id']
+                self._pending_event = None
+                self._update(state='stale', last_error=None)
+                return
+            event = pending
+        else:
+            req = Request(config['image_base'] + '/api/handoff/frozen/' + self.camera_id,
+                          headers={'Authorization': 'Bearer ' + token})
+            with urlopen(req, timeout=5) as response:
+                frozen = json.load(response)
+            if frozen['snapshot_id'] == getattr(self, '_last_snapshot_id', None):
+                return
+            captured_at = iso_time(frozen['source_captured_at'])
+            people = [{**obs, 'x': obs['position']['x'], 'y': obs['position']['y'],
+                       'position_observed_at': obs['observed_at']}
+                      for obs in frozen['map_observations']
+                      if not obs.get('position_estimated') and obs.get('position')]
+            tracks = self._tracks(frozen['camera'], captured_at, people,
+                                 max_location_delta_seconds=config['location_max_delta_seconds'])
+            event = build_joint_event(frozen, tracks, config)
+            if time.time() - self._unix_time(event['captured_at']) > config['inference_start_max_age_seconds']:
+                self._last_snapshot_id = frozen['snapshot_id']
+                self._update(state='stale', last_error=None)
+                return
+            # Check the actual image route separately from map availability.
+            with urlopen(Request(frozen['image_url'],
+                         headers={'Authorization': 'Bearer ' + token}), timeout=5) as response:
+                jpeg = response.read(16 * 1024 * 1024 + 1)
+                if response.headers.get_content_type() != 'image/jpeg':
+                    raise ValueError('snapshot route did not return JPEG')
+            import hashlib
+            if hashlib.sha256(jpeg).hexdigest() != frozen['image_sha256']:
+                raise ValueError('frozen JPEG digest mismatch')
+            if _jpeg_dimensions(jpeg) != (frozen['frame_width'], frozen['frame_height']):
+                raise ValueError('frozen JPEG dimensions mismatch')
+            from jsonschema import Draft202012Validator, FormatChecker
+            schema = json.loads(Path(config['receiver_schema_file']).read_text(encoding='utf-8'))
+            Draft202012Validator.check_schema(schema)
+            Draft202012Validator(schema, format_checker=FormatChecker()).validate(event)
+            remaining = frozen['image_expires_at'] - time.time()
+            if remaining <= 0:
+                raise ValueError('snapshot image expired')
+            self._pending_event = event
+            self._pending_deadline = time.monotonic() + remaining
+            # The index must exist even when the result arrives before ACK.
+            self.result_index.remember(event)
+        width, height = event['camera']['frame_width'], event['camera']['frame_height']
+        snapshot_id, captured_at = event['snapshot_id'], event['captured_at']
         if not event["camera"]["tracks"]:
+            self._last_snapshot_id = snapshot_id
+            self._pending_event = None
             self._update(
                 state="idle_no_tracks",
                 last_error=None,
@@ -375,14 +426,12 @@ class LiveSnapshotPublisher:
                 frame_height=height,
             )
             return
-        with self.server.live_snapshot_lock:
-            self.server.live_snapshots[snapshot_id] = jpeg
-            while len(self.server.live_snapshots) > 12:
-                self.server.live_snapshots.pop(next(iter(self.server.live_snapshots)))
         response = self.server.member_client.send_handoff(event)
         receipt_id = extract_receipt_id(response.body)
         if response.status != 200 or not receipt_id:
             raise RuntimeError(f"member receiver rejected live frame with HTTP {response.status}")
+        self._last_snapshot_id = snapshot_id
+        self._pending_event = None
         current_status = self.public_status
         frame_reports = list(current_status["frames"])
         frame_reports.append(
@@ -423,6 +472,30 @@ class LiveSnapshotPublisher:
             self.stop_event.wait(delay)
 
 
+class CameraPublishers:
+    """Independent latest-only sender per analyzed camera, shared exact index."""
+    def __init__(self, server, camera_ids, interval_seconds, max_frames=None):
+        if not camera_ids or any(camera not in {'cam_1', 'cam_2'} for camera in camera_ids):
+            raise ValueError('demo publisher supports cam_1 and cam_2 only')
+        self.result_index = SnapshotTrackIndex()
+        self.publishers = [LiveSnapshotPublisher(server, camera, interval_seconds, max_frames)
+                           for camera in dict.fromkeys(camera_ids)]
+        for publisher in self.publishers:
+            publisher.result_index = self.result_index
+
+    @property
+    def public_status(self):
+        return {'enabled': True, 'cameras': [publisher.public_status for publisher in self.publishers]}
+
+    def start(self):
+        for publisher in self.publishers:
+            publisher.start()
+
+    def stop(self):
+        for publisher in self.publishers:
+            publisher.stop()
+
+
 class FrontendHandler(SimpleHTTPRequestHandler):
     server_version = "LabFrontend/1.0"
 
@@ -431,7 +504,8 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         api_base = (api_base or self.server.api_base).replace("\\", "\\\\").replace('"', '\\"')
         bootstrap = (
             f'<script>window.__LAB_API_BASE__ = "{api_base}"; '
-            'window.__LAB_HARDWARE_URL__ = "/api/environment";</script>'
+            'window.__LAB_HARDWARE_URL__ = "/api/environment"; '
+            f'window.__LAB_RESULT_CONTRACT__ = {json.dumps(os.environ.get("LAB_MEMBER_RESULT_CONTRACT", ""))};</script>'
         )
         html = html.replace("</head>", f"  {bootstrap}\n  </head>", 1)
         self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
@@ -439,6 +513,15 @@ class FrontendHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlsplit(self.path)
         route = parsed.path
+        if route in {"/api/handoff/map", "/api/handoff/positions"}:
+            try:
+                payload = read_snapshot(self.server.api_base)
+                if route.endswith("/positions"):
+                    payload.pop("layout")
+                self._send_json(payload)
+            except Exception:
+                self._send_json({"error": "camera backend unavailable", "people": []}, status=503)
+            return
         requested_api = parse_qs(parsed.query).get("api", [None])[0]
         if requested_api and re.fullmatch(r"https?://[^\\s]+", requested_api):
             requested_api = requested_api.rstrip("/")
@@ -487,7 +570,10 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         if route == "/api/instruments/anchors":
             self._send_json(json.loads(INSTRUMENT_CONFIG.read_text(encoding="utf-8")))
             return
-        if route == "/":
+        if route == "/display":
+            self._send_html(DISPLAY_TEMPLATE, requested_api)
+            return
+        if route in {"/", "/monitor"}:
             self._send_html(TEMPLATE, requested_api)
             return
         if route == "/annotate":
@@ -1085,18 +1171,55 @@ class FrontendHandler(SimpleHTTPRequestHandler):
             )
             return
         camera_id = parse_qs(query).get("camera_id", [None])[0]
+        contract = parse_qs(query).get("contract", [None])[0]
+        if contract is not None and contract != 'lab-interaction-results-1.2':
+            self._send_json({'error': 'unsupported result contract'}, status=400)
+            return
         if camera_id is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", camera_id):
             self._send_json({"error": "invalid camera_id"}, status=400)
             return
         try:
-            response = client.latest_interactions(camera_id)
+            response = (client.latest_interactions(camera_id, contract=contract)
+                        if contract else client.latest_interactions(camera_id))
         except MemberIntegrationTransportError as error:
             self._send_json(
                 {"results": [], "integration": {"status": "unavailable", "error": str(error)}},
                 status=502,
             )
             return
-        self._send_json(response.body, status=response.status)
+        body = response.body
+        if contract and (not isinstance(body, dict) or body.get('result_contract') != contract):
+            self._send_json({'error': 'receiver result contract unavailable',
+                             'results': [], 'analyses': []}, status=502)
+            return
+        if contract:
+            if not all(isinstance(body.get(field), list) for field in ('results', 'analyses', 'errors')):
+                self._send_json({'error': 'invalid result contract shape'}, status=502)
+                return
+            for analysis in body['analyses']:
+                if (not isinstance(analysis, dict) or analysis.get('status') not in
+                        {'valid', 'pending', 'unavailable', 'error', 'stale', 'expired'}
+                        or (analysis['status'] == 'valid' and type(analysis.get('is_interacting')) is not bool)
+                        or (analysis['status'] != 'valid' and analysis.get('is_interacting') is not None)):
+                    self._send_json({'error': 'invalid analysis status or judgment'}, status=502)
+                    return
+        # This opt-in affects only the local result proxy. It sends no new
+        # fields to the receiver and defaults off during existing joint tests.
+        if contract or os.environ.get("LAB_MEMBER_EXACT_RESULT_MATCH", "0") == "1":
+            results = extract_results(body)
+            publisher = self.server.live_publisher
+            if results is not None:
+                index = publisher.result_index if publisher else SnapshotTrackIndex()
+                resolved = [index.resolve(item) for item in results if isinstance(item, dict)]
+                body = resolved if isinstance(body, list) else {**body, "results": resolved}
+                if contract:
+                    body['analyses'] = [index.resolve(item) for item in body['analyses']]
+                    try:
+                        body = self.server.joint_result_projection.project(body)
+                    except (ValueError, TypeError, KeyError):
+                        self._send_json({'error': 'invalid result timestamps or association'}, status=502)
+                        return
+        self._send_json(body, status=response.status)
 
     def _send_file(self, path, content_type):
         self._send_bytes(path.read_bytes(), content_type)
@@ -1139,6 +1262,8 @@ def main():
         os.environ.get("LAB_MEMBER_RECEIVER_IP", "192.168.31.189").strip(),
     }
     server.live_publisher = None
+    server.joint_result_projection = JointResultProjection(
+        ROOT / 'runtime' / 'joint-demo-analyses.jsonl')
     configured_port = os.environ.get("LAB_HARDWARE_PORT", "").strip()
     auto_detect = os.environ.get("LAB_HARDWARE_AUTO", "1").strip().lower() not in {
         "0", "false", "no", "off"
@@ -1162,12 +1287,14 @@ def main():
             "status": "configured",
         }
         live_enabled = os.environ.get(
-            "LAB_MEMBER_LIVE_PUBLISH_ENABLED", "1"
+            "LAB_MEMBER_LIVE_PUBLISH_ENABLED", "0"
         ).strip().lower() not in {"0", "false", "no", "off"}
         if live_enabled:
-            server.live_publisher = LiveSnapshotPublisher(
+            camera_ids = os.environ.get('LAB_MEMBER_LIVE_CAMERA_IDS',
+                os.environ.get('LAB_MEMBER_LIVE_CAMERA_ID', 'cam_1,cam_2')).split(',')
+            server.live_publisher = CameraPublishers(
                 server,
-                camera_id=os.environ.get("LAB_MEMBER_LIVE_CAMERA_ID", "cam_2"),
+                camera_ids=[camera.strip() for camera in camera_ids],
                 interval_seconds=float(
                     os.environ.get("LAB_MEMBER_LIVE_INTERVAL_SECONDS", "1")
                 ),

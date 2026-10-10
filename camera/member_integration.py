@@ -157,10 +157,18 @@ class MemberServiceClient:
             raise ValueError("handoff event requires a non-empty event_id")
         return self._request("POST", "/api/handoffs", dict(event))
 
-    def latest_interactions(self, camera_id: str | None = None) -> MemberServiceResponse:
+    def latest_interactions(self, camera_id: str | None = None,
+                            contract: str | None = None) -> MemberServiceResponse:
         path = "/api/interaction-results/latest"
+        params = {}
         if camera_id:
-            path = f"{path}?{urlencode({'camera_id': camera_id})}"
+            params['camera_id'] = camera_id
+        if contract:
+            if contract != 'lab-interaction-results-1.2':
+                raise ValueError('unsupported result contract')
+            params['contract'] = contract
+        if params:
+            path = f"{path}?{urlencode(params)}"
         return self._request("GET", path)
 
 
@@ -350,10 +358,13 @@ def build_monitoring_snapshot_frame_event(
     frame_width: int,
     frame_height: int,
     tracks: list[dict[str, Any]],
+    map_id: str | None = None,
+    map_revision: str | None = None,
+    include_map_reference: bool = False,
 ) -> dict[str, Any]:
     """Build an anonymized live frame without credentials or embeddings."""
 
-    return {
+    event = {
         "schema_version": "lab-handoff-1.1",
         "event_id": event_id,
         "event_type": "snapshot.frame",
@@ -372,6 +383,13 @@ def build_monitoring_snapshot_frame_event(
             "tracks": tracks,
         },
     }
+    # Receiver 1.1 may reject additional properties. Explicit opt-in only;
+    # the running publisher does not enable this until both schemas agree.
+    if include_map_reference:
+        if not map_id or not map_revision:
+            raise ValueError("map_id and map_revision are required when enabled")
+        event.update(map_id=str(map_id), map_revision=str(map_revision))
+    return event
 
 
 def extract_results(body: Any) -> list[Any] | None:

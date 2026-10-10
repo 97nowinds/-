@@ -11,6 +11,14 @@
 
 set -Eeuo pipefail
 
+# Three camera workers share eight allocated CPUs. Bound native pools so
+# concurrent ONNX, PyTorch and JPEG work cannot each consume all CPUs.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-2}"
+export LAB_INFERENCE_THREADS="${LAB_INFERENCE_THREADS:-2}"
+export LAB_ASYNC_EVENT_WRITES="${LAB_ASYNC_EVENT_WRITES:-1}"
+
 if ! type module >/dev/null 2>&1; then
     source /usr/share/lmod/lmod/init/bash
 fi
@@ -88,7 +96,7 @@ if [[ -n "${LAB_CAM_ENTRANCE_RTSP:-}" ]]; then
     export LAB_CAM_ENTRANCE_RTSP
 fi
 export LAB_RTSP_TRANSPORT="${LAB_RTSP_TRANSPORT:-tcp}"
-export OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;${LAB_RTSP_TRANSPORT}|stimeout;5000000|fflags;nobuffer|flags;low_delay|max_delay;0|analyzeduration;0|probesize;32768"
+export OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;${LAB_RTSP_TRANSPORT}|stimeout;5000000"
 export LAB_FACE_ENGINE="arcface"
 export LAB_FACE_DATA_DIR="${LAB_FACE_DATA_DIR:-$PROJECT_ROOT/camera/data}"
 export LAB_RECORDINGS_DIR="${LAB_RECORDINGS_DIR:-$PROJECT_ROOT/camera/data/recordings}"

@@ -22,6 +22,13 @@ const InstrumentLocation = (() => {
   }
 
   function identityScore(person, event) {
+    if (event.handoff_match_status === "unmatched") return 0;
+    if (event.handoff_match_status === "matched") {
+      // Resolved global identity is authoritative; raw track_id stays a frame key.
+      if (person.person_id && event.person_id && String(person.person_id) === String(event.person_id)) return 1;
+      const aliases = new Set([person.track_id, person.global_track_id, ...(person.global_track_ids || [])].filter(Boolean).map(String));
+      return event.global_id != null && aliases.has(String(event.global_id)) ? 0.9 : 0;
+    }
     if (person.person_id && event.person_id && String(person.person_id) === String(event.person_id)) return 1;
     const aliases = new Set([person.track_id, person.global_track_id, ...(person.global_track_ids || [])].filter(Boolean).map(String));
     return [event.global_id, event.global_track_id, event.track_id].some((id) => id != null && aliases.has(String(id))) ? 0.9 : 0;

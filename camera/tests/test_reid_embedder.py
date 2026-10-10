@@ -8,6 +8,15 @@ from reid_embedder import ReIDEmbedder, ReIDNetwork
 
 
 class ReIDEmbedderTests(unittest.TestCase):
+    def test_initial_only_checkpoint_is_rejected(self):
+        state = {"bn.running_mean": torch.zeros(4), "bn.running_var": torch.ones(4)}
+        with self.assertRaisesRegex(RuntimeError, "initial normalization"):
+            ReIDEmbedder.validate_trained_statistics(state)
+
+    def test_checkpoint_with_learned_statistics_is_accepted(self):
+        state = {"bn.running_mean": torch.tensor([0.1, 0.0]), "bn.running_var": torch.ones(2)}
+        ReIDEmbedder.validate_trained_statistics(state)
+
     def test_crop_person_clips_box_to_frame(self):
         frame = np.zeros((100, 80, 3), dtype=np.uint8)
 
