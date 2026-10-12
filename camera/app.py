@@ -14,6 +14,7 @@ import threading
 import time
 from handoff_transport import AuthoritySync, bearer_authorized, load_demo_config
 from map_handoff import map_snapshot
+from hd_snapshot import encode_detection_snapshot
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
@@ -696,6 +697,7 @@ class CameraWorker:
                 processed_sequence = sequence
 
                 self.handoff_source_dimensions = (frame.shape[1], frame.shape[0])
+                raw_handoff_frame = frame
                 frame = self.resize(frame)
                 self.frame_counter += 1
                 inference_started_at = time.time()
@@ -707,6 +709,7 @@ class CameraWorker:
                     frame,
                     frame_unix_time=captured_at,
                     frame_monotonic_time=captured_monotonic,
+                    raw_handoff_frame=raw_handoff_frame,
                 )
                 self.inference_ended_at = time.time()
                 self.inference_ended_monotonic = time.monotonic()
@@ -1340,7 +1343,7 @@ class CameraWorker:
             80 + (track_id * 31) % 160,
         )
 
-    def process(self, frame, frame_unix_time=None, frame_monotonic_time=None):
+    def process(self, frame, frame_unix_time=None, frame_monotonic_time=None, raw_handoff_frame=None):
         stage_started = time.perf_counter()
         self.pipeline_stage_ms = {}
         display = frame.copy()
@@ -1795,9 +1798,10 @@ class CameraWorker:
         # Only real successful detections may freeze evidence. Cached/held
         # boxes are useful for preview continuity, but are not this frame's boxes.
         if (os.environ.get("LAB_HANDOFF_FREEZE_ENABLED", "0") == "1"
-                and should_infer and not hold_cached_tracks and not self.yolo_error):
-            ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            if ok:
+                and should_infer and not hold_cached_tracks and not self.yolo_error
+                and raw_handoff_frame is not None):
+            jpeg, hd_tracks = encode_detection_snapshot(raw_handoff_frame, frame, published_tracks)
+            if jpeg:
                 self.handoff_sequence += 1
                 frame_id = f"{self.handoff_session}-{self.camera['id']}-{self.handoff_sequence}"
                 layout = map_snapshot({'floor_map': self.floor_map.public_config()})
@@ -1807,15 +1811,17 @@ class CameraWorker:
                     'source_occurred_at': time.time(),
                     'source_clock': 'capture-' + self.handoff_session,
                     'sync_mapping': self.handoff_sync.current(),
-                    'frame_width': frame.shape[1], 'frame_height': frame.shape[0],
-                    'source_dimensions': list(getattr(self, 'handoff_source_dimensions',
-                                                     (frame.shape[1], frame.shape[0]))),
+                    'frame_width': raw_handoff_frame.shape[1], 'frame_height': raw_handoff_frame.shape[0],
+                    'source_dimensions': [raw_handoff_frame.shape[1], raw_handoff_frame.shape[0]],
+                    'detection_dimensions': [frame.shape[1], frame.shape[0]],
+                    'image_transform': 'identity', 'full_frame': True,
+                    'service_revision': 'hd-same-frame-20261011-r1',
                     'map_id': layout['map_id'], 'map_revision': layout['map_revision'],
-                    'camera': {'yolo_tracks': published_tracks,
+                    'camera': {'yolo_tracks': hd_tracks,
                         'identities': self.status_payload()['identities']},
                     'map_observations': observations,
                     'timestamp_source': 'recording_replay' if self.replay_enabled else 'host_receive',
-                    'jpeg_base64': base64.b64encode(encoded.tobytes()).decode('ascii'),
+                    'jpeg_base64': base64.b64encode(jpeg).decode('ascii'),
                 }
                 with self.lock:
                     self.frozen_handoff = deepcopy(evidence)
@@ -2867,7 +2873,10 @@ def annotate():
 
 @app.route("/api/health")
 def api_health():
-    return jsonify({"status": "ok", "service": "lab-api"})
+    return jsonify({"status": "ok", "service": "lab-api",
+                    "service_revision": "hd-same-frame-20261011-r1",
+                    "snapshot_schema_version": "lab-handoff-1.2",
+                    "freeze_enabled": os.environ.get('LAB_HANDOFF_FREEZE_ENABLED', '0') == '1'})
 
 
 @app.route("/video/<camera_id>")
@@ -2926,6 +2935,8 @@ def api_frozen_handoff(camera_id):
         evidence = deepcopy(worker.frozen_handoff)
     if worker.status != 'running' or evidence is None:
         return jsonify({'error': 'frozen detection snapshot unavailable'}), 503
+    if time.time() - evidence['source_captured_at'] > load_demo_config()['inference_start_max_age_seconds']:
+        return jsonify({'error': 'frozen detection snapshot expired'}), 503
     return jsonify(evidence)
 
 

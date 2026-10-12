@@ -24,13 +24,18 @@ def build_joint_event(frozen, tracks, config):
         raise ValueError('source timestamps outside sync validity')
     alignment = config['alignment'].get(frozen['camera_id'])
     if (not alignment or not alignment.get('alignment_revision')
-            or alignment.get('transform') != 'full_frame_resize'):
+            or alignment.get('transform') not in ('full_frame_resize', 'identity')):
         raise ValueError('camera alignment unavailable')
     width, height = frozen['frame_width'], frozen['frame_height']
     if (alignment.get('jpeg_width'), alignment.get('jpeg_height')) != (width, height):
         raise ValueError('JPEG dimensions differ from accepted alignment')
     if alignment.get('source_dimensions') != frozen['source_dimensions']:
         raise ValueError('source dimensions differ from accepted alignment')
+    transform = alignment['transform']
+    if transform == 'identity' and (frozen.get('image_transform') != 'identity'
+            or not frozen.get('full_frame') or frozen['source_dimensions'] != [width, height]
+            or (alignment['hd_width'], alignment['hd_height']) != (width, height)):
+        raise ValueError('original full-frame JPEG required')
     tracks = deepcopy(tracks)
     for track in tracks:
         track['observed_at'] = iso_time(captured)
@@ -62,7 +67,7 @@ def build_joint_event(frozen, tracks, config):
             'image_url': frozen['image_url'], 'image_sha256': frozen['image_sha256'],
             'image_available_at': iso_time(frozen['image_available_at']),
             'image_expires_at': iso_time(frozen['image_expires_at']),
-            'geometry': {'binding': 'detection_frame', 'transform': 'full_frame_resize',
+            'geometry': {'binding': 'detection_frame', 'transform': transform,
                 'detection_width': width, 'detection_height': height,
                 'hd_width': alignment['hd_width'], 'hd_height': alignment['hd_height'],
                 'alignment_revision': alignment['alignment_revision'], 'hd_alignment_status': 'verified'},

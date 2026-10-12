@@ -17,4 +17,4 @@ if (-not $CredentialsFile) {
 if (-not (Test-Path -LiteralPath $CredentialsFile)) {
     throw "Missing server credentials file; provision image_read_token and sync_read_token privately first."
 }
-& $Python (Join-Path $handoffRoot "map_handoff.py") --api $BackendUrl --port 5175 --credentials-file $CredentialsFile
+& $Python (Join-Path $handoffRoot "map_handoff.py") --api $BackendUrl --port 5175 --credentials-file $CredentialsFile --sample-archive (Join-Path $handoffRoot "runtime\handoff-samples\archive")

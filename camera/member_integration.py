@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, build_opener, ProxyHandler
 
 
 DEFAULT_TIMEOUT_SECONDS = 3.0
@@ -69,7 +69,7 @@ def _validate_base_url(value: str) -> str:
 class MemberServiceClient:
     """Server-side adapter for handoffs and interaction result reads."""
 
-    def __init__(self, base_url: str, token: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS):
+    def __init__(self, base_url: str, token: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS, *, direct: bool = False):
         self.base_url = _validate_base_url(base_url)
         self._token = token.strip()
         if not self._token:
@@ -85,6 +85,7 @@ class MemberServiceClient:
                 "member service bearer token must not contain whitespace"
             )
         self.timeout_seconds = float(timeout_seconds)
+        self._direct_opener = build_opener(ProxyHandler({})) if direct else None
         if not 0.1 <= self.timeout_seconds <= 30.0:
             raise MemberIntegrationConfigError("member service timeout must be between 0.1 and 30 seconds")
 
@@ -95,6 +96,7 @@ class MemberServiceClient:
             values.get("LAB_MEMBER_SERVICE_URL", ""),
             values.get("LAB_MEMBER_SERVICE_TOKEN", ""),
             float(values.get("LAB_MEMBER_SERVICE_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)),
+            direct=values.get('LAB_MEMBER_SERVICE_DIRECT', '0').lower() in {'1', 'true', 'yes'},
         )
 
     @property
@@ -126,7 +128,8 @@ class MemberServiceClient:
             headers["Content-Type"] = "application/json; charset=utf-8"
         request = Request(f"{self.base_url}{path}", data=data, headers=headers, method=method)
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
+            open_request = self._direct_opener.open if self._direct_opener else urlopen
+            with open_request(request, timeout=self.timeout_seconds) as response:
                 return self._decode_response(response.status, response.headers, response.read())
         except HTTPError as error:
             return self._decode_response(error.code, error.headers, error.read())

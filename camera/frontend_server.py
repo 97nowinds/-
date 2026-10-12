@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 from handoff_transport import iso_time, load_demo_config
 from joint_demo import build_joint_event
 from joint_results import JointResultProjection
+from management_api import ManagementRuntime, handle_management
 
 from hardware_serial import EnvironmentSerialMonitor, discover_hardware_port
 from map_handoff import read_snapshot
@@ -511,6 +512,8 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_GET(self):
+        if handle_management(self, 'GET'):
+            return
         parsed = urlsplit(self.path)
         route = parsed.path
         if route in {"/api/handoff/map", "/api/handoff/positions"}:
@@ -599,6 +602,8 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         self.send_error(404, "frontend resource not found")
 
     def do_POST(self):
+        if handle_management(self, 'POST'):
+            return
         route = urlsplit(self.path).path
         allowed_routes = {
             "/api/integration/synthetic-round2": self._run_synthetic_round2,
@@ -1304,6 +1309,10 @@ def main():
                     else None
                 ),
             )
+    server.management = None
+    if os.environ.get('LAB_MANAGEMENT_ENABLED', '0') == '1':
+        server.management = ManagementRuntime(server, ROOT / 'config' / 'management.json')
+        server.management.start()
     server.environment.start()
     if server.live_publisher is not None:
         server.live_publisher.start()
@@ -1315,6 +1324,8 @@ def main():
     try:
         server.serve_forever()
     finally:
+        if server.management is not None:
+            server.management.stop()
         if server.live_publisher is not None:
             server.live_publisher.stop()
         server.environment.stop()

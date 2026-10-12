@@ -852,7 +852,11 @@ function update(state) {
   handoffSummary.textContent = handoff
     ? `${handoff.identity.handoff_from_camera} → ${handoff.id} · ${identityText(handoff.identity)}`
     : "等待重叠区继承";
-  renderFloorMap(InstrumentLocation.apply(state.floor_map, latestInteractionEvents, instrumentAnchors));
+  // A missing optional instrument adapter must not stop the live map refresh.
+  const visibleMap = typeof InstrumentLocation !== "undefined"
+    ? InstrumentLocation.apply(state.floor_map, latestInteractionEvents, instrumentAnchors)
+    : state.floor_map;
+  renderFloorMap(visibleMap);
   renderRecording(state.recording, state.cameras);
   renderEnvironment(state.environment);
   renderEventFeed(state);

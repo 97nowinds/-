@@ -112,6 +112,16 @@ class MapHandler(BaseHTTPRequestHandler):
                 return
             if image:
                 jpeg = self.server.snapshots.get(image.group(1))
+                if jpeg is None and getattr(self.server, 'sample_archive', None):
+                    directory = self.server.sample_archive / image.group(1)
+                    try:
+                        manifest = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
+                        if time.time() < manifest['expires_at']:
+                            archived = (directory / 'snapshot.jpg').read_bytes()
+                            if hashlib.sha256(archived).hexdigest() == manifest['image_sha256']:
+                                jpeg = archived
+                    except (OSError, ValueError, KeyError, TypeError):
+                        pass
                 if jpeg is None:
                     self._json({'error': 'snapshot not found or expired'}, 404)
                     return
@@ -162,13 +172,17 @@ if __name__ == '__main__':
     parser.add_argument('--api', default='http://127.0.0.1:15001')
     parser.add_argument('--port', type=int, default=5175)
     parser.add_argument('--credentials-file', type=Path)
+    parser.add_argument('--sample-archive', type=Path)
     args = parser.parse_args()
     server = ThreadingHTTPServer(('0.0.0.0', args.port), MapHandler)
     server.api_base = args.api
+    server.sample_archive = args.sample_archive.resolve() if args.sample_archive else None
     credentials = (json.loads(args.credentials_file.read_text(encoding='utf-8'))
                    if args.credentials_file else {})
     server.image_token = os.environ.get('LAB_HANDOFF_IMAGE_READ_TOKEN', '') or credentials.get('image_read_token', '')
     server.sync_token = os.environ.get('LAB_HANDOFF_SYNC_READ_TOKEN', '') or credentials.get('sync_read_token', '')
     server.authority_clock = 'main-' + uuid.uuid4().hex
-    server.snapshots = ImmutableSnapshots(retention_seconds=load_demo_config()['jpeg_retention_seconds'])
+    config = load_demo_config()
+    server.snapshots = ImmutableSnapshots(retention_seconds=config['jpeg_retention_seconds'],
+        max_bytes=config.get('jpeg_cache_max_bytes', 128 * 1024 * 1024))
     server.serve_forever()

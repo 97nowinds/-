@@ -8,6 +8,7 @@ class SnapshotTrackIndex:
     def __init__(self, max_snapshots=300):
         self.max_snapshots = max_snapshots
         self.snapshots = OrderedDict()
+        self.frames = {}
         self.lock = threading.Lock()
 
     def remember(self, event):
@@ -21,21 +22,32 @@ class SnapshotTrackIndex:
                 tracks[track_id] = None
             else:
                 tracks[track_id] = {field: deepcopy(track.get(field)) for field in
-                    ('global_id', 'person_id', 'display_name', 'observed_at')}
+                    ('global_id', 'person_id', 'display_name', 'observed_at', 'bbox', 'bbox_format')}
         with self.lock:
             self.snapshots[key] = tracks
+            self.frames[key] = {field: deepcopy(camera.get(field)) for field in
+                ('image_url', 'image_sha256', 'frame_width', 'frame_height', 'source_frame_id')}
             self.snapshots.move_to_end(key)
             while len(self.snapshots) > self.max_snapshots:
-                self.snapshots.popitem(last=False)
+                removed, _ = self.snapshots.popitem(last=False)
+                self.frames.pop(removed, None)
+
+    def evidence_frame(self, camera_id, snapshot_id):
+        with self.lock:
+            return deepcopy(self.frames.get((str(camera_id), str(snapshot_id))))
+
+    def evidence_track(self, camera_id, snapshot_id, track_id):
+        """Read original identity/observation time for strict evidence validation."""
+        key = (str(camera_id), str(snapshot_id))
+        with self.lock:
+            return deepcopy(self.snapshots.get(key, {}).get(str(track_id)))
 
     def resolve(self, result):
         item = dict(result)
         required = ('camera_id', 'snapshot_id', 'track_id')
         match = None
         if all(result.get(key) is not None for key in required):
-            key = (str(result['camera_id']), str(result['snapshot_id']))
-            with self.lock:
-                match = deepcopy(self.snapshots.get(key, {}).get(str(result['track_id'])))
+            match = self.evidence_track(*(result[key] for key in required))
         # Receiver predictions cannot assign an identity absent from the sent row.
         for field in ('global_id', 'person_id', 'display_name'):
             item[field] = match.get(field) if match else None

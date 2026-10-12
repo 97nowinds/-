@@ -1,10 +1,11 @@
-param(
+﻿param(
     [string]$BackendUrl = "http://127.0.0.1:15000",
     [string]$PythonPath,
     [int]$Port = 5173,
     [switch]$ConfigureMemberIntegration,
     [switch]$GuiTokenPrompt,
     [switch]$DisableLivePublisher,
+    [switch]$EnableManagement,
     [int]$LiveMaxFrames = 0,
     [string]$MemberServiceUrl = "http://192.168.31.189:8765"
 )
@@ -20,6 +21,14 @@ if ($PythonPath) {
     $python = $PythonPath
 }
 $server = Join-Path $projectRoot "frontend_server.py"
+if ($EnableManagement) {
+    if ([string]::IsNullOrWhiteSpace($env:LAB_MANAGEMENT_ADMIN_TOKEN) -and
+        -not (Test-Path -LiteralPath (Join-Path $projectRoot 'runtime\feishu-app.dpapi')) -and
+        -not (Test-Path -LiteralPath (Join-Path $projectRoot 'runtime\feishu-group.dpapi'))) {
+        throw "请先在本机配置 LAB_MANAGEMENT_ADMIN_TOKEN，再启用通知管理。不要将令牌写入脚本或聊天。"
+    }
+    $env:LAB_MANAGEMENT_ENABLED = "1"
+}
 
 function Read-MemberTokenFromDialog {
     Add-Type -AssemblyName System.Windows.Forms

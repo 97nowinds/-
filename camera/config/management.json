@@ -1,0 +1,93 @@
+{
+  "lab_id": "lab_main",
+  "event_max_age_seconds": 15,
+  "cooldown_seconds": 120,
+  "principals": [
+    {
+      "id": "administrator",
+      "role": "admin",
+      "token_env": "LAB_MANAGEMENT_ADMIN_TOKEN"
+    },
+    {
+      "id": "lab_manager",
+      "role": "manager",
+      "labs": [
+        "lab_main"
+      ],
+      "token_env": "LAB_MANAGEMENT_MANAGER_TOKEN"
+    },
+    {
+      "id": "yxq",
+      "role": "experimenter",
+      "labs": [
+        "lab_main"
+      ],
+      "person_ids": [],
+      "token_env": "LAB_MANAGEMENT_YXQ_TOKEN"
+    },
+    {
+      "id": "observer",
+      "role": "viewer",
+      "labs": [
+        "lab_main"
+      ],
+      "token_env": "LAB_MANAGEMENT_VIEWER_TOKEN"
+    },
+    {
+      "id": "member_detector",
+      "role": "producer",
+      "labs": [
+        "lab_main"
+      ],
+      "cameras": [
+        "cam_1",
+        "cam_2",
+        "cam_entrance"
+      ],
+      "token_env": "LAB_MANAGEMENT_PRODUCER_TOKEN"
+    }
+  ],
+  "routes": [
+    {
+      "id": "laboratory_group",
+      "transport": "webhook",
+      "labs": [
+        "lab_main"
+      ],
+      "event_types": [
+        "person.entered",
+        "instrument.started",
+        "safety.no_mask"
+      ],
+      "webhook_env": "LAB_FEISHU_GROUP_WEBHOOK",
+      "secret_env": "LAB_FEISHU_GROUP_SECRET"
+    }
+  ],
+  "silent_events": [
+    "person.entered",
+    "instrument.started"
+  ],
+  "evidence_required_events": [
+    "safety.no_mask",
+    "safety.no_lab_coat",
+    "safety.no_gloves"
+  ],
+  "ppe_rules": {
+    "mask": {
+      "enabled": true,
+      "minimum_confidence": 0.9
+    },
+    "lab_coat": {
+      "enabled": false,
+      "minimum_confidence": 0.9
+    },
+    "gloves": {
+      "enabled": false,
+      "minimum_confidence": 0.9
+    }
+  },
+  "evidence_image_origins": [
+    "http://127.0.0.1:5175",
+    "http://192.168.31.127:5175"
+  ]
+}
