@@ -6,6 +6,10 @@ import inspect
 import hashlib
 import time
 import sys
+import heapq
+import gzip
+from contextlib import ExitStack
+from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -21,8 +25,11 @@ def main():
     parser.add_argument('--session', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--floor-map', type=Path, default=Path('config/floor_map.json'))
-    parser.add_argument('--max-seconds', type=float, default=100000)
+    parser.add_argument('--max-seconds', type=float, default=1e12)
     parser.add_argument('--reid-model', type=Path, default=Path('models/osnet_x1_0_msmt17.pth'))
+    parser.add_argument('--full-rate', action='store_true', help='Controlled replay: infer every recorded frame instead of production stride')
+    parser.add_argument('--handoff-policy', type=Path)
+    parser.add_argument('--audit-candidates', action='store_true', help='Record rejected cross-camera candidate evidence without changing decisions')
     parser.add_argument('--audit-relink', action='store_true', help='Read-only candidate evidence, including rejected candidates')
     parser.add_argument('--detector', type=Path, default=Path('models/yolov8n.pt'))
     parser.add_argument('--guarded-lost-low', action='store_true', help='Evaluate guarded low-score Lost recovery on Cam2 only')
@@ -31,7 +38,33 @@ def main():
     configs = {c['id']: c for c in json.loads(Path('config/cameras.json').read_text(encoding='utf-8'))}
     floor = FloorMapProjector.from_path(args.floor_map)
     embedder = ReIDEmbedder(args.reid_model)
-    coordinator = CrossCameraTrackCoordinator(embedder, floor_map=floor)
+    coordinator = CrossCameraTrackCoordinator(embedder, floor_map=floor, handoff_policy_path=args.handoff_policy)
+    candidate_audit = []
+    reason_counts = Counter()
+    original_associate = coordinator.batch_associator.associate
+    def audited_associate(observations, targets, stream_skew_seconds=0.0):
+        decisions, evaluations = original_associate(observations, targets, stream_skew_seconds)
+        by_obs = {(o.camera_id, o.local_id): o for o in observations}
+        by_target = {t.global_id: t for t in targets}
+        for evaluation in evaluations:
+            detail = dict(evaluation)
+            reason_counts[detail.get('reason', 'unknown')] += 1
+            if args.audit_candidates:
+                observation = by_obs.get((detail.get('target_camera'), detail.get('target_local_id')))
+                target = by_target.get(detail.get('source_global_id'))
+                if observation is not None and target is not None:
+                    source = target.camera_observations.get(detail.get('source_camera'), {})
+                    detail.update(source_anchor=source.get('image_anchor', target.image_anchor),
+                                  target_anchor=observation.image_anchor,
+                                  source_box=source.get('box', target.box), target_box=observation.box)
+                    if not detail.get('eligible'):
+                        from dataclasses import replace
+                        variant = replace(target, appearance=source.get('appearance', target.appearance))
+                        score, _ = coordinator.batch_associator._gallery_score(observation, variant)
+                        detail['diagnostic_reid_score'] = score
+                candidate_audit.append(detail)
+        return decisions, evaluations
+    coordinator.batch_associator.associate = audited_associate
     relink_audit = []
     if args.audit_relink:
         original_relink = coordinator._same_camera_relink_assignments
@@ -64,33 +97,44 @@ def main():
                 relink_audit.append({'local_id':item['local_id'],'candidates':candidates})
             return original_relink(camera_id, prepared, active_local_ids, now, unix_time)
         coordinator._same_camera_relink_assignments = audited_relink
-    captures, trackers, schedule = {}, {}, []
+    captures, trackers, schedules = {}, {}, []
+    schedule_files = ExitStack()
     for cid, stream in info['streams'].items():
         captures[cid] = cv2.VideoCapture(str(args.session / stream['video_file']))
         cfg = configs[cid]
         options = dict(confidence=cfg.get('yolo_confidence', .45), image_size=cfg.get('yolo_image_size', 640))
         if 'tracker_config' in inspect.signature(YoloPersonTracker).parameters:
             options['tracker_config'] = cfg.get('yolo_tracker_config', 'bytetrack.yaml')
+        options['reid_embedder'] = embedder
         if args.guarded_lost_low and cid == 'cam_2':
             options['tracker_config'] = 'config/bytetrack_guarded_lab.yaml'
             options['reid_embedder'] = embedder
         trackers[cid] = YoloPersonTracker(args.detector, **options)
-        with (args.session / stream['timestamps_file']).open(newline='') as source:
-            for row in csv.DictReader(source):
-                schedule.append((float(row['unix_time']), cid, int(row['frame_index'])))
-    schedule.sort()
-    start = schedule[0][0]
+        source = schedule_files.enter_context((args.session / stream['timestamps_file']).open(newline=''))
+        def camera_schedule(reader, camera):
+            for row in reader:
+                yield (float(row['unix_time']), camera, int(row['frame_index']))
+        schedules.append(camera_schedule(csv.DictReader(source), cid))
+    schedule = heapq.merge(*schedules)
+    first = next(schedule)
+    import itertools
+    schedule = itertools.chain([first], schedule)
+    start = first[0]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.with_suffix('.meta.json').write_text(json.dumps({
-        'session_id': info['session_id'], 'replay_only': True,
+        'session_id': info['session_id'], 'replay_only': True, 'full_rate':args.full_rate,
+        'reid_sha256':hashlib.sha256(args.reid_model.read_bytes()).hexdigest(),
+        'coordinator_sha256':hashlib.sha256(Path('yolo_person_tracker.py').read_bytes()).hexdigest(),
+        'association_sha256':hashlib.sha256(Path('association.py').read_bytes()).hexdigest(),
         'detector_model': args.detector.name,
-        'guarded_lost_low': args.guarded_lost_low,
-        'guarded_implementation_sha256': hashlib.sha256(Path('guarded_byte_tracker.py').read_bytes()).hexdigest() if args.guarded_lost_low else None,
+        'guarded_lost_low': any(t.guarded_tracker is not None for t in trackers.values()),
+        'guarded_implementation_sha256': hashlib.sha256(Path('guarded_byte_tracker.py').read_bytes()).hexdigest() if any(t.guarded_tracker is not None for t in trackers.values()) else None,
         'detector_sha256': hashlib.sha256(args.detector.read_bytes()).hexdigest(),
         'reid_model': args.reid_model.name,
         'mtmc_config_sha256': hashlib.sha256(Path('config/mtmc.json').read_bytes()).hexdigest(),
         'floor_map_sha256': hashlib.sha256(args.floor_map.read_bytes()).hexdigest(),
-        'face_recognition_run': False, 'identity_ground_truth': False,
+        'face_recognition_run': False, 'identity_ground_truth': False, 'candidate_audit_revision':2,
+        'handoff_policy_sha256': hashlib.sha256(args.handoff_policy.read_bytes()).hexdigest() if args.handoff_policy else None,
         'limit': 'Capture timestamp ordered replay; no live queue/drop/transport/face workload. Global IDs are replay IDs, not registered names.',
     }, ensure_ascii=False, indent=2), encoding='utf-8')
     rows = 0
@@ -99,14 +143,21 @@ def main():
     last_detection = {}
     last_ids = {}
     last_seen = {}
-    with args.output.open('w', encoding='utf-8') as output:
+    open_output = gzip.open if args.output.suffix == '.gz' else open
+    decoded_frames = Counter()
+    started_wall = time.monotonic()
+    completed_stream = True
+    with open_output(args.output, 'wt', encoding='utf-8') as output:
         for stamp, cid, index in schedule:
             if stamp-start > args.max_seconds:
+                completed_stream = False
                 break
             ok, frame = captures[cid].read()
             if not ok:
                 raise RuntimeError(f'{cid}: missing frame {index}')
-            if index % configs[cid].get('yolo_frame_stride', 1):
+            decoded_frames[cid] += 1
+            candidate_audit.clear()
+            if not args.full_rate and index % configs[cid].get('yolo_frame_stride', 1):
                 continue
             if frame.shape[1] > 960:
                 frame = cv2.resize(frame, (960, int(frame.shape[0] * 960 / frame.shape[1])))
@@ -150,6 +201,7 @@ def main():
             last_ids[cid] = ids
             report = {'camera_id': cid, 'frame_index': index, 'seconds': round(stamp-start, 4), 'held': held, 'tracks': [{**t, 'global_id': ids[t['track_id']]} for t in tracks],
                 'tracker_diagnostics': trackers[cid].diagnostics(),
+                'candidate_evaluations': list(candidate_audit),
                 'association_events': list(coordinator.recent_associations)[-8:],
                 'identity_ground_truth': False,
                 'face_recognition_run': False,
@@ -171,11 +223,15 @@ def main():
                 }
             output.write(json.dumps(report, ensure_ascii=False) + '\n')
             rows += 1
+            if rows % 2000 == 0:
+                args.output.with_suffix('.progress.json').write_text(json.dumps({'rows':rows,'video_seconds':stamp-start,'wall_seconds':time.monotonic()-started_wall,'decoded_frames':dict(decoded_frames),'rejections':dict(reason_counts)}),encoding='utf-8')
             if rows % 200 == 0:
                 output.flush()
                 print(f'processed={rows} seconds={stamp-start:.1f}', flush=True)
     for cap in captures.values():
         cap.release()
+    schedule_files.close()
+    args.output.with_suffix('.summary.json').write_text(json.dumps({'complete':completed_stream,'rows':rows,'decoded_frames':dict(decoded_frames),'wall_seconds':time.monotonic()-started_wall,'rejections':dict(reason_counts)},indent=2),encoding='utf-8')
     print(f'complete rows={rows} output={args.output}', flush=True)
 
 

@@ -9,6 +9,7 @@ data/
 tmp/
 camera_probe/
 models/*.pt
+models/fire/
 models/insightface/
 runs/
 

@@ -67,6 +67,7 @@ class EnvironmentSerialMonitor:
             "temperature": None,
             "humidity": None,
             "flame_alarm": False,
+            "flame_observed_at": None,
             "dht_valid": False,
             "last_seen_at": None,
             "protocol": None,
@@ -107,10 +108,14 @@ class EnvironmentSerialMonitor:
                 updates[field] = round(value, 1)
         for field in ("flame_alarm", "dht_valid"):
             if field in payload:
+                if type(payload[field]) not in (bool,int) or payload[field] not in (True,False,0,1):
+                    raise ValueError(field+" must be a boolean")
                 updates[field] = bool(payload[field])
         if "device_id" in payload:
             updates["device_id"] = str(payload["device_id"])[:64]
         now = time.time()
+        if 'flame_alarm' in payload:
+            updates['flame_observed_at']=now
         with self._lock:
             self._state.update(updates)
             self._state.update(

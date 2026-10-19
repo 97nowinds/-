@@ -2,7 +2,7 @@
   "scope": "joint-demo-minimal-r1",
   "image_base": "http://192.168.31.127:5175",
   "jpeg_retention_seconds": 60,
-  "jpeg_cache_max_bytes": 268435456,
+  "jpeg_cache_max_bytes": 1073741824,
   "sender_camera_id": "cam_2",
   "sender_target_fps": 3,
   "sender_receiver_url": "http://100.66.129.119:8765",

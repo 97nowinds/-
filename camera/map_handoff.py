@@ -7,10 +7,11 @@ import os
 import re
 import time
 import uuid
+import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, build_opener, ProxyHandler
 from handoff_transport import ImmutableSnapshots, bearer_authorized, load_demo_config
 
 
@@ -65,6 +66,50 @@ def read_snapshot(api_base):
 
 
 class MapHandler(BaseHTTPRequestHandler):
+    def _transfer_log(self, data):
+        path = getattr(self.server, 'transfer_log', None)
+        if path is None:
+            return
+        # No headers, credentials, camera URLs or personnel metadata are logged.
+        entry = dict(recorded_at=datetime.now(timezone.utc).isoformat(),
+                     peer=self.client_address[0], **data)
+        with self.server.transfer_log_lock:
+            with path.open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+    def _send_jpeg(self, snapshot_id, jpeg, started, lookup_ms):
+        accepted = 0
+        headers_at = None
+        error = None
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/jpeg')
+            self.send_header('Content-Length', str(len(jpeg)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.flush()
+            headers_at = time.monotonic()
+            view = memoryview(jpeg)
+            while accepted < len(view):
+                count = self.connection.send(view[accepted:accepted + 65536])
+                if count == 0:
+                    raise ConnectionError('zero-byte socket send')
+                accepted += count
+        except OSError as exc:
+            error = type(exc).__name__
+            self.close_connection = True
+        finally:
+            self._transfer_log(dict(kind='jpeg', snapshot_id=snapshot_id,
+                response_started_at=datetime.fromtimestamp(started[0], timezone.utc).isoformat(),
+                http_status=200 if headers_at is not None else None,
+                jpeg_bytes=len(jpeg), body_bytes_accepted_by_socket=accepted,
+                complete_write=accepted == len(jpeg), error=error,
+                lookup_ms=lookup_ms,
+                headers_elapsed_ms=(headers_at-started[1])*1000 if headers_at else None,
+                write_elapsed_ms=(time.monotonic()-headers_at)*1000 if headers_at else None,
+                total_elapsed_ms=(time.monotonic()-started[1])*1000,
+                evidence_scope='local socket acceptance, not remote receipt confirmation'))
+
     def _json(self, payload, status=200):
         body = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(status)
@@ -111,6 +156,7 @@ class MapHandler(BaseHTTPRequestHandler):
                 self._json({'error': 'snapshot read permission required'}, 403)
                 return
             if image:
+                started = (time.time(), time.monotonic())
                 jpeg = self.server.snapshots.get(image.group(1))
                 if jpeg is None and getattr(self.server, 'sample_archive', None):
                     directory = self.server.sample_archive / image.group(1)
@@ -123,22 +169,25 @@ class MapHandler(BaseHTTPRequestHandler):
                     except (OSError, ValueError, KeyError, TypeError):
                         pass
                 if jpeg is None:
+                    self._transfer_log(dict(kind='jpeg', snapshot_id=image.group(1),
+                        http_status=404, error='not_found_or_expired',
+                        total_elapsed_ms=(time.monotonic()-started[1])*1000))
                     self._json({'error': 'snapshot not found or expired'}, 404)
                     return
-                self.send_response(200)
-                self.send_header('Content-Type', 'image/jpeg')
-                self.send_header('Content-Length', str(len(jpeg)))
-                self.send_header('Cache-Control', 'no-store')
-                self.end_headers()
-                self.wfile.write(jpeg)
+                self._send_jpeg(image.group(1), jpeg, started, (time.monotonic()-started[1])*1000)
                 return
             try:
+                started = time.monotonic()
                 request = Request(self.server.api_base.rstrip('/') + route,
                     headers={'Authorization': 'Bearer ' + self.server.image_token})
-                with urlopen(request, timeout=5) as response:
+                with build_opener(ProxyHandler({})).open(request, timeout=5) as response:
                     payload = json.load(response)
+                upstream_ms = (time.monotonic()-started)*1000
                 jpeg = base64.b64decode(payload.pop('jpeg_base64'), validate=True)
                 metadata = self.server.snapshots.put(payload['snapshot_id'], jpeg, payload)
+                self._transfer_log(dict(kind='freeze', snapshot_id=payload['snapshot_id'],
+                    upstream_ms=upstream_ms, total_prepare_ms=(time.monotonic()-started)*1000,
+                    jpeg_bytes=len(jpeg), image_expires_at=metadata['image_expires_at']))
                 metadata['image_url'] = ('http://192.168.31.127:5175/api/handoff/snapshots/'
                                          + payload['snapshot_id'] + '.jpg')
                 self._json(metadata)
@@ -173,9 +222,13 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=5175)
     parser.add_argument('--credentials-file', type=Path)
     parser.add_argument('--sample-archive', type=Path)
+    parser.add_argument('--transfer-log', type=Path, default=Path(__file__).parent/'runtime/image-transfers.jsonl')
     args = parser.parse_args()
     server = ThreadingHTTPServer(('0.0.0.0', args.port), MapHandler)
     server.api_base = args.api
+    server.transfer_log = args.transfer_log.resolve()
+    server.transfer_log.parent.mkdir(parents=True, exist_ok=True)
+    server.transfer_log_lock = threading.Lock()
     server.sample_archive = args.sample_archive.resolve() if args.sample_archive else None
     credentials = (json.loads(args.credentials_file.read_text(encoding='utf-8'))
                    if args.credentials_file else {})

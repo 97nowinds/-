@@ -37,9 +37,16 @@ class AlertEvidence:
         except Exception:
             raise EvidenceUnavailable('exact snapshot unavailable') from None
 
-    def capture(self, row, index):
+    def capture_scene(self,row,index):
+        """Fire evidence is a scene observation, never a fabricated person track."""
+        return self.capture(row,index,scene=True)
+
+    def capture(self, row, index, scene=False):
         frame=index.evidence_frame(row['camera_id'],row['snapshot_id'])
-        track=index.evidence_track(row['camera_id'],row['snapshot_id'],row['track_id'])
+        if scene:
+            track=({'bbox':row['fire_bbox'] if row.get('fire_bbox') is not None else [0,0,frame['frame_width'],frame['frame_height']],
+                    'bbox_format':row.get('bbox_format') if row.get('fire_bbox') is not None else 'xywh_pixels'} if frame else None)
+        else:track=index.evidence_track(row['camera_id'],row['snapshot_id'],row['track_id'])
         if not frame or not track:
             raise EvidenceUnavailable('original snapshot binding missing')
         url=frame.get('image_url') or ''
@@ -67,19 +74,21 @@ class AlertEvidence:
                     raise EvidenceUnavailable('bbox outside snapshot')
                 # Preserve original; create a separate annotated copy for group viewing.
                 annotated=image.convert('RGB')
-                ImageDraw.Draw(annotated).rectangle((x,y,x+w,y+h),outline=(255,60,30),width=4)
+                if not scene or row.get('fire_bbox') is not None:
+                    ImageDraw.Draw(annotated).rectangle((x,y,x+w,y+h),outline=(255,60,30),width=4)
                 output=BytesIO();annotated.save(output,format='JPEG',quality=90)
         except EvidenceUnavailable:
             raise
         except Exception:
             raise EvidenceUnavailable('snapshot decode failed') from None
-        evidence_id=hashlib.sha256((row['camera_id']+'|'+row['snapshot_id']+'|'+row['track_id']).encode()).hexdigest()
+        evidence_id=hashlib.sha256((row['camera_id']+'|'+row['snapshot_id']+'|'+('scene:fire' if scene else row['track_id'])).encode()).hexdigest()
         directory=self.root/evidence_id;directory.mkdir(parents=True,exist_ok=True)
         if (directory/'metadata.dpapi').exists():
             old=json.loads(protect((directory/'metadata.dpapi').read_bytes(),decrypt=True))
             if old['source_sha256']!=frame['image_sha256'] or old['bbox']!=box:
                 raise EvidenceUnavailable('snapshot evidence changed')
         metadata={key:row.get(key) for key in ('camera_id','snapshot_id','track_id','person_id','captured_at')}
+        if scene:metadata.update(track_id=None,person_id=None,kind='fire_scene')
         metadata.update(source_sha256=frame['image_sha256'],source_frame_id=frame.get('source_frame_id'),
                         bbox=box,frame_width=frame['frame_width'],frame_height=frame['frame_height'])
         for name,content in [('original.dpapi',jpeg),('annotated.dpapi',output.getvalue()),

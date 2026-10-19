@@ -46,6 +46,16 @@ class AuthoritySync:
             self.stop_event.wait(self.config['sync_refresh_seconds'])
 
     def probe(self):
+        # A failed explicit probe must revoke the old proof too, not only when
+        # invoked through the periodic worker.
+        try:
+            return self._probe()
+        except Exception:
+            with self.lock:
+                self.mapping = None
+            raise
+
+    def _probe(self):
         probe_id = uuid.uuid4().hex
         t1, m1 = time.time(), time.monotonic()
         body = {'probe_id': probe_id, 'client_sent_at': iso_time(t1)}
@@ -65,6 +75,11 @@ class AuthoritySync:
         sample['uncertainty_ms'] += 1  # Client echo is quantized to milliseconds.
         if sample['uncertainty_ms'] > self.config['sync_max_uncertainty_ms']:
             raise ValueError('sync uncertainty exceeds confirmed limit')
+        # Count validity from T1; otherwise the advertised window includes the
+        # probe RTT in addition to the configured validity period.
+        deadline = m1 + self.config['sync_valid_seconds']
+        if m4 >= deadline:
+            raise ValueError('sync sample already expired')
         with self.lock:
             old = self.mapping
             if old and (old['authority_clock'] != result['authority_clock'] or
@@ -74,22 +89,22 @@ class AuthoritySync:
             self.mapping = dict(sample, sync_id=probe_id, authority_clock=result['authority_clock'],
                 source_clock=self.source_clock, source_reference_at=t4,
                 sync_valid_from=t1 + sample['offset_ms'] / 1000,
-                sync_valid_until=t4 + sample['offset_ms'] / 1000 + self.config['sync_valid_seconds'],
+                sync_valid_until=t1 + sample['offset_ms'] / 1000 + self.config['sync_valid_seconds'],
                 received_monotonic=m4, received_wall=t4,
-                deadline=m4 + self.config['sync_valid_seconds'])
+                deadline=deadline)
 
     def current(self):
         with self.lock:
             sample = deepcopy(self.mapping)
-        if not sample or time.monotonic() >= sample['deadline']:
-            return None
-        jump = abs((time.time() - sample['received_wall']) -
-                   (time.monotonic() - sample['received_monotonic'])) * 1000
-        if jump > self.config['sync_jump_limit_ms']:
-            with self.lock:
+            if not sample or time.monotonic() >= sample['deadline']:
                 self.mapping = None
-            return None
-        return sample
+                return None
+            jump = abs((time.time() - sample['received_wall']) -
+                       (time.monotonic() - sample['received_monotonic'])) * 1000
+            if jump > self.config['sync_jump_limit_ms']:
+                self.mapping = None
+                return None
+            return sample
 
 
 class ImmutableSnapshots:

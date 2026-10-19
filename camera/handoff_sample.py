@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import time
+import math
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -10,7 +11,7 @@ from handoff_transport import iso_time, load_demo_config
 from frontend_server import LiveSnapshotPublisher, _jpeg_dimensions
 
 
-def build_sample_event(frozen, require_person_location=True):
+def build_sample_event(frozen, require_person_location=True, include_estimated_locations=False):
     width, height = frozen['frame_width'], frozen['frame_height']
     if (frozen.get('image_transform') != 'identity' or not frozen.get('full_frame')
             or frozen['source_dimensions'] != [width, height]
@@ -23,6 +24,39 @@ def build_sample_event(frozen, require_person_location=True):
               if not obs.get('position_estimated') and obs.get('position')]
     tracks = LiveSnapshotPublisher._tracks(frozen['camera'], captured, people,
         max_location_delta_seconds=load_demo_config()['location_max_delta_seconds'])
+    if include_estimated_locations:
+        # Candidate policy 1.4.8: retain a source observation, never manufacture
+        # a footpoint or borrow a nearby person's observation or an older frame.
+        for track in tracks:
+            track.pop('location', None)
+            matches = [obs for obs in frozen['map_observations']
+                       if obs.get('track_id') == track['track_id']
+                       and obs.get('local_id') == track['local_track_id']
+                       and obs.get('camera_id') == frozen['camera_id']]
+            if len(matches) != 1:
+                continue
+            obs = matches[0]
+            position = obs.get('position')
+            quality = obs.get('localization_quality', obs.get('quality'))
+            state = obs.get('localization_state', obs.get('state'))
+            if (not isinstance(position, dict) or quality not in ('high', 'medium', 'low')
+                    or obs.get('valid') is False or obs.get('lost') is True
+                    or obs.get('association_conflict')
+                    or state in ('invalid', 'lost', 'unavailable', 'held', 'predicted')):
+                continue
+            try:
+                x, y = position['x'], position['y']
+                if not all(math.isfinite(float(v)) for v in (x, y, obs['observed_at'])):
+                    continue
+                if abs(float(obs['observed_at']) - float(frozen['source_captured_at'])) > 1e-6:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            track['location'] = dict(x_m=x, y_m=y, observed_at=iso_time(obs['observed_at']),
+                                     quality=quality, valid=True)
+            for field in ('position_estimated', 'localization_reason', 'footpoint_visible'):
+                if obs.get(field) is not None:
+                    track['location'][field] = obs[field]
     if require_person_location and (not tracks or not any(track.get('location') for track in tracks)):
         raise ValueError('sample requires a real person with a fresh map observation')
     if len({track['track_id'] for track in tracks}) != len(tracks):

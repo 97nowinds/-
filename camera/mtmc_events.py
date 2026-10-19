@@ -29,6 +29,7 @@ def _sanitize(value):
 
 
 class AssociationEventStore:
+    STARTUP_ROTATE_BYTES = 64 * 1024 * 1024
     def __init__(self, path, memory_limit=300, retention_days=30, now_fn=time.time):
         self.path = Path(path)
         self.memory_limit = int(memory_limit)
@@ -38,6 +39,7 @@ class AssociationEventStore:
         self.events = deque(maxlen=self.memory_limit)
         self.next_sequence = 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.startup_archive = None
         self._load_history()
         self.write_queue = None
         self.write_error = None
@@ -73,26 +75,61 @@ class AssociationEventStore:
         if not self.path.exists():
             return
         cutoff = self.now_fn() - self.retention_seconds
-        retained = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            try:
-                event = json.loads(line)
-            except (ValueError, TypeError):
-                continue
-            self.next_sequence = max(self.next_sequence, int(event.get("sequence", 0)) + 1)
-            if float(event.get("unix_time", 0.0)) >= cutoff:
-                self.events.append(event)
-                retained.append(event)
-        # Apply the retention policy to disk as well as the in-memory query
-        # window. Live tracker state is intentionally never reconstructed.
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(
-            "".join(
-                json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
-                for event in retained
-            ),
-            encoding="utf-8",
-        )
+        if self.path.stat().st_size > self.STARTUP_ROTATE_BYTES:
+            # Only the bounded API history is needed to start the tracker.
+            # Preserve the entire original file; do not read gigabytes into RAM.
+            tail = deque(maxlen=self.memory_limit)
+            with self.path.open("rb") as handle:
+                handle.seek(0, 2)
+                position = handle.tell()
+                pending = b""
+                valid = 0
+                while position and valid < self.memory_limit:
+                    size = min(position, 65536)
+                    position -= size
+                    handle.seek(position)
+                    pending = handle.read(size) + pending
+                    lines = pending.split(b"\n")
+                    pending = lines[0]
+                    for line in reversed(lines[1:]):
+                        try:
+                            event = json.loads(line)
+                            sequence = int(event.get("sequence", 0))
+                        except (ValueError, TypeError, AttributeError):
+                            continue
+                        self.next_sequence = max(self.next_sequence, sequence + 1)
+                        valid += 1
+                        if float(event.get("unix_time", 0.0)) >= cutoff:
+                            tail.appendleft(event)
+                        if valid >= self.memory_limit:
+                            break
+                if position == 0 and pending and valid < self.memory_limit:
+                    try:
+                        event = json.loads(pending)
+                        self.next_sequence = max(self.next_sequence, int(event.get("sequence", 0)) + 1)
+                        if float(event.get("unix_time", 0.0)) >= cutoff:
+                            tail.appendleft(event)
+                    except (ValueError, TypeError, AttributeError):
+                        pass
+            self.events.extend(tail)
+            temporary.write_text("".join(json.dumps(e, ensure_ascii=False, separators=(",", ":"))+"\n" for e in tail), encoding="utf-8")
+            archive = self.path.with_name(self.path.stem + ".archive-" + str(time.time_ns()) + self.path.suffix)
+            self.path.replace(archive)
+            temporary.replace(self.path)
+            self.startup_archive = str(archive)
+            return
+        # Small histories keep the original retention behavior, with bounded RAM.
+        with self.path.open(encoding="utf-8") as source, temporary.open("w", encoding="utf-8") as output:
+            for line in source:
+                try:
+                    event = json.loads(line)
+                    self.next_sequence = max(self.next_sequence, int(event.get("sequence", 0)) + 1)
+                    if float(event.get("unix_time", 0.0)) >= cutoff:
+                        self.events.append(event)
+                        output.write(json.dumps(event, ensure_ascii=False, separators=(",", ":"))+"\n")
+                except (ValueError, TypeError, AttributeError):
+                    continue
         temporary.replace(self.path)
 
     def record(self, event_type, **payload):
@@ -144,6 +181,7 @@ class AssociationEventStore:
                 "confidence_counts": dict(confidence),
                 "top_rejection_reasons": dict(rejection_reasons.most_common(8)),
                 "persistence": "jsonl_history_only",
+                "startup_archive": self.startup_archive,
                 "live_tracks_restored": False,
                 "write_pending": self.write_queue.qsize() if self.write_queue is not None else 0,
                 "write_error": self.write_error,

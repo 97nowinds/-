@@ -15,9 +15,7 @@ class NotificationTests(unittest.TestCase):
         self.now = 2000000000.
         self.sent = []
         self.config = {'lab_id': 'lab', 'principals': [
-            {'id': 'admin', 'role': 'admin', 'token_env': 'ADMIN'},
-            {'id': 'manager', 'role': 'manager', 'labs': ['lab'], 'instruments': ['i1'], 'token_env': 'MANAGER'},
-            {'id': 'yxq', 'role': 'experimenter', 'labs': ['lab'], 'person_ids': ['registered1'], 'token_env': 'YXQ'}],
+            {'id': 'admin', 'role': 'admin', 'token_env': 'ADMIN'}],
             'routes': [{'id': 'managers', 'labs': ['lab'], 'instruments': ['i1'],
                         'event_types': ['person.entered', 'instrument.started', 'safety.no_mask'],
                         'webhook_env': 'HOOK', 'secret_env': 'SECRET'}]}
@@ -105,26 +103,6 @@ class NotificationTests(unittest.TestCase):
         self.assertTrue(self.service.deliver_once())
         self.assertEqual(self.service.events({'role': 'admin'})[0]['deliveries'][0]['state'], 'expired')
 
-    def test_roles_scope_ack_and_route_persistence(self):
-        self.adapter.analysis(self.row(), self.index)
-        manager = self.service.authenticate('Bearer manager-secret')
-        experimenter = self.service.authenticate('Bearer personal-secret')
-        self.assertIsNone(self.service.authenticate('Bearer invalid'))
-        self.assertEqual(len(self.service.events(manager)), 1)
-        self.assertEqual(len(self.service.events(experimenter)), 1)
-        self.assertEqual(self.service.events({'role': 'experimenter', 'labs': ['lab'], 'person_ids': []}), [])
-        event_id = self.service.events(manager)[0]['event_id']
-        with self.assertRaises(PermissionError):
-            self.service.acknowledge(experimenter, event_id)
-        self.service.acknowledge(manager, event_id)
-        with self.assertRaises(PermissionError):
-            self.service.set_routes(manager, [])
-        self.service.set_routes({'id': 'admin', 'role': 'admin'}, [])
-        self.service.db.close()
-        self.service = self.make_service()
-        self.assertEqual(self.service.config['routes'], [])
-        self.service.deliver_once()
-        self.assertEqual(len(self.sent), 0)
 
     def test_out_of_scope_instrument_not_routed(self):
         self.adapter.analysis(self.row(instrument_id='i2'), self.index)
@@ -177,12 +155,73 @@ class NotificationTests(unittest.TestCase):
 
     def test_http_permissions_and_secret_redaction(self):
         self.assertEqual(self.request('/api/management/events')[0], 401)
-        self.assertEqual(self.request('/api/management/routes', 'manager-secret')[0], 403)
-        self.assertEqual(self.request('/api/management/audit', 'personal-secret')[0], 403)
+        self.assertEqual(self.request('/api/management/routes', 'manager-secret')[0], 401)
+        self.assertEqual(self.request('/api/management/audit', 'personal-secret')[0], 401)
         result = self.request('/api/management/routes', 'admin-secret')
         self.assertEqual(result[0], 200)
         self.assertNotIn(self.env['HOOK'], json.dumps(result[1]))
-        self.assertEqual(self.request('/api/management/ack', 'personal-secret', {'event_id':'anything'}, 'POST')[0], 403)
+        self.assertEqual(self.request('/api/management/ack', 'personal-secret', {'event_id':'anything'}, 'POST')[0], 401)
+
+    def test_removed_account_endpoints_cannot_create_or_restore_users(self):
+        for method in ['GET','POST']:
+            status,_=self.request('/api/management/accounts','admin-secret',
+                {'action':'create','account':{'id':'unused','role':'admin'}} if method=='POST' else None,method)
+            self.assertEqual(status,404)
+        self.assertFalse(hasattr(self.service,'accounts'))
+        tables={row[0] for row in self.service.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertNotIn('accounts',tables)
+
+    def test_maintenance_auth_and_group_routes_remain_persistent(self):
+        self.adapter.analysis(self.row(),self.index)
+        admin=self.service.authenticate('Bearer admin-secret')
+        self.assertEqual(admin['role'],'admin')
+        self.assertIsNone(self.service.authenticate('Bearer manager-secret'))
+        event_id=self.service.events(admin)[0]['event_id']
+        self.service.acknowledge(admin,event_id)
+        self.service.set_routes(admin,[])
+        self.service.db.close();self.service=self.make_service()
+        self.assertEqual(self.service.config['routes'],[])
+        self.assertEqual(self.service.events(admin)[0]['acknowledged_by'],'admin')
+        self.service.deliver_once();self.assertEqual(self.sent,[])
+
+
+
+    def test_policy_authorization_validation_and_persistence(self):
+        policy={'ppe_rules':{'mask':{'enabled':True,'minimum_confidence':.95}},'ppe_confirmation':{
+            'minimum_frames':3,'minimum_seconds':5,'maximum_gap_seconds':15,'escalation_seconds':60}}
+        path='/api/management/policy'
+        self.assertEqual(self.request(path,'manager-secret',policy,'POST')[0],401)
+        self.assertEqual(self.request(path,'admin-secret',policy,'POST')[0],200)
+        self.assertEqual(self.request(path,'admin-secret')[1],policy)
+        bad={**policy,'ppe_confirmation':{**policy['ppe_confirmation'],'minimum_frames':1}}
+        self.assertEqual(self.request(path,'admin-secret',bad,'POST')[0],400)
+        restored=self.make_service()
+        try:self.assertEqual(restored.config['ppe_confirmation'],policy['ppe_confirmation'])
+        finally:restored.db.close()
+
+    def test_unconfirmed_snapshot_clock_cannot_be_overridden_by_receiver(self):
+        self.index.remember({'snapshot_id':'source-snapshot','camera':{'camera_id':'cam_2',
+            'timing':{'event_time_domain':'source'},'tracks':[{'track_id':'t1','person_id':'registered1',
+                'observed_at':iso(self.now-1)}]}})
+        self.assertFalse(self.adapter.analysis(self.row(snapshot_id='source-snapshot'),self.index))
+        self.service.config['require_authority_snapshot']=True
+        self.assertFalse(self.adapter.analysis(self.row(),self.index))
+
+    def test_evidence_disk_failure_does_not_consume_ppe_episode(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        self.service.config.update(evidence_required_events=['safety.no_mask'],ppe_confirmation={
+            'minimum_frames':2,'minimum_seconds':1,'maximum_gap_seconds':5,'escalation_seconds':6})
+        capture=Mock(side_effect=OSError('synthetic storage failure'))
+        self.service.evidence=SimpleNamespace(capture=capture)
+        for number in range(3):
+            self.now+=1;snapshot='fresh'+str(number)
+            self.index.remember({'snapshot_id':snapshot,'time_domain':'authority','camera':{'camera_id':'cam_2',
+                'source_frame_id':snapshot,'tracks':[{'track_id':'t1','person_id':'registered1','observed_at':iso(self.now-1)}]}})
+            if number==2:capture.side_effect=None;capture.return_value='a'*64
+            accepted=self.adapter.analysis(self.row(snapshot_id=snapshot,mask_state='not_worn',confidence=.99),self.index,mask=True)
+            self.assertEqual(accepted,number==2)
+        self.assertEqual(capture.call_count,2)
 
     def test_producer_cannot_read_and_only_bound_evidence_accepted(self):
         self.service.config['principals'].append({'id': 'producer', 'role':'producer', 'labs':['lab'],

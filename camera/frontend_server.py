@@ -413,6 +413,9 @@ class LiveSnapshotPublisher:
             self._pending_deadline = time.monotonic() + remaining
             # The index must exist even when the result arrives before ACK.
             self.result_index.remember(event)
+            management=getattr(self.server,'management',None)
+            if management is not None:
+                management.registry.publish(event)
         width, height = event['camera']['frame_width'], event['camera']['frame_height']
         snapshot_id, captured_at = event['snapshot_id'], event['captured_at']
         if not event["camera"]["tracks"]:

@@ -27,7 +27,7 @@ def main():
     root.attributes('-topmost',True)
     container=ttk.Frame(root,padding=20);container.pack(fill='both',expand=True)
     ttk.Label(container,text='群消息证据图片配置',font=('Microsoft YaHei',17)).pack(anchor='w')
-    ttk.Label(container,text='应用仅用于上传图片；不查询手机号/邮箱，不发送私聊，不启用电话。').pack(anchor='w',pady=10)
+    ttk.Label(container,text='应用仅用于上传证据图片，通知由三个群机器人发送。').pack(anchor='w',pady=10)
     tabs=ttk.Notebook(container);tabs.pack(fill='x',pady=8)
     entries={}
     specs=[('app','图片上传应用',[('app_id','App ID（cli_开头）',False),('app_secret','App Secret',True)])]
@@ -67,19 +67,16 @@ def main():
                         '实验室图文通知连接测试（合成数据）。\n图片为程序生成的测试图，不代表真人违规，不是火焰警报。',
                         image_key,bot['secret'],title='实验室图文连接测试｜合成数据'))
                     delivered.append(audience)
-                old=load_credentials(GROUP_CREDENTIALS) if GROUP_CREDENTIALS.exists() else {}
+                old_path=EVIDENCE_CREDENTIALS if EVIDENCE_CREDENTIALS.exists() else GROUP_CREDENTIALS
+                old=load_credentials(old_path) if old_path.exists() else {}
                 credentials={**values['app'],'groups':{k:v for k,v in values.items() if k!='app'},
-                    'management_admin_token':old.get('management_admin_token') or secrets.token_urlsafe(32),'phone_enabled':False}
+                    'management_admin_token':old.get('management_admin_token') or secrets.token_urlsafe(32),
+                    'management_producer_token':old.get('management_producer_token') or secrets.token_urlsafe(32)}
                 save_credentials(credentials,EVIDENCE_CREDENTIALS)
                 config=json.loads((ROOT/'config'/'management.json').read_text(encoding='utf-8'))
                 service=ManagementNotifications(ROOT/'runtime'/'management.sqlite3',config)
                 try:
-                    service.set_routes({'role':'admin','id':'local-evidence-setup'},[{
-                        'id':audience,'transport':'webhook','labs':[config['lab_id']],
-                        'event_types':['safety.no_mask','safety.no_lab_coat','safety.no_gloves'] if audience=='experimenters' else [],
-                        'webhook_env':'LAB_FEISHU_'+audience.upper()+'_WEBHOOK',
-                        'secret_env':'LAB_FEISHU_'+audience.upper()+'_SECRET'}
-                        for audience in ('experimenters','managers','administrators')])
+                    service.set_routes({'role':'admin','id':'local-evidence-setup'},config['routes'])
                 finally:service.db.close()
                 status('connected')
                 root.after(0,done,True,'三个群图文测试均已被飞书接受，配置已加密保存。请确认三群收到测试图片，再重启通知前端加载配置。')

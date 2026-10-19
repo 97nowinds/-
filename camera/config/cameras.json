@@ -19,7 +19,7 @@
     "yolo_confidence": 0.1,
     "yolo_image_size": 640,
     "yolo_frame_stride": 1,
-    "yolo_tracker_config": "config/bytetrack_lab.yaml",
+    "yolo_tracker_config": "config/bytetrack_guarded_lab.yaml",
     "track_hold_seconds": 1.5,
     "source_env": "LAB_CAM_2_RTSP"
   },

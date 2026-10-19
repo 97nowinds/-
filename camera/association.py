@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, replace
 import math
 
 import numpy as np
+from handoff_hub import body_overlap_ratio
 
 
 ASSOCIATION_ALGORITHM = "hungarian-mtmc-v1"
@@ -21,6 +22,7 @@ class AssociationObservation:
     person_class: str = "person"
     geometry_trusted: bool = True
     image_anchor: dict = None
+    image_box: tuple = None
     excluded_global_ids: set = field(default_factory=set)
     handoff_exit_grace: dict = field(default_factory=dict)
     clothing_tone: str = None
@@ -42,6 +44,7 @@ class AssociationTarget:
     geometry_trusted: bool = True
     source_local_id: int = None
     image_anchor: dict = None
+    image_box: tuple = None
     recent_exit_gates: dict = field(default_factory=dict)
     clothing_tone: str = None
     camera_observations: dict = field(default_factory=dict)
@@ -205,11 +208,16 @@ class BatchAssociator:
             previous = current
         return inside
 
-    def _inside_handoff_gate(self, transition, camera_id, direction, anchor):
+    def _inside_handoff_gate(self, transition, camera_id, direction, anchor, image_box=None):
         gate = (transition.get("image_handoff_gates") or {}).get(camera_id, {}).get(direction)
         if gate is None:
             return True
-        return any(self._point_in_polygon(anchor, points) for points in self._gate_polygons(gate))
+        polygons = self._gate_polygons(gate)
+        if any(self._point_in_polygon(anchor, points) for points in polygons):
+            return True
+        minimum = gate.get("minimum_body_overlap")
+        return bool(minimum is not None and image_box is not None and any(
+            body_overlap_ratio(image_box, points) >= float(minimum) for points in polygons))
 
     @staticmethod
     def _handoff_routes(transition):
@@ -227,7 +235,7 @@ class BatchAssociator:
             polygons.insert(0, gate["points"])
         return polygons
 
-    def exit_gate_destinations(self, camera_id, anchor):
+    def exit_gate_destinations(self, camera_id, anchor, image_box=None):
         """Return adjacent cameras whose source exit was just observed."""
         destinations = set()
         for transition in self.transitions:
@@ -238,11 +246,11 @@ class BatchAssociator:
             else:
                 continue
             for route_id, variant in self._handoff_routes(transition):
-                if other and self._inside_handoff_gate(variant, camera_id, "exit", anchor):
+                if other and self._inside_handoff_gate(variant, camera_id, "exit", anchor, image_box):
                     destinations.add(other if route_id is None else f"{other}|{route_id}")
         return destinations
 
-    def entry_gate_sources(self, camera_id, anchor):
+    def entry_gate_sources(self, camera_id, anchor, image_box=None):
         sources = set()
         for transition in self.transitions:
             if transition.get("to") == camera_id:
@@ -252,7 +260,7 @@ class BatchAssociator:
             else:
                 continue
             for route_id, variant in self._handoff_routes(transition):
-                if other and self._inside_handoff_gate(variant, camera_id, "entry", anchor):
+                if other and self._inside_handoff_gate(variant, camera_id, "entry", anchor, image_box):
                     sources.add(other if route_id is None else f"{other}|{route_id}")
         return sources
 
@@ -280,7 +288,7 @@ class BatchAssociator:
                     target, camera_id=camera_id, camera_observations={},
                     **{name: source[name] for name in (
                         "last_seen", "position", "direction", "geometry_trusted",
-                        "source_local_id", "image_anchor", "recent_exit_gates",
+                        "source_local_id", "image_anchor", "image_box", "recent_exit_gates",
                         "clothing_tone", "appearance", "box", "pixel_velocity",
                     ) if name in source},
                 )
@@ -321,8 +329,8 @@ class BatchAssociator:
             return {**evaluation, "eligible": False, "reason": "topology_rejected"}
         gate_options = []
         for route_id, variant in self._handoff_routes(transition):
-            source_gate = self._inside_handoff_gate(variant, target.camera_id, "exit", target.image_anchor)
-            target_gate = self._inside_handoff_gate(variant, observation.camera_id, "entry", observation.image_anchor)
+            source_gate = self._inside_handoff_gate(variant, target.camera_id, "exit", target.image_anchor, target.image_box)
+            target_gate = self._inside_handoff_gate(variant, observation.camera_id, "entry", observation.image_anchor, observation.image_box)
             entry_key = target.camera_id if route_id is None else f"{target.camera_id}|{route_id}"
             entry_at = observation.recent_entry_gates.get(entry_key)
             if entry_at is not None and 0.0 <= observation.monotonic_time - entry_at <= self.association.get("handoff_entry_memory_seconds", 3.0):
@@ -349,6 +357,8 @@ class BatchAssociator:
             source_exit_gate_grace=source_exit_grace,
             target_in_handoff_gate=target_in_gate,
             handoff_route=route_id or "main",
+            hub_id=transition.get("hub_id"),
+            hub_requires_confirmation=bool(transition.get("hub_requires_confirmation")),
         )
         if not source_in_gate and not source_exit_recent:
             return {**evaluation, "eligible": False, "reason": "source_not_in_handoff_exit_gate"}
@@ -529,6 +539,8 @@ class BatchAssociator:
                 and result["reid_score"] >= self.reid["high_similarity"]
                 and margin >= self.reid["match_margin"]
             )
+            hub_strong = high and result.get("hub_requires_confirmation", False)
+            high = high and not result.get("hub_requires_confirmation", False)
             medium = bool(
                 result["final_score"] >= self.association["medium_confidence_score"]
                 and result["reid_score"] >= self.reid["medium_similarity"]
@@ -543,6 +555,7 @@ class BatchAssociator:
                     "candidate_global_id": targets[column].global_id,
                     "confidence": confidence,
                     "accepted": high,
+                    "hub_strong_candidate": bool(hub_strong),
                     "reason": "high_confidence_match" if high else "pending_more_evidence" if medium else "score_below_threshold",
                     "match_margin": round(float(margin), 6),
                 }

@@ -18,8 +18,9 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-KINDS = {'person.entered', 'instrument.started', 'safety.no_mask', 'safety.no_lab_coat', 'safety.no_gloves'}
-ROLES = {'viewer', 'experimenter', 'manager', 'admin', 'producer'}
+KINDS = {'person.entered', 'instrument.started', 'safety.no_mask', 'safety.no_lab_coat', 'safety.no_gloves',
+         'environment.flame','environment.flame_recovered'}
+ROLES = {'admin', 'producer'}
 
 
 def stamp(value):
@@ -38,10 +39,10 @@ def scoped(principal, event):
         return True
     if event['lab_id'] not in principal.get('labs', []):
         return False
-    if principal['role'] == 'experimenter' and event['person_id'] not in principal.get('person_ids', []):
-        return False
     instruments = principal.get('instruments')
-    return not event.get('instrument_id') or instruments is None or event['instrument_id'] in instruments
+    cameras = principal.get('cameras')
+    return ((not event.get('instrument_id') or instruments is None or event['instrument_id'] in instruments)
+            and (not event.get('camera_id') or cameras is None or event['camera_id'] in cameras))
 
 
 def feishu_payload(text, secret='', now=None):
@@ -103,20 +104,35 @@ class ManagementNotifications:
         saved = self.db.execute("SELECT value FROM settings WHERE key='routes'").fetchone()
         if saved:
             self.config['routes'] = json.loads(saved['value'])
+        saved_policy=self.db.execute("SELECT value FROM settings WHERE key='ppe_policy'").fetchone()
+        if saved_policy:self.config.update(json.loads(saved_policy['value']))
         self._validate_config(self.config)
         self.stop_event = threading.Event()
         self.thread = None
         self.last_send = 0.0
-        self.app_client = None
-        self.app_credentials_revision = None
         self.evidence = None
         self.image_client = None
         self.image_credentials_revision = None
+        from safety_incidents import SafetyIncidents
+        self.incidents=SafetyIncidents(self)
+        from ppe_policy import PPEPolicy
+        self.ppe_policy=PPEPolicy(self)
+        from fire_fusion import FireFusion
+        self.fire_fusion=FireFusion(self)
+        self.image_lock=threading.RLock()
+        with self.db:
+            columns={row[1] for row in self.db.execute('PRAGMA table_info(outbox)')}
+            for name,declaration in [('priority','INTEGER DEFAULT 0'),('lease_until','REAL DEFAULT 0'),('claim','TEXT')]:
+                if name not in columns:self.db.execute('ALTER TABLE outbox ADD COLUMN '+name+' '+declaration)
 
     @staticmethod
     def _validate_config(config):
         if not config.get('lab_id'):
             raise ValueError('lab_id required')
+        from management_policy import validate_policy
+        from fire_fusion import validate_config as validate_fire_config
+        validate_fire_config(config)
+        validate_policy({k:config[k] for k in ('ppe_rules','ppe_confirmation') if k in config})
         ids = set()
         for principal in config.get('principals', []):
             if (principal.get('role') not in ROLES or not principal.get('id')
@@ -128,11 +144,10 @@ class ManagementNotifications:
             if (not route.get('id') or route['id'] in ids
                     or not set(route.get('event_types', [])) <= KINDS
                     or not route.get('labs')
-                    or route.get('transport', 'webhook') not in {'webhook', 'app'}
-                    or (route.get('transport', 'webhook') == 'webhook' and not route.get('webhook_env'))
-                    or (route.get('transport') == 'app' and route.get('recipient_key') != 'primary')
+                    or route.get('transport', 'webhook') != 'webhook'
+                    or not route.get('webhook_env')
                     or set(route) - {'id', 'labs', 'instruments', 'event_types', 'webhook_env', 'secret_env',
-                                     'transport', 'recipient_key'}):
+                                     'transport','audience'}):
                 raise ValueError('invalid notification route')
             ids.add(route['id'])
 
@@ -151,10 +166,14 @@ class ManagementNotifications:
         # Explicit allowlist prevents accidental transmission of biometrics/secrets.
         fields = {'event_id', 'event_type', 'lab_id', 'person_id', 'display_name',
                   'camera_id', 'snapshot_id', 'track_id', 'global_id',
-                  'instrument_id', 'instrument_name', 'observed_at', 'evidence_source', 'evidence_id'}
+                  'instrument_id', 'instrument_name', 'observed_at', 'evidence_source', 'evidence_id',
+                  'severity','incident_id','device_id','audiences','fire_stage','zone_id','sources','image_observed_at',
+                  'hardware_observed_at','visual_observed_at'}
         item = {k: v for k, v in event.items() if k in fields}
+        item.setdefault('severity','L0' if item.get('event_type') in {'person.entered','instrument.started'} else 'L1')
         if (item.get('event_type') not in KINDS or item.get('lab_id') != self.config['lab_id']
-                or not item.get('event_id') or not item.get('person_id')):
+                or not item.get('event_id') or (not item.get('person_id') and
+                    not (item['event_type'].startswith('environment.') and item.get('device_id')))):
             raise ValueError('known identity and valid event required')
         for value in item.values():
             if not isinstance(value, str) or not value or len(value) > 256:
@@ -172,20 +191,25 @@ class ManagementNotifications:
                     raise ValueError('event_id conflict')
                 return False
             # Cooldown is persistent and shared across cameras; short ID churn does not spam.
-            semantic = (item['event_type'], item['person_id'], item.get('instrument_id'))
+            semantic = (item['event_type'], item.get('person_id'), item.get('instrument_id'))
             for row in self.db.execute('SELECT payload FROM events WHERE received>?',
                                        (self.wall() - self.config.get('cooldown_seconds', 120),)):
                 old = json.loads(row['payload'])
-                if (old['event_type'], old['person_id'], old.get('instrument_id')) == semantic:
+                if (not item.get('incident_id') and item.get('severity')!='L3' and
+                        (old['event_type'], old.get('person_id'), old.get('instrument_id')) == semantic):
                     return False
             self.db.execute('INSERT INTO events(id,payload,received) VALUES(?,?,?)',
                             (item['event_id'], encoded, self.wall()))
+            if item.get('incident_id') and item['event_type'].startswith('safety.'):
+                self.incidents.note_ppe(item)
             for route in self.config.get('routes', []):
-                principal = dict(role='manager', labs=route['labs'], instruments=route.get('instruments'))
+                principal = dict(role='route', labs=route['labs'], instruments=route.get('instruments'))
                 if (item['event_type'] not in self.config.get('silent_events', [])
                         and item['event_type'] in route['event_types'] and scoped(principal, item)):
-                    self.db.execute('INSERT INTO outbox(event_id,route_id,state,due) VALUES(?,?,?,?)',
-                                    (item['event_id'], route['id'], 'pending', self.wall()))
+                    if item.get('audiences') and route.get('audience',route['id']) not in item['audiences'].split(','):
+                        continue
+                    self.db.execute('INSERT INTO outbox(event_id,route_id,state,due,priority) VALUES(?,?,?,?,?)',
+                                    (item['event_id'], route['id'], 'pending', self.wall(),3 if item.get('severity')=='L3' else 1))
             self._audit('system', 'event.record', item['event_id'])
         return True
 
@@ -194,12 +218,13 @@ class ManagementNotifications:
                         (self.wall(), actor, action, target))
 
     def cooling_down(self,event):
-        semantic=(event['event_type'],event['person_id'],event.get('instrument_id'))
+        if event.get('incident_id'):return False
+        semantic=(event['event_type'],event.get('person_id'),event.get('instrument_id'))
         with self.lock:
             for row in self.db.execute('SELECT payload FROM events WHERE received>?',
                 (self.wall()-self.config.get('cooldown_seconds',120),)):
                 previous=json.loads(row['payload'])
-                if (previous['event_type'],previous['person_id'],previous.get('instrument_id'))==semantic:
+                if (previous['event_type'],previous.get('person_id'),previous.get('instrument_id'))==semantic:
                     return True
         return False
 
@@ -218,8 +243,8 @@ class ManagementNotifications:
             return output
 
     def acknowledge(self, principal, event_id):
-        if principal['role'] not in {'manager', 'admin'}:
-            raise PermissionError('manager role required')
+        if principal['role'] != 'admin':
+            raise PermissionError('maintenance administrator required')
         with self.lock, self.db:
             row = self.db.execute('SELECT payload FROM events WHERE id=?', (event_id,)).fetchone()
             if not row or not scoped(principal, json.loads(row['payload'])):
@@ -241,6 +266,15 @@ class ManagementNotifications:
 
     @staticmethod
     def message(event):
+        if event['event_type'].startswith('environment.'):
+            stage=event.get('fire_stage')
+            title=('【L3 紧急】视觉与硬件双源火焰确认，需现场核查' if stage=='dual_confirmed' else
+                   '【L3 紧急】火焰报警（单源），需现场核查') if event['event_type']=='environment.flame' else '火焰信号恢复，等待现场核查关闭'
+            return (f"实验室通知\n{title}\n实验室：{event['lab_id']}\n设备：{event['device_id']}"
+                    f"\n区域：{event.get('zone_id','未配置')}\n来源：{event.get('sources',event.get('evidence_source','unknown'))}"
+                    f"\n视觉快照时间：{event.get('image_observed_at','无视觉图片')}"
+                    f"\n硬件观测：{event.get('hardware_observed_at','无融合观测')}\n视觉观测：{event.get('visual_observed_at','无融合观测')}"
+                    f"\n原始观测时间：{event['observed_at']}\n告警：{event['incident_id']}\n事件：{event['event_id']}")
         name = event.get('display_name') or '身份已确认人员'
         if event['event_type'] == 'person.entered':
             action = '进入实验室（入口与室内连续身份观测）'
@@ -251,80 +285,11 @@ class ManagementNotifications:
                       'safety.no_gloves':'未戴手套'}[event['event_type']]+'（防护检测结果）'
         camera='\n摄像头：'+event['camera_id'] if event.get('camera_id') else ''
         snapshot='\n快照：'+event['snapshot_id'] if event.get('snapshot_id') else ''
-        return f"实验室通知\n{name} {action}\n实验室：{event['lab_id']}{camera}\n观测时间：{event['observed_at']}{snapshot}\n事件：{event['event_id']}"
+        return f"实验室通知 {event.get('severity','')}\n{name} {action}\n实验室：{event['lab_id']}{camera}\n观测时间：{event['observed_at']}{snapshot}\n事件：{event['event_id']}"
 
     def deliver_once(self):
-        with self.lock:
-            row = self.db.execute('SELECT o.*, e.payload FROM outbox o JOIN events e ON e.id=o.event_id '
-                                  "WHERE o.state='pending' AND o.due<=? ORDER BY o.due LIMIT 1", (self.wall(),)).fetchone()
-            if not row or self.wall() - self.last_send < 1:
-                return False
-            route = next((r for r in self.config['routes'] if r['id'] == row['route_id']), None)
-            event = json.loads(row['payload'])
-            if self.wall() - stamp(event['observed_at']) > self.config.get('delivery_max_age_seconds', 300):
-                self.db.execute("UPDATE outbox SET state='expired' WHERE event_id=? AND route_id=?",
-                                (row['event_id'], row['route_id']))
-                self.db.commit()
-                return True
-            # Re-evaluate route scope after an administrator revokes it.
-            allowed = route and event['event_type'] in route['event_types'] and scoped(
-                dict(role='manager', labs=route['labs'], instruments=route.get('instruments')), event)
-            if not allowed:
-                self.db.execute("UPDATE outbox SET state='cancelled' WHERE event_id=? AND route_id=?",
-                                (row['event_id'], row['route_id']))
-                self.db.commit()
-                return True
-            application = route.get('transport') == 'app'
-            from feishu_app import DEFAULT_CREDENTIALS, load_credentials, FeishuAppClient
-            url = self.env.get(route.get('webhook_env', ''), '')
-            configured = DEFAULT_CREDENTIALS.exists() if application else bool(url)
-            if not configured:
-                self.db.execute('UPDATE outbox SET due=? WHERE event_id=? AND route_id=?',
-                                (self.wall() + 30, row['event_id'], row['route_id']))
-                self.db.commit()
-                return False  # Leave durable pending until configured.
-            self.last_send = self.wall()
-            # Network I/O is on a dedicated worker, never on the inference path.
-            try:
-                if application:
-                    revision = DEFAULT_CREDENTIALS.stat().st_mtime_ns
-                    if self.app_client is None or revision != self.app_credentials_revision:
-                        self.app_client = FeishuAppClient(load_credentials(), wall=self.wall)
-                        self.app_credentials_revision = revision
-                    recipient = self.app_client.credentials['primary_open_id']
-                    self.app_client.send_text(recipient, self.message(event), event['event_id'])
-                else:
-                    if event.get('evidence_id'):
-                        from feishu_app import EVIDENCE_CREDENTIALS
-                        from alert_evidence import group_evidence_payload
-                        if self.evidence is None or not EVIDENCE_CREDENTIALS.exists():
-                            raise ValueError('image transport not configured')
-                        revision=EVIDENCE_CREDENTIALS.stat().st_mtime_ns
-                        if self.image_client is None or self.image_credentials_revision!=revision:
-                            self.image_client=FeishuAppClient(load_credentials(EVIDENCE_CREDENTIALS),wall=self.wall)
-                            self.image_credentials_revision=revision
-                        app_id=self.image_client.credentials['app_id']
-                        old=self.db.execute('SELECT image_key FROM evidence_uploads WHERE evidence_id=? AND app_id=?',
-                                            (event['evidence_id'],app_id)).fetchone()
-                        image_key=old['image_key'] if old else self.image_client.upload_image(self.evidence.read(event['evidence_id']))
-                        if not old:
-                            with self.db:
-                                self.db.execute('INSERT INTO evidence_uploads VALUES(?,?,?)',(event['evidence_id'],app_id,image_key))
-                        payload=group_evidence_payload(self.message(event),image_key,
-                            self.env.get(route.get('secret_env',''),''),self.wall())
-                    else:
-                        payload=feishu_payload(self.message(event),self.env.get(route.get('secret_env',''),''),self.wall())
-                    self.sender(url,payload)
-                state, error = 'sent', None
-            except Exception as exc:
-                # Never log exception text: it can contain a credential-bearing URL.
-                state, error = ('failed' if row['attempts'] >= 4 else 'pending'), type(exc).__name__
-            with self.db:
-                self.db.execute('UPDATE outbox SET state=?, attempts=attempts+1,due=?,error=? '
-                                'WHERE event_id=? AND route_id=?',
-                                (state, self.wall() + min(300, 2 ** (row['attempts'] + 1)), error,
-                                 row['event_id'], row['route_id']))
-            return True
+        from notification_delivery import deliver
+        return deliver(self)
 
     def start(self):
         def run():
@@ -333,13 +298,12 @@ class ManagementNotifications:
                     self.deliver_once()
                 except Exception:
                     pass  # Isolation: notification failure never stops camera services.
-        self.thread = threading.Thread(target=run, daemon=True, name='lab-feishu-outbox')
-        self.thread.start()
+        self.threads=[threading.Thread(target=run,daemon=True,name='lab-feishu-outbox-'+str(i)) for i in range(3)]
+        for worker in self.threads:worker.start()
 
     def stop(self):
         self.stop_event.set()
-        if self.thread:
-            self.thread.join(timeout=6)
+        for worker in getattr(self,"threads",[]):worker.join(timeout=6)
 
 
 class EvidenceAdapter:
@@ -365,6 +329,8 @@ class EvidenceAdapter:
             return False
         original = index.evidence_track(row['camera_id'], row['snapshot_id'], row['track_id'])
         if (not original or not original.get('observed_at')
+                or original.get('time_domain') not in (None,'authority')
+                or (self.service.config.get('require_authority_snapshot',False) and original.get('time_domain')!='authority')
                 or abs(stamp(original['observed_at']) - stamp(row['captured_at'])) > .005):
             return False  # An old frame cannot be made current with a new timestamp.
         now = self.service.wall()
@@ -373,6 +339,7 @@ class EvidenceAdapter:
                 or min(stamp(row['expires_at']), stamp(row['published_at']) + 5) <= now
                 or stamp(row['published_at']) > now + 2):
             return False
+        if not -2<=now-stamp(row['captured_at'])<=self.service.config.get('event_max_age_seconds',15):return False
         if mask or ppe_type:
             ppe_type=ppe_type or 'mask'
             rule=self.service.config.get('ppe_rules',{}).get(ppe_type)
@@ -380,31 +347,45 @@ class EvidenceAdapter:
                     (rule is not None and not rule.get('enabled')) or (not mask and rule is None)):
                 return False
             if row.get('evidence_type')=='ppe' and row.get('visibility')!='valid':
+                self.service.ppe_policy.observe(matched['person_id'],'safety.no_'+ppe_type,
+                    row.get('instrument_id'),stamp(row['captured_at']),row['snapshot_id'],'unknown')
                 return False
             confidence = row.get('confidence', 0)
             state=row.get('ppe_state') if row.get('evidence_type')=='ppe' else row.get('mask_state')
             minimum=rule.get('minimum_confidence',.9) if rule else .9
-            if (state != 'not_worn' or type(confidence) not in (int, float)
-                    or not math.isfinite(confidence) or not minimum <= confidence <= 1):
-                return False
             kind = 'safety.no_'+ppe_type
+            valid_confidence=(type(confidence) in (int,float) and math.isfinite(confidence) and minimum<=confidence<=1)
+            frame=index.evidence_frame(row['camera_id'],row['snapshot_id']) or {}
+            policy_result=self.service.ppe_policy.observe(matched['person_id'],kind,row.get('instrument_id'),
+                stamp(row['captured_at']),row['camera_id']+':'+str(frame.get('source_frame_id') or row['snapshot_id']),
+                state if valid_confidence else 'unknown')
+            if state!='not_worn' or not valid_confidence or policy_result is None:return False
         else:
             if row.get('is_interacting') is not True or not row.get('instrument_id'):
                 return False
             kind = 'instrument.started'
         event=self.base(kind,matched,row['captured_at'],'ppe_detector' if mask or ppe_type else 'member_minicpm')
+        if mask or ppe_type:
+            event.update(policy_result)
+            if event.get('incident_id'):event['event_id']=event['incident_id']+':'+event['severity']
         if self.service.cooling_down(event):
             return False
         if kind in self.service.config.get('evidence_required_events', []):
             if self.service.evidence is None:
+                if event.get('incident_id'):self.service.ppe_policy.retry(event['incident_id'],event['severity'])
                 return False
             try:
                 event['evidence_id']=self.service.evidence.capture(matched,index)
-            except ValueError:
+            except Exception:
+                if event.get('incident_id'):self.service.ppe_policy.retry(event['incident_id'],event['severity'])
                 with self.service.lock,self.service.db:
                     self.service._audit('system','evidence.unavailable',str(row.get('snapshot_id','unknown'))[:128])
                 return False
-        return self.service.record(event)
+        try:
+            return self.service.record(event)
+        except Exception:
+            if event.get('incident_id'):self.service.ppe_policy.retry(event['incident_id'],event['severity'])
+            raise
 
     def cameras(self, state):
         # Relative entry sequence uses host receipt clock, never compares GPU wall clocks.

@@ -1,7 +1,6 @@
-"""Feishu application bot transport. No secrets or raw responses in errors."""
+"""Feishu image upload and protected local credentials. Group delivery uses Webhooks."""
 import ctypes
 from ctypes import wintypes
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,7 +10,6 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 BASE = 'https://open.feishu.cn/open-apis'
-DEFAULT_CREDENTIALS = Path(__file__).parent / 'runtime' / 'feishu-app.dpapi'
 GROUP_CREDENTIALS = Path(__file__).parent / 'runtime' / 'feishu-group.dpapi'
 EVIDENCE_CREDENTIALS = Path(__file__).parent / 'runtime' / 'feishu-evidence.dpapi'
 
@@ -49,7 +47,7 @@ def protect(data, decrypt=False):
         kernel.LocalFree(ctypes.cast(output.data, ctypes.c_void_p))
 
 
-def save_credentials(credentials, path=DEFAULT_CREDENTIALS):
+def save_credentials(credentials, path):
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     encrypted = protect(json.dumps(credentials).encode())
@@ -58,7 +56,7 @@ def save_credentials(credentials, path=DEFAULT_CREDENTIALS):
     temporary.replace(target)
 
 
-def load_credentials(path=DEFAULT_CREDENTIALS):
+def load_credentials(path):
     try:
         return json.loads(protect(Path(path).read_bytes(), decrypt=True))
     except FeishuError:
@@ -112,38 +110,7 @@ class FeishuAppClient:
             self._deadline = self.wall() + result['expire'] - 60
             return self._token
 
-    def resolve_recipient(self, address):
-        address = address.strip()
-        if address.startswith('ou_'):
-            return address
-        if not address:
-            raise FeishuError('recipient mobile/email/open_id required')
-        field = 'emails' if '@' in address else 'mobiles'
-        body = self.request('POST', '/contact/v3/users/batch_get_id?user_id_type=open_id',
-                            {field: [address]}, self.token())
-        users = body.get('data', {}).get('user_list', [])
-        identifiers = {u.get('user_id') for u in users if isinstance(u, dict) and u.get('user_id')}
-        if not identifiers:
-            raise FeishuError('飞书查询成功，但未返回此接收人的编号。请确认：接收人属于该应用所在组织；'
-                              '手机号或邮箱与组织通讯录一致；通讯录权限范围包含接收人；修改已发布生效。')
-        if len(identifiers) != 1:
-            raise FeishuError('接收人查询存在歧义，未发送消息。请使用此应用下明确的 open_id。')
-        if not next(iter(identifiers)).startswith('ou_'):
-            raise FeishuError('接收人编号类型不是 open_id，未发送消息。请检查接口编号类型。')
-        return next(iter(identifiers))
 
-    def send_text(self, open_id, text, event_id):
-        if not isinstance(open_id, str) or not open_id.startswith('ou_'):
-            raise FeishuError('validated recipient open_id required')
-        # Stable per-recipient UUID supports Feishu message request deduplication.
-        request_id = hashlib.sha256((event_id + '|' + open_id).encode()).hexdigest()[:32]
-        body = self.request('POST', '/im/v1/messages?receive_id_type=open_id',
-            {'receive_id': open_id, 'msg_type': 'text',
-             'content': json.dumps({'text': text}, ensure_ascii=False), 'uuid': request_id}, self.token())
-        message_id = body.get('data', {}).get('message_id')
-        if not message_id:
-            raise FeishuError('message acknowledgement missing')
-        return message_id
 
     def upload_image(self, jpeg):
         if not isinstance(jpeg, bytes) or not jpeg.startswith(b'\xff\xd8') or len(jpeg) > 10 * 1024 * 1024:
@@ -168,15 +135,3 @@ class FeishuAppClient:
             raise FeishuError('图片上传被拒绝，请检查im:resource权限及应用发布状态。错误码='+
                               (str(code) if isinstance(code,int) else 'unknown'))
         return result['data']['image_key']
-
-    def urgent_phone(self, message_id, open_id, enabled=False):
-        if not enabled:
-            raise FeishuError('phone escalation disabled')
-        if (not message_id.startswith('om_') or not open_id.startswith('ou_')
-                or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_' for c in message_id)):
-            raise FeishuError('invalid escalation identifiers')
-        result = self.request('PATCH', '/im/v1/messages/' + message_id + '/urgent_phone?user_id_type=open_id',
-                              {'user_id_list': [open_id]}, self.token())
-        if result.get('data', {}).get('invalid_user_id_list'):
-            raise FeishuError('phone recipient rejected')
-        return result

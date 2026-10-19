@@ -56,9 +56,9 @@ def main():
         status('connecting')
         def connect():
             try:
-                send_feishu(webhook,feishu_payload('实验室通知系统：群机器人连接测试。\n这是一条测试消息，不代表实际人员事件或安全告警。\n通知方式已选择群消息，电话加急未启用。',signing_secret))
+                send_feishu(webhook,feishu_payload('实验室通知系统：群机器人连接测试。\n这是一条测试消息，不代表实际人员事件或安全告警。\n通知直接发送到当前飞书群。',signing_secret))
                 save_credentials({'webhook':webhook,'secret':signing_secret,
-                    'management_admin_token':secrets.token_urlsafe(32),'phone_enabled':False},GROUP_CREDENTIALS)
+                    'management_admin_token':secrets.token_urlsafe(32)},GROUP_CREDENTIALS)
                 config=json.loads((ROOT/'config'/'management.json').read_text(encoding='utf-8'))
                 service=ManagementNotifications(ROOT/'runtime'/'management.sqlite3',config)
                 try:

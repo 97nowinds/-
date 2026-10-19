@@ -40,6 +40,10 @@ class YoloPersonTracker:
         self.tracker_config = str(tracker_config)
         self.device = device if device is not None else ("0" if torch.cuda.is_available() else "cpu")
         self.model = model_factory(self.model_path)
+        from scoped_byte_tracker import TrackIdAllocator
+        self.id_allocator = TrackIdAllocator()
+        self.byte_tracker = None
+        self.last_detector_boxes = None
         self.guarded_tracker = None
         config_path = Path(self.tracker_config)
         if config_path.is_file():
@@ -51,7 +55,11 @@ class YoloPersonTracker:
                 if reid_embedder is None:
                     from reid_embedder import ReIDEmbedder
                     reid_embedder = ReIDEmbedder(Path(__file__).parent / "models/osnet_x1_0_msmt17.pth")
-                self.guarded_tracker = GuardedByteTracker(SimpleNamespace(**settings), reid_embedder)
+                self.guarded_tracker = GuardedByteTracker(SimpleNamespace(**settings), reid_embedder, allocator=self.id_allocator)
+                self.byte_tracker = self.guarded_tracker
+            elif settings.get("tracker_type") == "bytetrack" and hasattr(self.model, "predict"):
+                from scoped_byte_tracker import ScopedByteTracker
+                self.byte_tracker = ScopedByteTracker(SimpleNamespace(**settings), allocator=self.id_allocator)
         self.last_diagnostics = {
             "tracker_result_boxes": 0,
             "valid_track_boxes": 0,
@@ -80,19 +88,21 @@ class YoloPersonTracker:
             device=self.device,
             verbose=False,
         )
-        if self.guarded_tracker is None:
+        if self.byte_tracker is None:
             results = self.model.track(persist=True, tracker=self.tracker_config, **options)
         else:
             results = self.model.predict(**options)
             if results and results[0].boxes is not None:
                 raw = results[0].boxes.cpu().numpy()
-                output = self.guarded_tracker.update(raw, frame, observed_at=observed_at)
+                self.last_detector_boxes = len(raw)
+                output = (self.guarded_tracker.update(raw, frame, observed_at=observed_at)
+                    if self.guarded_tracker is not None else self.byte_tracker.update(raw, frame))
                 if len(output):
                     results[0] = results[0][output[:, -1].astype(int)]
                     results[0].update(boxes=torch.as_tensor(output[:, :-1]))
                 else:
                     results[0].update(boxes=torch.empty((0, 7)))
-                self.model.predictor.trackers = [self.guarded_tracker]
+                self.model.predictor.trackers = [self.byte_tracker]
         if not results or results[0].boxes is None:
             self.last_diagnostics = {
                 "tracker_result_boxes": 0,
@@ -154,6 +164,8 @@ class YoloPersonTracker:
             "nms_iou_threshold": self.iou,
             "image_size": self.image_size,
             "tracker_config": self.tracker_config,
+            "local_id_scope": "camera_monotonic" if self.byte_tracker is not None else "external_tracker",
+            "detector_result_boxes": self.last_detector_boxes,
             "lost_low_recovery": list(self.guarded_tracker.audit) if self.guarded_tracker is not None else [],
         }
 
@@ -193,8 +205,8 @@ class YoloPersonTracker:
         # Ultralytics stores persistent tracker state on the predictor.
         # Dropping it prevents an ID from surviving a camera reconnect.
         self.model.predictor = None
-        if self.guarded_tracker is not None:
-            self.guarded_tracker.reset()
+        if self.byte_tracker is not None:
+            self.byte_tracker.reset()
 
 
 class TrackTrailStore:
@@ -249,6 +261,7 @@ class CrossCameraTrackCoordinator:
         mtmc_config=None,
         event_store=None,
         camera_roles=None,
+        handoff_policy_path=None,
     ):
         self.feature_extractor = feature_extractor
         self.floor_map = floor_map
@@ -275,9 +288,9 @@ class CrossCameraTrackCoordinator:
             else same_camera_similarity_threshold
         )
         self.same_camera_ttl_seconds = float(same_camera_ttl_seconds)
-        self.transitions = list(
-            floor_map.config.get("camera_transitions", []) if floor_map else []
-        )
+        from handoff_hub import load_handoff_transitions
+        self.handoff_policy_path = str(handoff_policy_path) if handoff_policy_path else None
+        self.transitions = load_handoff_transitions(floor_map.config if floor_map else {}, handoff_policy_path)
         self.retention_seconds = max(
             [self.ttl_seconds]
             + [float(item.get("max_gap_seconds", 0.0)) for item in self.transitions]
@@ -290,6 +303,7 @@ class CrossCameraTrackCoordinator:
         self.next_id = 1
         self.local_bindings = {}
         self.local_features = {}
+        self.local_feature_attempts = {}
         self.local_galleries = {}
         self.local_motion = {}
         self.global_galleries = {}
@@ -1130,13 +1144,16 @@ class CrossCameraTrackCoordinator:
             if lock_owner and lock_owner != global_id:
                 owner_record = self.global_identities.get(lock_owner)
                 if self._identity_is_active(owner_record, now):
-                    # A face result is not sufficient evidence to merge two
-                    # simultaneously active bodies. Occlusion can put another
-                    # worker's face crop on the wrong ByteTrack box; merging
-                    # here would then label every involved local track as the
-                    # same registered person. Cross-camera continuity must be
-                    # established by the spatial/Re-ID coordinator first.
-                    return None
+                    # A retained name is not a live body. After the global
+                    # owner expires, a newly confirmed face can reclaim its
+                    # name without merging two trajectories or waiting 90s.
+                    if (lock_owner not in self.global_tracks
+                            and global_id in self.global_tracks
+                            and identity.get("identity_source") == "face"):
+                        self._release_identity(lock_owner)
+                    else:
+                        # Never use a face crop to merge two existing bodies.
+                        return None
                 else:
                     self._release_identity(lock_owner)
 
@@ -1255,12 +1272,13 @@ class CrossCameraTrackCoordinator:
             # A recovered head/upper-body ROI is association evidence only;
             # never overwrite the clean full-body identity gallery with it.
             needs_refresh = not occluded and not track.get("partial_body", False) and (
-                cached is None or monotonic_time - cached[1] >= self.feature_refresh_seconds
+                cached is None or monotonic_time - self.local_feature_attempts.get(key, cached[1]) >= self.feature_refresh_seconds
             )
             quality = BodyQualityScorer.assess(frame, box) if needs_refresh else None
             track_inputs.append((track, local_id, box, key, gallery, quality))
             if needs_refresh and quality["score"] >= gallery.min_quality:
                 refresh_inputs.append((local_id, box))
+                self.local_feature_attempts[key] = monotonic_time
 
         refreshed = {}
         if refresh_inputs:
@@ -1323,6 +1341,7 @@ class CrossCameraTrackCoordinator:
                     "gallery": gallery,
                     "appearance": appearance,
                     "image_anchor": track.get("image_anchor"),
+                    "image_box": (box[0]/frame.shape[1], box[1]/frame.shape[0], box[2]/frame.shape[1], box[3]/frame.shape[0]),
                     "clothing_tone": self.clothing_tone(frame, box),
                 }
             )
@@ -1387,7 +1406,7 @@ class CrossCameraTrackCoordinator:
                     continue
                 key = (camera_id, item["local_id"])
                 entry_state = self.local_entry_states.setdefault(key, {"inside": set(), "times": {}})
-                inside_entries = self.batch_associator.entry_gate_sources(camera_id, item.get("image_anchor"))
+                inside_entries = self.batch_associator.entry_gate_sources(camera_id, item.get("image_anchor"), item.get("image_box"))
                 for entry in inside_entries - entry_state["inside"]:
                     entry_state["times"][entry] = monotonic_time
                 entry_state["inside"] = inside_entries
@@ -1408,6 +1427,7 @@ class CrossCameraTrackCoordinator:
                         and item["geometry_trusted"]
                     ),
                     image_anchor=item.get("image_anchor"),
+                    image_box=item.get("image_box"),
                     clothing_tone=item.get("clothing_tone"),
                     box=item["box"],
                     recent_entry_gates=dict(entry_state["times"]),
@@ -1453,6 +1473,7 @@ class CrossCameraTrackCoordinator:
                         ),
                         source_local_id=target.get("local_id"),
                         image_anchor=target.get("image_anchor"),
+                        image_box=target.get("image_box"),
                         recent_exit_gates=dict(target.get("exit_gate_seen_at") or {}),
                         clothing_tone=target.get("clothing_tone"),
                         camera_observations=dict(target.get("camera_observations") or {}),
@@ -1507,7 +1528,12 @@ class CrossCameraTrackCoordinator:
                 temporal_evidence = None
                 overlap_min = decision.get("temporal_overlap_min_similarity")
                 evidence_similarity = overlap_min if overlap_min is not None else self.mtmc_config["association"].get("pending_confirmation_similarity", 0.68)
-                evidence_duration = 1.0 if overlap_min is not None else 0.4
+                hub_strong = bool(decision.get("hub_strong_candidate"))
+                evidence_mode = "hub_strong" if hub_strong else "standard"
+                if hub_strong:
+                    evidence_similarity = self.mtmc_config["reid"]["high_similarity"]
+                evidence_duration = .2 if hub_strong else 1.0 if overlap_min is not None else .4
+                required_observations = 3 if hub_strong else self.mtmc_config["association"].get("pending_confirmation_observations", 5)
                 if (
                     decision.get("confidence") == "medium" and candidate_id
                     and not relink_pending
@@ -1519,12 +1545,13 @@ class CrossCameraTrackCoordinator:
                     old_evidence = self.pending.get(previous_id, {})
                     consecutive = (
                         old_evidence.get("candidate_global_id") == candidate_id
+                        and old_evidence.get("evidence_mode", "standard") == evidence_mode
                         and monotonic_time - old_evidence.get("last_evidence_at", -1e9) <= 0.5
                     )
                     count = old_evidence.get("evidence_count", 0) + 1 if consecutive else 1
                     first_at = old_evidence.get("first_evidence_at", monotonic_time) if consecutive else monotonic_time
-                    temporal_evidence = {"evidence_count": count, "first_evidence_at": first_at, "last_evidence_at": monotonic_time}
-                    if count >= self.mtmc_config["association"].get("pending_confirmation_observations", 5) and monotonic_time - first_at >= evidence_duration - 1e-6:
+                    temporal_evidence = {"evidence_mode": evidence_mode, "evidence_count": count, "first_evidence_at": first_at, "last_evidence_at": monotonic_time}
+                    if count >= required_observations and monotonic_time - first_at >= evidence_duration - 1e-6:
                         decision = {**decision, "accepted": True, "confidence": "high", "reason": "confirmed_temporal_candidate", "evidence_count": count}
                 created_global_id = False
                 if decision.get("accepted") and candidate_id in self.global_tracks:
@@ -1661,7 +1688,7 @@ class CrossCameraTrackCoordinator:
                         "position": item["position"],
                         "geometry_trusted": item["geometry_trusted"],
                         "box": item["box"],
-                        "image_anchor": item.get("image_anchor"),
+                        "image_anchor": item.get("image_anchor"), "image_box": item.get("image_box"),
                         "local_id": item["local_id"],
                         "direction": item["direction"],
                         "last_seen": monotonic_time,
@@ -1676,7 +1703,7 @@ class CrossCameraTrackCoordinator:
                     target["clothing_tone"] = self._dominant_clothing_tone(votes)
                 exit_gate_seen_at = target.setdefault("exit_gate_seen_at", {})
                 for destination in self.batch_associator.exit_gate_destinations(
-                    camera_id, item.get("image_anchor")
+                    camera_id, item.get("image_anchor"), item.get("image_box")
                 ):
                     exit_gate_seen_at[destination] = monotonic_time
                     camera_exits[destination] = monotonic_time
@@ -1690,7 +1717,7 @@ class CrossCameraTrackCoordinator:
                     "last_seen": monotonic_time, "box": item["box"],
                     "position": item["position"], "direction": item["direction"],
                     "geometry_trusted": self._camera_geometry_allowed(camera_id) and item["geometry_trusted"],
-                    "image_anchor": item.get("image_anchor"), "appearance": item["appearance"],
+                    "image_anchor": item.get("image_anchor"), "image_box": item.get("image_box"), "appearance": item["appearance"],
                     "clothing_tone": item.get("clothing_tone"),
                     "recent_exit_gates": camera_exits, "pixel_velocity": pixel_velocity,
                 }
@@ -1897,6 +1924,8 @@ class CrossCameraTrackCoordinator:
             return {
                 "algorithm_version": self.mtmc_config["algorithm_version"],
                 "association_algorithm": ASSOCIATION_ALGORITHM,
+                "handoff_policy_path": getattr(self, "handoff_policy_path", None),
+                "handoff_hub_ids": sorted({t["hub_id"] for t in self.transitions if t.get("hub_id")}),
                 "active_global_tracks": len(self.global_tracks),
                 "pending_associations": len(self.pending),
                 "batch_window_reservations": len(self.association_reservations),
@@ -1981,6 +2010,7 @@ class CrossCameraTrackCoordinator:
                         ):
                             self.local_bindings.pop(key, None)
                             self.local_features.pop(key, None)
+                            self.local_feature_attempts.pop(key, None)
 
             # Existing camera-local tracks may have received separate IDs before
             # reaching the overlap. Merge them once both views agree there.
@@ -2044,6 +2074,7 @@ class CrossCameraTrackCoordinator:
             for key in [key for key in self.local_bindings if key[0] == camera_id]:
                 self.local_bindings.pop(key, None)
                 self.local_features.pop(key, None)
+                self.local_feature_attempts.pop(key, None)
                 self.local_galleries.pop(key, None)
                 self.local_motion.pop(key, None)
                 self.local_entry_states.pop(key, None)
@@ -2056,7 +2087,7 @@ class CrossCameraTrackCoordinator:
         """Discard all cross-camera evidence at a recording loop boundary."""
         with self.lock:
             for state in (
-                self.local_bindings, self.local_features, self.local_galleries,
+                self.local_bindings, self.local_features, self.local_feature_attempts, self.local_galleries,
                 self.local_motion, self.global_galleries, self.global_tracks,
                 self.global_identities, self.person_locks, self.pending,
                 self.redirects, self.active_local_ids_by_camera,
@@ -2075,6 +2106,7 @@ class CrossCameraTrackCoordinator:
         with self.lock:
             self.local_bindings.pop(key, None)
             self.local_features.pop(key, None)
+            self.local_feature_attempts.pop(key, None)
             self.local_galleries.pop(key, None)
             self.local_motion.pop(key, None)
             self.relink_evidence.pop(key, None)

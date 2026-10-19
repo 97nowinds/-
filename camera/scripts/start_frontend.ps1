@@ -23,7 +23,7 @@ if ($PythonPath) {
 $server = Join-Path $projectRoot "frontend_server.py"
 if ($EnableManagement) {
     if ([string]::IsNullOrWhiteSpace($env:LAB_MANAGEMENT_ADMIN_TOKEN) -and
-        -not (Test-Path -LiteralPath (Join-Path $projectRoot 'runtime\feishu-app.dpapi')) -and
+        -not (Test-Path -LiteralPath (Join-Path $projectRoot 'runtime\feishu-evidence.dpapi')) -and
         -not (Test-Path -LiteralPath (Join-Path $projectRoot 'runtime\feishu-group.dpapi'))) {
         throw "请先在本机配置 LAB_MANAGEMENT_ADMIN_TOKEN，再启用通知管理。不要将令牌写入脚本或聊天。"
     }

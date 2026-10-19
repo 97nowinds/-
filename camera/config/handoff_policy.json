@@ -1,0 +1,12 @@
+{
+  "enabled": false,
+  "hub_id": "laboratory-door-interchange",
+  "cameras": [
+    "cam_1",
+    "cam_2",
+    "cam_entrance"
+  ],
+  "minimum_body_overlap": 0.35,
+  "region_source": "union_of_existing_operator_image_regions",
+  "note": "Candidate under replay validation; map geometry and instrument regions are unchanged."
+}

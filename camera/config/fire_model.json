@@ -1,0 +1,13 @@
+{
+  "repository": "rabahdev/fire-smoke-yolov8n",
+  "revision": "13017fe8af477c25f5298d168e2dfede4b000753",
+  "source_url": "https://huggingface.co/rabahdev/fire-smoke-yolov8n/resolve/13017fe8af477c25f5298d168e2dfede4b000753/best.pt",
+  "source_sha256": "b91633799ceb052c814b4f8b77a37efc9a40f002d528df97d74463585fa4f28f",
+  "sha256": "50567bc3ee7b4336768976693391440cedb737d94469127f0980ee2195d064f9",
+  "path": "models/fire/rabahdev-yolov8n-640.onnx",
+  "export_size": 640,
+  "cpu_threads": 2,
+  "candidate_confidence": 0.25,
+  "state": "experimental_observe",
+  "export_metadata_license": "AGPL-3.0"
+}

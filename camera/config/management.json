@@ -1,37 +1,22 @@
 {
   "lab_id": "lab_main",
   "event_max_age_seconds": 15,
+  "require_authority_snapshot": true,
+  "fire_fusion": {
+    "camera_zones": {},
+    "device_zones": {},
+    "confirmation_window_seconds": 10,
+    "visual_minimum_confidence": 0.9,
+    "visual_minimum_frames": 2,
+    "visual_minimum_seconds": 1,
+    "visual_maximum_gap_seconds": 5
+  },
   "cooldown_seconds": 120,
   "principals": [
     {
       "id": "administrator",
       "role": "admin",
       "token_env": "LAB_MANAGEMENT_ADMIN_TOKEN"
-    },
-    {
-      "id": "lab_manager",
-      "role": "manager",
-      "labs": [
-        "lab_main"
-      ],
-      "token_env": "LAB_MANAGEMENT_MANAGER_TOKEN"
-    },
-    {
-      "id": "yxq",
-      "role": "experimenter",
-      "labs": [
-        "lab_main"
-      ],
-      "person_ids": [],
-      "token_env": "LAB_MANAGEMENT_YXQ_TOKEN"
-    },
-    {
-      "id": "observer",
-      "role": "viewer",
-      "labs": [
-        "lab_main"
-      ],
-      "token_env": "LAB_MANAGEMENT_VIEWER_TOKEN"
     },
     {
       "id": "member_detector",
@@ -49,18 +34,52 @@
   ],
   "routes": [
     {
-      "id": "laboratory_group",
+      "id": "experimenters",
+      "audience": "experimenters",
       "transport": "webhook",
       "labs": [
         "lab_main"
       ],
       "event_types": [
-        "person.entered",
-        "instrument.started",
-        "safety.no_mask"
+        "environment.flame",
+        "environment.flame_recovered",
+        "safety.no_mask",
+        "safety.no_lab_coat",
+        "safety.no_gloves"
       ],
-      "webhook_env": "LAB_FEISHU_GROUP_WEBHOOK",
-      "secret_env": "LAB_FEISHU_GROUP_SECRET"
+      "webhook_env": "LAB_FEISHU_EXPERIMENTERS_WEBHOOK",
+      "secret_env": "LAB_FEISHU_EXPERIMENTERS_SECRET"
+    },
+    {
+      "id": "managers",
+      "audience": "managers",
+      "transport": "webhook",
+      "labs": [
+        "lab_main"
+      ],
+      "event_types": [
+        "environment.flame",
+        "environment.flame_recovered",
+        "safety.no_mask",
+        "safety.no_lab_coat",
+        "safety.no_gloves"
+      ],
+      "webhook_env": "LAB_FEISHU_MANAGERS_WEBHOOK",
+      "secret_env": "LAB_FEISHU_MANAGERS_SECRET"
+    },
+    {
+      "id": "administrators",
+      "audience": "administrators",
+      "transport": "webhook",
+      "labs": [
+        "lab_main"
+      ],
+      "event_types": [
+        "environment.flame",
+        "environment.flame_recovered"
+      ],
+      "webhook_env": "LAB_FEISHU_ADMINISTRATORS_WEBHOOK",
+      "secret_env": "LAB_FEISHU_ADMINISTRATORS_SECRET"
     }
   ],
   "silent_events": [
@@ -85,6 +104,12 @@
       "enabled": false,
       "minimum_confidence": 0.9
     }
+  },
+  "ppe_confirmation": {
+    "minimum_frames": 3,
+    "minimum_seconds": 5,
+    "maximum_gap_seconds": 15,
+    "escalation_seconds": 60
   },
   "evidence_image_origins": [
     "http://127.0.0.1:5175",

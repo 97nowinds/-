@@ -25,6 +25,7 @@ try:
 
     from camera_source import resolve_camera_source
     from dataset_recorder import DatasetRecorder, RecordingError
+    from face_attempt_audit import FaceAttemptAudit, run_face_attempt, warm_face_models
     from face_identity import (
         ARCFACE_MIN_GALLERY_FEATURES,
         REGISTRATION_MAX_SAMPLES,
@@ -469,6 +470,7 @@ class CameraWorker:
         self.last_face_result = None
         self.last_face_box_at = 0.0
         self.face_attempts_by_track = {}
+        self.face_attempt_audit = FaceAttemptAudit()
         self.face_attempt_count = 0
         self.face_detection_count = 0
         self.face_match_count = 0
@@ -1171,8 +1173,12 @@ class CameraWorker:
         return (left + fx, top + fy, fw, fh), face, aligned_face, embedding
 
     def confirm_face_identity(self, frame, person_box, track_id=None):
+        audit_started = time.perf_counter()
         detection = self.detect_face_in_person_box(frame, person_box)
+        detection_ms = (time.perf_counter() - audit_started) * 1000
         if detection is None:
+            self.face_attempt_audit.record(track_id=track_id, detection_ms=detection_ms,
+                total_ms=(time.perf_counter()-audit_started)*1000)
             return None
         face_box, face, aligned_face, embedding = detection
         appearance = self.handoff.appearance(frame, person_box)
@@ -1182,6 +1188,8 @@ class CameraWorker:
             track_key=(self.camera["id"], track_id),
             query_embedding=embedding,
         )
+        self.face_attempt_audit.record(track_id=track_id, detection_ms=detection_ms,
+            total_ms=(time.perf_counter()-audit_started)*1000, result=result, face_box=face_box)
         self.accept_face_result(result, appearance, track_id=track_id)
         self.last_face_at = time.time()
         return face_box, result
@@ -1714,8 +1722,8 @@ class CameraWorker:
                 self.face_attempts_by_track[target_local_id] = now
                 self.last_face_attempt_track_id = target_local_id
                 self.face_attempt_count += 1
-                candidate = self.confirm_face_identity(
-                    frame, target_track["box"], target_track.get("track_id")
+                candidate = run_face_attempt(
+                    self, frame, target_track["box"], target_track.get("track_id")
                 )
                 if candidate is not None:
                     face_box, face_result = candidate
@@ -1981,6 +1989,11 @@ class CameraWorker:
             "face_recognition_enabled": self.camera["face_recognition"],
             "face_recognition_ready": self.face_recognition_ready,
             "face_recognition_error": self.face_recognition_error,
+            "face_interval_seconds": self.camera["face_interval_seconds"],
+            "face_attempt_diagnostics": self.face_attempt_audit.payload(),
+            "face_actual_providers": {name: model.session.get_providers()
+                for name, model in self.face_store.modern.analysis.models.items()}
+                if self.face_store.modern.available else {},
             "face_attempt_count": self.face_attempt_count,
             "face_detection_count": self.face_detection_count,
             "face_match_count": self.face_match_count,
@@ -2119,6 +2132,7 @@ class CameraManager:
             mtmc_config=self.mtmc_config,
             event_store=self.event_store,
             camera_roles={camera["id"]: camera["role"] for camera in cameras},
+            handoff_policy_path=BASE_DIR / "config" / "handoff_policy.json",
         )
         camera_ids = [camera["id"] for camera in cameras]
         self.recorder = DatasetRecorder(RECORDINGS_DIR, camera_ids)
@@ -2819,6 +2833,7 @@ face_store = FaceIdentityStore(
     modern_model_root=MODERN_FACE_MODEL_ROOT,
     required_engine=FACE_RECOGNITION_ENGINE,
 )
+warm_face_models(face_store.modern)
 camera_manager = CameraManager(load_cameras(), face_store)
 face_registration = FaceRegistrationManager(face_store, camera_manager.workers)
 

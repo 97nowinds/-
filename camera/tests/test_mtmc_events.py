@@ -8,6 +8,18 @@ from mtmc_events import AssociationEventStore
 
 
 class AssociationEventStoreTests(unittest.TestCase):
+    def test_large_history_is_archived_without_losing_sequence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"events.jsonl"
+            raw = "".join(json.dumps({"sequence":i,"event":"create","unix_time":99})+"\n" for i in range(1,21))
+            path.write_text(raw,encoding="utf-8")
+            with patch.object(AssociationEventStore,"STARTUP_ROTATE_BYTES",1):
+                store = AssociationEventStore(path,memory_limit=3,now_fn=lambda:100)
+            self.assertEqual([e["sequence"] for e in store.recent()],[18,19,20])
+            self.assertEqual(Path(store.startup_archive).read_text(encoding="utf-8"),raw)
+            self.assertEqual(store.record("create")["sequence"],21)
+            self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()),4)
+
     def test_async_writer_flushes_ordered_events_on_close(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', {'LAB_ASYNC_EVENT_WRITES': '1'}):
             path = Path(directory) / 'events.jsonl'

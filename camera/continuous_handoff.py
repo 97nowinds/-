@@ -12,9 +12,9 @@ from member_integration import MemberServiceClient, extract_receipt_id
 from handoff_transport import load_demo_config
 
 
-def prepare_live_event(frozen, jpeg):
-    if frozen['camera_id'] != 'cam_2':
-        raise ValueError('this stage only sends cam_2')
+def prepare_live_event(frozen, jpeg, camera_id='cam_2', include_estimated_locations=False):
+    if camera_id not in ('cam_1', 'cam_2') or frozen['camera_id'] != camera_id:
+        raise ValueError('snapshot camera differs from selected instrument camera')
     if not frozen.get('source_frame_id'):
         raise ValueError('source frame identifier required')
     if (frozen['map_id'], frozen['map_revision']) != ('lab-floor', 'd9ea86e4bd80d086'):
@@ -27,7 +27,8 @@ def prepare_live_event(frozen, jpeg):
         raise ValueError('JPEG digest mismatch')
     if _jpeg_dimensions(jpeg) != (frozen['frame_width'], frozen['frame_height']):
         raise ValueError('JPEG dimensions mismatch')
-    event = build_sample_event(frozen, require_person_location=False)
+    event = build_sample_event(frozen, require_person_location=False,
+                               include_estimated_locations=include_estimated_locations)
     for track in event['camera']['tracks']:
         x, y, width, height = track['bbox']
         if x < 0 or y < 0 or width <= 0 or height <= 0 or x+width > 2560 or y+height > 1440:
@@ -46,6 +47,8 @@ def main():
     credentials = json.loads((root/'runtime/handoff-credentials.json').read_text(encoding='utf-8-sig'))
     headers = {'Authorization': 'Bearer ' + credentials['image_read_token']}
     client = MemberServiceClient(config['sender_receiver_url'], os.environ.get('LAB_MEMBER_SERVICE_TOKEN', ''), direct=True)
+    from snapshot_registry import SnapshotRegistry
+    registry=SnapshotRegistry(root/'runtime'/'snapshot-registry.sqlite3')
     interval = 1 / config['sender_target_fps']
     status_path = root/'runtime/continuous-cam2-status.json'
     status = dict(camera_id='cam_2', target_fps=3, transport_enabled=True,
@@ -85,6 +88,8 @@ def main():
                 # No retry queue: move to the newest frame after errors. Every
                 # event has immutable evidence; no archived sample is loaded.
                 sent = time.monotonic()
+                # Save immutable metadata before send: a result can beat its ACK.
+                registry.publish(event)
                 response = client.send_handoff(event)
                 receipt = extract_receipt_id(response.body)
                 if not response.ok or not receipt:

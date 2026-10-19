@@ -50,6 +50,45 @@ class SampleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_sample_event(frozen)
 
+    def estimated_sample(self):
+        frozen = self.sample()
+        frozen['map_observations'][0].update(camera_id=frozen['camera_id'], local_id=2,
+            observed_at=frozen['source_captured_at'], localization_quality='low',
+            position_estimated=True, footpoint_visible=False,
+            localization_reason='footpoint inferred from overlapping calibrated aisle')
+        return frozen
+
+    def test_candidate_retains_original_estimate_and_provenance(self):
+        frozen = self.estimated_sample()
+        before = deepcopy(frozen)
+        event = build_sample_event(frozen, include_estimated_locations=True)
+        location = event['camera']['tracks'][0]['location']
+        self.assertTrue(location['valid'])
+        self.assertTrue(location['position_estimated'])
+        self.assertFalse(location['footpoint_visible'])
+        self.assertEqual(location['quality'], 'low')
+        self.assertEqual(location['x_m'], 1)
+        self.assertEqual(frozen, before)
+
+    def test_candidate_does_not_borrow_stale_wrong_person_or_invalid_position(self):
+        for patch in ({'local_id': 99}, {'track_id': 'other'}, {'camera_id': 'other'},
+                      {'observed_at': 1}, {'valid': False}, {'lost': True},
+                      {'localization_state': 'lost'}, {'localization_quality': 'unavailable'}):
+            frozen = self.estimated_sample()
+            frozen['map_observations'][0].update(patch)
+            event = build_sample_event(frozen, require_person_location=False,
+                                       include_estimated_locations=True)
+            self.assertNotIn('location', event['camera']['tracks'][0], patch)
+
+    def test_optional_unknown_provenance_is_omitted_without_changing_false_values(self):
+        frozen = self.estimated_sample()
+        frozen['map_observations'][0].update(localization_reason=None, position_estimated=False)
+        event = build_sample_event(frozen, include_estimated_locations=True)
+        location = event['camera']['tracks'][0]['location']
+        self.assertNotIn('localization_reason', location)
+        self.assertFalse(location['position_estimated'])
+        self.assertFalse(location['footpoint_visible'])
+
     def test_automatic_original_path_keeps_acceptance_gates(self):
         config, frozen, tracks = fixtures()
         frozen.update(frame_width=2560, frame_height=1440, source_dimensions=[2560, 1440],

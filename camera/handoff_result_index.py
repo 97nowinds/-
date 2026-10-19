@@ -13,6 +13,8 @@ class SnapshotTrackIndex:
 
     def remember(self, event):
         camera = event['camera']
+        timing=camera.get('timing') or {}
+        time_domain=event.get('time_domain') or timing.get('event_time_domain') or timing.get('time_domain')
         key = (str(camera['camera_id']), str(event['snapshot_id']))
         tracks = {}
         for track in camera.get('tracks', []):
@@ -23,10 +25,14 @@ class SnapshotTrackIndex:
             else:
                 tracks[track_id] = {field: deepcopy(track.get(field)) for field in
                     ('global_id', 'person_id', 'display_name', 'observed_at', 'bbox', 'bbox_format')}
+                timing=camera.get('timing') or {}
+                tracks[track_id]['time_domain']=(event.get('time_domain') or timing.get('event_time_domain')
+                                                or timing.get('time_domain'))
         with self.lock:
             self.snapshots[key] = tracks
             self.frames[key] = {field: deepcopy(camera.get(field)) for field in
                 ('image_url', 'image_sha256', 'frame_width', 'frame_height', 'source_frame_id')}
+            self.frames[key].update(captured_at=event.get('captured_at'),time_domain=time_domain)
             self.snapshots.move_to_end(key)
             while len(self.snapshots) > self.max_snapshots:
                 removed, _ = self.snapshots.popitem(last=False)

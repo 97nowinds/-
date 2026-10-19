@@ -15,13 +15,15 @@ class ManagementRuntime:
         config = json.loads(Path(config_path).read_text(encoding='utf-8'))
         self.service = ManagementNotifications(Path(config_path).parent.parent /
                                               'runtime' / 'management.sqlite3', config)
-        from feishu_app import DEFAULT_CREDENTIALS, GROUP_CREDENTIALS, EVIDENCE_CREDENTIALS, load_credentials
+        from feishu_app import GROUP_CREDENTIALS, EVIDENCE_CREDENTIALS, load_credentials
         credential_path = (EVIDENCE_CREDENTIALS if EVIDENCE_CREDENTIALS.exists() else
-                           GROUP_CREDENTIALS if GROUP_CREDENTIALS.exists() else DEFAULT_CREDENTIALS)
+                           GROUP_CREDENTIALS)
         if credential_path.exists():
             credentials = load_credentials(credential_path)
             self.service.env = dict(self.service.env)
             self.service.env.setdefault('LAB_MANAGEMENT_ADMIN_TOKEN', credentials['management_admin_token'])
+            if credentials.get('management_producer_token'):
+                self.service.env.setdefault('LAB_MANAGEMENT_PRODUCER_TOKEN', credentials['management_producer_token'])
             if credential_path == GROUP_CREDENTIALS:
                 self.service.env['LAB_FEISHU_GROUP_WEBHOOK'] = credentials['webhook']
                 self.service.env['LAB_FEISHU_GROUP_SECRET'] = credentials.get('secret', '')
@@ -29,6 +31,24 @@ class ManagementRuntime:
                 for audience, bot in credentials['groups'].items():
                     self.service.env['LAB_FEISHU_'+audience.upper()+'_WEBHOOK']=bot['webhook']
                     self.service.env['LAB_FEISHU_'+audience.upper()+'_SECRET']=bot.get('secret','')
+                # Use the already configured destination groups. No private
+                # Webhook value is written to route settings or API responses.
+                audiences=('experimenters','managers','administrators')
+                if all(key in credentials['groups'] for key in audiences):
+                    ppe=['safety.no_mask','safety.no_lab_coat','safety.no_gloves']
+                    routes=[{'id':key,'audience':key,'transport':'webhook','labs':[config['lab_id']],
+                        'event_types':(['environment.flame','environment.flame_recovered']+
+                                       (ppe if key in {'experimenters','managers'} else [])),
+                        'webhook_env':'LAB_FEISHU_'+key.upper()+'_WEBHOOK',
+                        'secret_env':'LAB_FEISHU_'+key.upper()+'_SECRET'} for key in audiences]
+                    with self.service.lock,self.service.db:
+                        migrated=self.service.db.execute("SELECT value FROM settings WHERE key='group_policy_version'").fetchone()
+                        if not migrated:
+                            # Migrate only the shipped legacy single group. A
+                            # previously customized route remains administrator-owned.
+                            if {r['id'] for r in self.service.config['routes']}<={'laboratory_group'}:
+                                self.service.set_routes({'id':'runtime-policy-migration','role':'admin'},routes)
+                            self.service.db.execute('INSERT INTO settings VALUES(?,?)',('group_policy_version','20261015'))
         from alert_evidence import AlertEvidence
         import os
         image_token=os.environ.get('LAB_HANDOFF_IMAGE_READ_TOKEN','')
@@ -38,18 +58,37 @@ class ManagementRuntime:
         origins=set(config.get('evidence_image_origins',['http://127.0.0.1:5175']))|{server.api_base}
         self.service.evidence=AlertEvidence(Path(config_path).parent.parent/'runtime'/'alert-evidence',origins,image_token)
         self.evidence = EvidenceAdapter(self.service)
+        from visual_fire import VisualFireAdapter
+        self.fire=VisualFireAdapter(self.service)
+        from snapshot_registry import SnapshotRegistry
+        self.registry=SnapshotRegistry(Path(config_path).parent.parent/'runtime'/'snapshot-registry.sqlite3')
+        self.shared_index=SnapshotTrackIndex(max_snapshots=1200)
         self.stop_event = threading.Event()
         self.last_poll_status = 'starting'
         self.thread = None
 
     def index(self):
         publisher = self.server.live_publisher
-        return publisher.result_index if publisher else SnapshotTrackIndex()
+        index=publisher.result_index if publisher else self.shared_index
+        self.registry.populate(index)
+        return index
 
     def start(self):
         self.service.start()
+        self.environment_thread=threading.Thread(target=self._poll_environment,daemon=True,name='lab-local-alarm')
+        self.environment_thread.start()
         self.thread = threading.Thread(target=self._poll, daemon=True, name='lab-management-evidence')
         self.thread.start()
+
+    def _poll_environment(self):
+        while not self.stop_event.is_set():
+            try:
+                # Local serial monitor only: unauthenticated remote telemetry
+                # must not cause an emergency broadcast.
+                self.service.incidents.observe_environment(self.server.environment.status())
+            except Exception:
+                pass
+            self.stop_event.wait(.25)
 
     def _poll(self):
         while not self.stop_event.is_set():
@@ -70,7 +109,8 @@ class ManagementRuntime:
                         for row in body.get('analyses', []):
                             if isinstance(row, dict):
                                 try:
-                                    self.evidence.analysis({**row, 'time_domain': 'authority'}, self.index())
+                                    adapter=self.fire if row.get('evidence_type')=='fire' else self.evidence
+                                    adapter.analysis({**row, 'time_domain': 'authority'}, self.index())
                                 except (ValueError, KeyError, TypeError):
                                     pass
             except Exception:
@@ -81,6 +121,7 @@ class ManagementRuntime:
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=7)
+        if getattr(self,'environment_thread',None):self.environment_thread.join(timeout=2)
         self.service.stop()
 
 
@@ -104,7 +145,31 @@ def handle_management(handler, method):
     try:
         if principal['role'] == 'producer' and path != '/api/management/evidence':
             raise PermissionError('producer can only submit evidence')
-        if method == 'GET' and path.startswith('/api/management/evidence/'):
+        if method=='GET' and path=='/api/management/me':
+            handler._send_json({k:v for k,v in principal.items() if k!='token_env'})
+        elif method=='GET' and path=='/api/management/status':
+            if principal['role'] != 'admin':
+                raise PermissionError('maintenance administrator required')
+            from notification_status import notification_status
+            handler._send_json(notification_status(runtime))
+        elif path=='/api/management/policy' and method in {'GET','POST'}:
+            from management_policy import read_policy,set_policy
+            if method=='GET':handler._send_json(read_policy(service,principal))
+            else:
+                length=int(handler.headers.get('Content-Length','0'))
+                if not 1<=length<=16384:raise ValueError('invalid request size')
+                set_policy(service,principal,json.loads(handler.rfile.read(length)))
+                handler._send_json({'ok':True})
+        elif method == 'GET' and path=='/api/management/incidents':
+            handler._send_json({'incidents':service.incidents.list(principal)})
+        elif method == 'POST' and path=='/api/management/incidents':
+            length=int(handler.headers.get('Content-Length','0'))
+            if not 1<=length<=16384:raise ValueError('invalid request size')
+            body=json.loads(handler.rfile.read(length))
+            if not isinstance(body,dict):raise ValueError('object required')
+            service.incidents.transition(principal,body['incident_id'],body['action'],body.get('note',''))
+            handler._send_json({'ok':True})
+        elif method == 'GET' and path.startswith('/api/management/evidence/'):
             import re
             from management_notifications import scoped
             match=re.fullmatch(r'/api/management/evidence/([a-f0-9]{64})\.jpg',path)
@@ -149,12 +214,14 @@ def handle_management(handler, method):
                 if (principal['role'] != 'producer' or service.config['lab_id'] not in principal.get('labs', [])
                         or body.get('camera_id') not in principal.get('cameras', [])):
                     raise PermissionError('producer camera scope required')
-                if body.get('evidence_type') not in {'mask', 'ppe', 'interaction'}:
-                    raise ValueError('mask, ppe or interaction evidence required')
+                if body.get('evidence_type') not in {'mask', 'ppe', 'interaction','fire'}:
+                    raise ValueError('mask, ppe, interaction or fire evidence required')
                 if body['evidence_type']=='ppe' and body.get('ppe_type') not in {'mask','lab_coat','gloves'}:
                     raise ValueError('unsupported PPE type')
-                recorded = runtime.evidence.analysis(body, runtime.index(), mask=body['evidence_type'] == 'mask',
-                    ppe_type=body.get('ppe_type') if body['evidence_type']=='ppe' else None)
+                if body['evidence_type']=='fire':recorded=runtime.fire.analysis(body,runtime.index())
+                else:
+                    recorded = runtime.evidence.analysis(body, runtime.index(), mask=body['evidence_type'] == 'mask',
+                        ppe_type=body.get('ppe_type') if body['evidence_type']=='ppe' else None)
                 with service.lock, service.db:
                     service._audit(principal['id'], 'evidence.submit', str(body.get('analysis_id', 'unknown'))[:128])
                 handler._send_json({'accepted': recorded,

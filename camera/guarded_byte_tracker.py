@@ -7,15 +7,16 @@ import time
 import cv2
 import numpy as np
 from ultralytics.trackers.byte_tracker import BYTETracker
+from scoped_byte_tracker import ScopedByteTracker
 from ultralytics.trackers.basetrack import TrackState
 from ultralytics.trackers.utils import matching
 
 
-class GuardedByteTracker(BYTETracker):
-    def __init__(self, args, embedder):
+class GuardedByteTracker(ScopedByteTracker):
+    def __init__(self, args, embedder, allocator=None):
         if not hasattr(BYTETracker, '_second_association'):
             raise RuntimeError('Guarded recovery requires the inspected ByteTrack stage API')
-        super().__init__(args)
+        super().__init__(args, allocator=allocator)
         self.embedder = embedder
         self.references = {}
         self.reference_gray = {}
