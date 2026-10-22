@@ -4,7 +4,7 @@ import math
 
 
 def validate_policy(policy):
-    if not isinstance(policy,dict) or set(policy)-{'ppe_rules','ppe_confirmation'}:
+    if not isinstance(policy,dict) or set(policy)-{'ppe_rules','ppe_confirmation','ppe_preparation'}:
         raise ValueError('unknown policy fields')
     rules=policy.get('ppe_rules',{})
     if not isinstance(rules,dict) or set(rules)-{'mask','lab_coat','gloves'}:
@@ -14,6 +14,17 @@ def validate_policy(policy):
                 or type(rule['enabled']) is not bool or type(rule['minimum_confidence']) not in (int,float)
                 or not math.isfinite(rule['minimum_confidence']) or not .5<=rule['minimum_confidence']<=1):
             raise ValueError('invalid PPE threshold')
+    if 'ppe_preparation' in policy:
+        preparation=policy['ppe_preparation']
+        if (not isinstance(preparation,dict) or set(preparation)!=
+                {'enabled','camera_ids','grace_seconds','end_on_confirmed_interaction'}
+                or type(preparation['enabled']) is not bool
+                or type(preparation['end_on_confirmed_interaction']) is not bool
+                or not isinstance(preparation['camera_ids'],list) or not preparation['camera_ids']
+                or any(not isinstance(c,str) or not c for c in preparation['camera_ids'])
+                or type(preparation['grace_seconds']) is not int
+                or not 10<=preparation['grace_seconds']<=600):
+            raise ValueError('invalid PPE preparation policy')
     if 'ppe_confirmation' not in policy:return
     settings=policy['ppe_confirmation']
     fields={'minimum_frames','minimum_seconds','maximum_gap_seconds','escalation_seconds'}
@@ -34,12 +45,12 @@ def authorize(service,actor):
 def read_policy(service,actor):
     authorize(service,actor)
     with service.lock:
-        return {key:service.config.get(key,{}) for key in ('ppe_rules','ppe_confirmation')}
+        return {key:service.config.get(key,{}) for key in ('ppe_rules','ppe_confirmation','ppe_preparation') if key in service.config}
 
 
 def set_policy(service,actor,policy):
     authorize(service,actor)
-    if set(policy)!={'ppe_rules','ppe_confirmation'}:raise ValueError('complete policy required')
+    if not {'ppe_rules','ppe_confirmation'}<=set(policy):raise ValueError('complete policy required')
     validate_policy(policy)
     with service.lock,service.db:
         # Reset accumulated, unconfirmed observations on a rule change. Existing
@@ -48,8 +59,9 @@ def set_policy(service,actor,policy):
             state=json.loads(row['payload'])
             if not state['emitted']:service.db.execute('DELETE FROM ppe_states WHERE key=?',(row['key'],))
             else:
-                state.update(frames=[],continuous_since=None)
+                state.update(frames=[],continuous_since=None,escalation_since=None)
                 service.db.execute('UPDATE ppe_states SET payload=? WHERE key=?',(json.dumps(state),row['key']))
-        service.db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',('ppe_policy',json.dumps(policy)))
         service.config={**service.config,**json.loads(json.dumps(policy))}
+        persisted={k:service.config[k] for k in ('ppe_rules','ppe_confirmation','ppe_preparation') if k in service.config}
+        service.db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',('ppe_policy',json.dumps(persisted)))
         service._audit(actor['id'],'policy.update',json.dumps(policy,sort_keys=True))

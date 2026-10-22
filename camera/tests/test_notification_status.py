@@ -15,7 +15,7 @@ from snapshot_registry import SnapshotRegistry
 class NotificationStatusTests(unittest.TestCase):
     def test_deployed_config_routes_by_severity_and_keeps_routine_events_silent(self):
         with tempfile.TemporaryDirectory() as directory:
-            config=json.loads((Path(__file__).resolve().parents[1]/'config/management.json').read_text())
+            config=json.loads((Path(__file__).resolve().parents[1]/'config/management.json').read_text(encoding='utf-8'))
             now=2000000000.0
             def forbidden_sender(*_args):
                 raise AssertionError('This policy test must never send a real message')

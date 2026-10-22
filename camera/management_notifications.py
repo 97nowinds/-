@@ -115,6 +115,8 @@ class ManagementNotifications:
         self.image_credentials_revision = None
         from safety_incidents import SafetyIncidents
         self.incidents=SafetyIncidents(self)
+        from ppe_preparation import PPEPreparation
+        self.preparation=PPEPreparation(self)
         from ppe_policy import PPEPolicy
         self.ppe_policy=PPEPolicy(self)
         from fire_fusion import FireFusion
@@ -132,7 +134,7 @@ class ManagementNotifications:
         from management_policy import validate_policy
         from fire_fusion import validate_config as validate_fire_config
         validate_fire_config(config)
-        validate_policy({k:config[k] for k in ('ppe_rules','ppe_confirmation') if k in config})
+        validate_policy({k:config[k] for k in ('ppe_rules','ppe_confirmation','ppe_preparation') if k in config})
         ids = set()
         for principal in config.get('principals', []):
             if (principal.get('role') not in ROLES or not principal.get('id')
@@ -363,6 +365,10 @@ class EvidenceAdapter:
         else:
             if row.get('is_interacting') is not True or not row.get('instrument_id'):
                 return False
+            preparation=self.service.config.get('ppe_preparation',{})
+            if preparation.get('enabled') and preparation.get('end_on_confirmed_interaction',True):
+                self.service.preparation.finish(matched['person_id'],stamp(row['captured_at']),
+                                                'confirmed_instrument_interaction')
             kind = 'instrument.started'
         event=self.base(kind,matched,row['captured_at'],'ppe_detector' if mask or ppe_type else 'member_minicpm')
         if mask or ppe_type:
@@ -409,6 +415,10 @@ class EvidenceAdapter:
                             or identity.get('identity_lock_status') != 'locked'):
                         continue
                     person = identity['person_id']
+                    preparation=self.service.config.get('ppe_preparation',{})
+                    self.service.preparation.see(person,now,entrance_face=(
+                        camera['id'] in preparation.get('camera_ids',[])
+                        and identity.get('identity_source')=='face'))
                     if camera.get('role') == 'entrance_identity':
                         if person not in self.indoor_seen:
                             self.entrances.setdefault(person, now)

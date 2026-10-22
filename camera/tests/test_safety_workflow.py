@@ -149,9 +149,10 @@ class SafetyTests(unittest.TestCase):
         policy.observe('p1','safety.no_mask',None,self.now+5,'f4','not_worn')
         first=policy.observe('p1','safety.no_mask',None,self.now+6,'f5','not_worn');self.assertEqual(first['severity'],'L1')
         policy.observe('p1','safety.no_mask',None,self.now+8,'f6','not_worn')
-        escalation=policy.observe('p1','safety.no_mask',None,self.now+10,'f7','not_worn')
+        self.assertIsNone(policy.observe('p1','safety.no_mask',None,self.now+10,'f7','not_worn'))
+        escalation=policy.observe('p1','safety.no_mask',None,self.now+12,'f8','not_worn')
         self.assertEqual(escalation['severity'],'L2');self.assertEqual(escalation['incident_id'],first['incident_id'])
-        self.assertIsNone(policy.observe('p1','safety.no_mask',None,self.now+11,'f8','worn'))
+        self.assertIsNone(policy.observe('p1','safety.no_mask',None,self.now+13,'f9','worn'))
 
     def test_registry_shared_immutable_encrypted_and_expiring(self):
         path=Path(self.temp.name)/'registry.db'

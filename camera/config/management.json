@@ -2,6 +2,17 @@
   "lab_id": "lab_main",
   "event_max_age_seconds": 15,
   "require_authority_snapshot": true,
+  "audience_labels": {
+    "experimenters": "学生实验人员群",
+    "managers": "负责师兄师姐群",
+    "administrators": "负责老师群"
+  },
+  "ppe_preparation": {
+    "enabled": true,
+    "camera_ids": ["cam_entrance"],
+    "grace_seconds": 120,
+    "end_on_confirmed_interaction": true
+  },
   "fire_fusion": {
     "camera_zones": {},
     "device_zones": {},

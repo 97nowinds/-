@@ -17,12 +17,19 @@ class PPEPolicy:
             saved=s.db.execute('SELECT payload FROM ppe_states WHERE key=?',(key,)).fetchone()
             session=json.loads(saved['payload']) if saved else None
             if session and observed<session['last']:return None
+            if session and session['emitted'] and 'first_alert_at' not in session:
+                session['first_alert_at']=observed
             if state=='worn':
                 if session and session['emitted']:s.incidents.recover_ppe(session['id'],observed)
                 s.db.execute('DELETE FROM ppe_states WHERE key=?',(key,));return None
+            if s.preparation.active(person,observed):
+                # Preparation samples cannot become post-deadline evidence.
+                if session and not session['emitted']:
+                    s.db.execute('DELETE FROM ppe_states WHERE key=?',(key,))
+                return None
             if state!='not_worn':
                 if session:
-                    session['frames']=[];session['continuous_since']=None
+                    session['frames']=[];session['continuous_since']=None;session['escalation_since']=None
                     s.db.execute('UPDATE ppe_states SET payload=? WHERE key=?',(json.dumps(session),key))
                 return None
             if not session:
@@ -30,7 +37,9 @@ class PPEPolicy:
                          'emitted':False,'escalated':False}
             if frame in [row[1] for row in session['frames']]:return None
             if session['continuous_since'] is None or observed-session['last']>policy['maximum_gap_seconds']:
-                session['frames']=[];session['continuous_since']=observed
+                session['frames']=[];session['continuous_since']=observed;session['escalation_since']=None
+            if session['emitted'] and session.get('escalation_since') is None:
+                session['escalation_since']=observed
             session['last']=observed
             if frame not in [row[1] for row in session['frames']]:session['frames'].append([observed,frame])
             session['frames']=session['frames'][-100:]
@@ -39,8 +48,10 @@ class PPEPolicy:
             output=None
             if ready and not session['emitted']:
                 session['emitted']=True
+                session['first_alert_at']=observed
+                session['escalation_since']=observed
                 output={'incident_id':session['id'],'severity':'L1','audiences':'experimenters'}
-            elif ready and session['emitted'] and not session['escalated'] and observed-session['continuous_since']>=policy['escalation_seconds']:
+            elif ready and session['emitted'] and not session['escalated'] and observed-session.get('escalation_since',observed)>=policy['escalation_seconds']:
                 session['escalated']=True
                 output={'incident_id':session['id'],'severity':'L2','audiences':'experimenters,managers'}
             s.db.execute('INSERT OR REPLACE INTO ppe_states VALUES(?,?)',(key,json.dumps(session)))

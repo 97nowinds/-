@@ -85,8 +85,14 @@ class SafetyIncidents:
             (event['incident_id'],event['lab_id'],'ppe',1,'open',s.wall(),s.wall(),event['person_id'],event.get('instrument_id'),event.get('camera_id')))
 
     def recover_ppe(self,incident,observed):
-        self.service.db.execute("UPDATE incidents SET active=0,state='recovered',recovered=?,last_observed=? WHERE id=? AND kind='ppe'",
-                                (observed,observed,incident))
+        s=self.service
+        with s.lock,s.db:
+            s.db.execute("UPDATE incidents SET active=0,state='recovered',recovered=?,last_observed=? WHERE id=? AND kind='ppe'",
+                         (observed,observed,incident))
+            for row in s.db.execute('SELECT id,payload FROM events').fetchall():
+                event=json.loads(row['payload'])
+                if event.get('incident_id')==incident and event.get('event_type','').startswith('safety.'):
+                    s.db.execute("UPDATE outbox SET state='cancelled' WHERE event_id=? AND state='pending'",(row['id'],))
 
     def transition(self,principal,incident,action,note=''):
         from management_notifications import scoped

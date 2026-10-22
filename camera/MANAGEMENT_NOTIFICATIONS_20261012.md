@@ -4,6 +4,8 @@
 
 2026-10-19：新版通知端已加载到 5173，三群分级路由与 L0 静默规则已核对生效。检测侧尚未接入，详见 [当前部署与验收记录](FEISHU_NOTIFICATIONS_20261019.md)。
 
+同日补充：entrance 首次确认身份后提供 120 秒穿戴准备期；学生群 → 负责师兄师姐群分级处理普通防护问题，老师群接收火焰等严重事件。没有固定准备区。详见 [准备期、传输验证与已知边界](PPE_PREPARATION_AND_GROUP_ROUTING_20261019.md)。
+
 具体路由、证据要求、告警规则与部署状态见 [群通知机制](MANAGEMENT_MECHANISMS_20261015.md)。
 
 三个群及图片上传使用 scripts/configure_feishu_evidence.py 配置；单群连接工具为 scripts/configure_feishu_group.py。凭据在本机隐藏输入并用 DPAPI 加密保存，不写入 Git。旧私聊、联系人查询、电话及个人网站账号功能已移除。

@@ -8,6 +8,7 @@ def notification_status(runtime):
         groups = [{
             'id': route['id'],
             'audience': route.get('audience', route['id']),
+            'label': service.config.get('audience_labels',{}).get(route.get('audience',route['id']),route['id']),
             'event_types': list(route['event_types']),
             'webhook_configured': bool(service.env.get(route.get('webhook_env', ''))),
             'signature_configured': bool(service.env.get(route.get('secret_env', ''))),
@@ -34,6 +35,7 @@ def notification_status(runtime):
         blockers.append('experimenters_ppe_route_missing')
     return {
         'groups': groups, 'silent_events': silent, 'ppe_rules': rules,
+        'ppe_preparation': dict(service.config.get('ppe_preparation',{})),
         'outbox_counts': outbox,
         'evidence_upload_configured': evidence,
         'producer_auth_configured': producer,
