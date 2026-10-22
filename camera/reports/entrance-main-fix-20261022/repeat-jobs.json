@@ -1,0 +1,46 @@
+[
+  {
+    "mode": "baseline",
+    "returncode": 0,
+    "wall_seconds": 118.75318455696106,
+    "cameras": {
+      "cam_1": {
+        "first_known_elapsed": 66.52686190302484,
+        "finished": true,
+        "error": null
+      },
+      "cam_2": {
+        "first_known_elapsed": 53.92085624602623,
+        "finished": true,
+        "error": null
+      },
+      "cam_entrance": {
+        "first_known_elapsed": 50.889224651036784,
+        "finished": true,
+        "error": null
+      }
+    }
+  },
+  {
+    "mode": "fixed",
+    "returncode": 0,
+    "wall_seconds": 119.28718209266663,
+    "cameras": {
+      "cam_1": {
+        "first_known_elapsed": 66.58606033190154,
+        "finished": true,
+        "error": null
+      },
+      "cam_2": {
+        "first_known_elapsed": 49.94430009787902,
+        "finished": true,
+        "error": null
+      },
+      "cam_entrance": {
+        "first_known_elapsed": 49.94430009787902,
+        "finished": true,
+        "error": null
+      }
+    }
+  }
+]

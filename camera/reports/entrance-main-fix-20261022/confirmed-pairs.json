@@ -1,0 +1,29 @@
+[
+  {
+    "subject": "yxq_side_20261009",
+    "seconds": 50.9813,
+    "source_local_id": 5,
+    "local_id": 3,
+    "reid_score": 0.698291,
+    "match_margin": 1.0,
+    "evidence_count": 27
+  },
+  {
+    "subject": "yxq_side_20261009",
+    "seconds": 80.7174,
+    "source_local_id": 6,
+    "local_id": 13,
+    "reid_score": 0.748634,
+    "match_margin": 1.0,
+    "evidence_count": 26
+  },
+  {
+    "subject": "kaoqing",
+    "seconds": 8.8075,
+    "source_local_id": 2,
+    "local_id": 7,
+    "reid_score": 0.729213,
+    "match_margin": 1.0,
+    "evidence_count": 15
+  }
+]

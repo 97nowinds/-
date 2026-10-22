@@ -54,6 +54,7 @@
       "to": "cam_2",
       "max_gap_seconds": 20,
       "bidirectional": true,
+      "temporal_overlap_min_similarity": 0.68,
       "image_handoff_gates": {
         "cam_entrance": {
           "entry": {"points": [[0.0, 0.55], [0.45, 0.55], [0.5, 1.0], [0.0, 1.0]]},

@@ -1,0 +1,100 @@
+{
+  "baseline": {
+    "cam_1": {
+      "first_known_elapsed": 66.6265076128766,
+      "face_attempts": 0,
+      "face_match_count": 0,
+      "final_identities": [
+        {
+          "local_id": 8,
+          "person_id": "person001",
+          "person_number": 5,
+          "name": "yxq",
+          "identity_source": "transition_handoff",
+          "identity_lock_status": "locked",
+          "global_track_id": "person_1"
+        }
+      ],
+      "replay_finished": true,
+      "tracker_error": null,
+      "state_samples": 181
+    },
+    "cam_2": {
+      "first_known_elapsed": 84.78666054201312,
+      "face_attempts": 0,
+      "face_match_count": 0,
+      "final_identities": [
+        {
+          "local_id": 12,
+          "person_id": "person001",
+          "person_number": 5,
+          "name": "yxq",
+          "identity_source": "transition_handoff",
+          "identity_lock_status": "locked",
+          "global_track_id": "person_1"
+        }
+      ],
+      "replay_finished": true,
+      "tracker_error": null,
+      "state_samples": 181
+    },
+    "cam_entrance": {
+      "first_known_elapsed": 50.89563527191058,
+      "face_attempts": 63,
+      "face_match_count": 9,
+      "final_identities": [],
+      "replay_finished": true,
+      "tracker_error": null,
+      "state_samples": 181
+    }
+  },
+  "fixed": {
+    "cam_1": {
+      "first_known_elapsed": 66.52389660710469,
+      "face_attempts": 0,
+      "face_match_count": 0,
+      "final_identities": [
+        {
+          "local_id": 5,
+          "person_id": "person001",
+          "person_number": 5,
+          "name": "yxq",
+          "identity_source": "transition_handoff",
+          "identity_lock_status": "locked",
+          "global_track_id": "person_1"
+        }
+      ],
+      "replay_finished": true,
+      "tracker_error": null,
+      "state_samples": 181
+    },
+    "cam_2": {
+      "first_known_elapsed": 53.41569700697437,
+      "face_attempts": 0,
+      "face_match_count": 0,
+      "final_identities": [
+        {
+          "local_id": 13,
+          "person_id": "person001",
+          "person_number": 5,
+          "name": "yxq",
+          "identity_source": "transition_handoff",
+          "identity_lock_status": "locked",
+          "global_track_id": "person_1"
+        }
+      ],
+      "replay_finished": true,
+      "tracker_error": null,
+      "state_samples": 181
+    },
+    "cam_entrance": {
+      "first_known_elapsed": 49.873264531139284,
+      "face_attempts": 63,
+      "face_match_count": 10,
+      "final_identities": [],
+      "replay_finished": true,
+      "tracker_error": null,
+      "state_samples": 181
+    }
+  }
+}

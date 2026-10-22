@@ -1,0 +1,8 @@
+{
+  "deployed_at": 1792658308.8302429,
+  "old_pid": 4127205,
+  "restart_returncode": 0,
+  "semantic_change": "camera_transitions[cam_entrance->cam_2].temporal_overlap_min_similarity=0.68",
+  "before_sha256": "c5c5f86f581b17198ce861eca2bd4ec42c9a1f043f24f8689611a3e5d473e73c",
+  "after_sha256": "c769e1df374f4fa7b734832dab09f3a684cf0df2c539037e0420b4055abfb1ce"
+}

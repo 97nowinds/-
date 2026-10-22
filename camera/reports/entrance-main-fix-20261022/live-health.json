@@ -1,0 +1,26 @@
+{
+  "checked_at": 1792659672.9572392,
+  "cameras": [
+    {
+      "id": "cam_1",
+      "status": "running",
+      "fps": 24.0,
+      "capture_age_seconds": 0.0,
+      "tracker_error": null
+    },
+    {
+      "id": "cam_2",
+      "status": "running",
+      "fps": 25.0,
+      "capture_age_seconds": 0.03,
+      "tracker_error": null
+    },
+    {
+      "id": "cam_entrance",
+      "status": "running",
+      "fps": 18.9,
+      "capture_age_seconds": 0.01,
+      "tracker_error": null
+    }
+  ]
+}

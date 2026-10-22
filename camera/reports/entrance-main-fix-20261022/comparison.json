@@ -1,0 +1,1073 @@
+[
+  {
+    "file": "base01-20260921_172359.jsonl.gz",
+    "baseline": {
+      "file": "baseline-base01-20260921_172359.jsonl.gz",
+      "cameras": {
+        "cam_1": {
+          "processed_rows": 271,
+          "held_rows": 38,
+          "fresh_track_observations": 282,
+          "observed_local_id_count": 7,
+          "observed_global_id_count": 7,
+          "fresh_position_observations": 216,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 32.6135,
+            "ids": [
+              {
+                "track_id": 8,
+                "global_id": "person_14"
+              },
+              {
+                "track_id": 19,
+                "global_id": "person_19"
+              }
+            ]
+          }
+        },
+        "cam_2": {
+          "processed_rows": 816,
+          "held_rows": 38,
+          "fresh_track_observations": 861,
+          "observed_local_id_count": 5,
+          "observed_global_id_count": 6,
+          "fresh_position_observations": 756,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 32.6092,
+            "ids": [
+              {
+                "track_id": 13,
+                "global_id": "person_10"
+              }
+            ]
+          }
+        },
+        "cam_entrance": {
+          "processed_rows": 212,
+          "held_rows": 27,
+          "fresh_track_observations": 100,
+          "observed_local_id_count": 5,
+          "observed_global_id_count": 11,
+          "fresh_position_observations": 48,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 32.6138,
+            "ids": [
+              {
+                "track_id": 9,
+                "global_id": "person_10"
+              }
+            ]
+          }
+        }
+      },
+      "recovery_events": {
+        "low:candidate": 4,
+        "low:geometry": 3
+      },
+      "tracker_stage_ms": {
+        "p50": 9.020420024171472,
+        "p95": 10.284072952345014
+      },
+      "scope": "Observed IDs and track observations; held rows excluded. No person ground truth, registered-name score, IDF1, HOTA, or end-to-end latency claimed."
+    },
+    "fixed": {
+      "file": "base01-20260921_172359.jsonl.gz",
+      "cameras": {
+        "cam_1": {
+          "processed_rows": 271,
+          "held_rows": 38,
+          "fresh_track_observations": 282,
+          "observed_local_id_count": 7,
+          "observed_global_id_count": 7,
+          "fresh_position_observations": 216,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 32.6135,
+            "ids": [
+              {
+                "track_id": 8,
+                "global_id": "person_14"
+              },
+              {
+                "track_id": 19,
+                "global_id": "person_19"
+              }
+            ]
+          }
+        },
+        "cam_2": {
+          "processed_rows": 816,
+          "held_rows": 38,
+          "fresh_track_observations": 861,
+          "observed_local_id_count": 5,
+          "observed_global_id_count": 6,
+          "fresh_position_observations": 756,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 32.6092,
+            "ids": [
+              {
+                "track_id": 13,
+                "global_id": "person_10"
+              }
+            ]
+          }
+        },
+        "cam_entrance": {
+          "processed_rows": 212,
+          "held_rows": 27,
+          "fresh_track_observations": 100,
+          "observed_local_id_count": 5,
+          "observed_global_id_count": 9,
+          "fresh_position_observations": 48,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 32.6138,
+            "ids": [
+              {
+                "track_id": 9,
+                "global_id": "person_10"
+              }
+            ]
+          }
+        }
+      },
+      "recovery_events": {
+        "low:candidate": 4,
+        "low:geometry": 3
+      },
+      "tracker_stage_ms": {
+        "p50": 9.621196892112494,
+        "p95": 10.852186940610409
+      },
+      "scope": "Observed IDs and track observations; held rows excluded. No person ground truth, registered-name score, IDF1, HOTA, or end-to-end latency claimed."
+    },
+    "processed_rows": 1299,
+    "raw_detection_equal_rows": 1299,
+    "local_measurement_equal_rows": 1299,
+    "entrance_main_temporal_events": []
+  },
+  {
+    "file": "base04-20261009_142701.jsonl.gz",
+    "baseline": {
+      "file": "baseline-base04-20261009_142701.jsonl.gz",
+      "cameras": {
+        "cam_1": {
+          "processed_rows": 465,
+          "held_rows": 0,
+          "fresh_track_observations": 878,
+          "observed_local_id_count": 7,
+          "observed_global_id_count": 14,
+          "fresh_position_observations": 412,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 55.7877,
+            "ids": [
+              {
+                "track_id": 2,
+                "global_id": "person_29"
+              },
+              {
+                "track_id": 8,
+                "global_id": "person_3"
+              },
+              {
+                "track_id": 16,
+                "global_id": "person_34"
+              }
+            ]
+          }
+        },
+        "cam_2": {
+          "processed_rows": 1391,
+          "held_rows": 0,
+          "fresh_track_observations": 2525,
+          "observed_local_id_count": 6,
+          "observed_global_id_count": 7,
+          "fresh_position_observations": 2522,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 55.8308,
+            "ids": [
+              {
+                "track_id": 1,
+                "global_id": "person_5"
+              },
+              {
+                "track_id": 11,
+                "global_id": "person_15"
+              }
+            ]
+          }
+        },
+        "cam_entrance": {
+          "processed_rows": 277,
+          "held_rows": 0,
+          "fresh_track_observations": 826,
+          "observed_local_id_count": 12,
+          "observed_global_id_count": 13,
+          "fresh_position_observations": 123,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 55.8185,
+            "ids": [
+              {
+                "track_id": 1,
+                "global_id": "person_1"
+              },
+              {
+                "track_id": 34,
+                "global_id": "person_10"
+              },
+              {
+                "track_id": 51,
+                "global_id": "person_24"
+              }
+            ]
+          }
+        }
+      },
+      "recovery_events": {
+        "low:candidate": 7,
+        "low:no_reference": 43
+      },
+      "tracker_stage_ms": {
+        "p50": 9.86301782540977,
+        "p95": 11.23055606149137
+      },
+      "scope": "Observed IDs and track observations; held rows excluded. No person ground truth, registered-name score, IDF1, HOTA, or end-to-end latency claimed."
+    },
+    "fixed": {
+      "file": "base04-20261009_142701.jsonl.gz",
+      "cameras": {
+        "cam_1": {
+          "processed_rows": 465,
+          "held_rows": 0,
+          "fresh_track_observations": 878,
+          "observed_local_id_count": 7,
+          "observed_global_id_count": 14,
+          "fresh_position_observations": 412,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 55.7877,
+            "ids": [
+              {
+                "track_id": 2,
+                "global_id": "person_29"
+              },
+              {
+                "track_id": 8,
+                "global_id": "person_3"
+              },
+              {
+                "track_id": 16,
+                "global_id": "person_34"
+              }
+            ]
+          }
+        },
+        "cam_2": {
+          "processed_rows": 1391,
+          "held_rows": 0,
+          "fresh_track_observations": 2525,
+          "observed_local_id_count": 6,
+          "observed_global_id_count": 7,
+          "fresh_position_observations": 2522,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 55.8308,
+            "ids": [
+              {
+                "track_id": 1,
+                "global_id": "person_5"
+              },
+              {
+                "track_id": 11,
+                "global_id": "person_15"
+              }
+            ]
+          }
+        },
+        "cam_entrance": {
+          "processed_rows": 277,
+          "held_rows": 0,
+          "fresh_track_observations": 826,
+          "observed_local_id_count": 12,
+          "observed_global_id_count": 13,
+          "fresh_position_observations": 123,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 55.8185,
+            "ids": [
+              {
+                "track_id": 1,
+                "global_id": "person_1"
+              },
+              {
+                "track_id": 34,
+                "global_id": "person_10"
+              },
+              {
+                "track_id": 51,
+                "global_id": "person_24"
+              }
+            ]
+          }
+        }
+      },
+      "recovery_events": {
+        "low:candidate": 7,
+        "low:no_reference": 43
+      },
+      "tracker_stage_ms": {
+        "p50": 9.660086128860712,
+        "p95": 11.2128050532192
+      },
+      "scope": "Observed IDs and track observations; held rows excluded. No person ground truth, registered-name score, IDF1, HOTA, or end-to-end latency claimed."
+    },
+    "processed_rows": 2133,
+    "raw_detection_equal_rows": 2133,
+    "local_measurement_equal_rows": 2133,
+    "entrance_main_temporal_events": []
+  },
+  {
+    "file": "kadun-20261009_141659.jsonl.gz",
+    "baseline": {
+      "file": "baseline-kadun-20261009_141659.jsonl.gz",
+      "cameras": {
+        "cam_1": {
+          "processed_rows": 620,
+          "held_rows": 0,
+          "fresh_track_observations": 1143,
+          "observed_local_id_count": 6,
+          "observed_global_id_count": 6,
+          "fresh_position_observations": 668,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 74.4363,
+            "ids": [
+              {
+                "track_id": 4,
+                "global_id": "person_9"
+              },
+              {
+                "track_id": 11,
+                "global_id": "person_15"
+              }
+            ]
+          }
+        },
+        "cam_2": {
+          "processed_rows": 1861,
+          "held_rows": 1,
+          "fresh_track_observations": 3064,
+          "observed_local_id_count": 10,
+          "observed_global_id_count": 8,
+          "fresh_position_observations": 1029,
+          "partial_body_observations": 3,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 74.4583,
+            "ids": [
+              {
+                "track_id": 68,
+                "global_id": "person_14"
+              },
+              {
+                "track_id": 74,
+                "global_id": "person_17"
+              }
+            ]
+          }
+        },
+        "cam_entrance": {
+          "processed_rows": 382,
+          "held_rows": 0,
+          "fresh_track_observations": 732,
+          "observed_local_id_count": 3,
+          "observed_global_id_count": 4,
+          "fresh_position_observations": 394,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 74.4503,
+            "ids": [
+              {
+                "track_id": 1,
+                "global_id": "person_1"
+              }
+            ]
+          }
+        }
+      },
+      "recovery_events": {
+        "low:candidate": 40,
+        "low:continued": 2,
+        "low:geometry": 32,
+        "low:no_reference": 29,
+        "low:recovered": 1,
+        "low:stale_reference": 2
+      },
+      "tracker_stage_ms": {
+        "p50": 10.32375218346715,
+        "p95": 11.413105996325612
+      },
+      "scope": "Observed IDs and track observations; held rows excluded. No person ground truth, registered-name score, IDF1, HOTA, or end-to-end latency claimed."
+    },
+    "fixed": {
+      "file": "kadun-20261009_141659.jsonl.gz",
+      "cameras": {
+        "cam_1": {
+          "processed_rows": 620,
+          "held_rows": 0,
+          "fresh_track_observations": 1143,
+          "observed_local_id_count": 6,
+          "observed_global_id_count": 6,
+          "fresh_position_observations": 668,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 74.4363,
+            "ids": [
+              {
+                "track_id": 4,
+                "global_id": "person_9"
+              },
+              {
+                "track_id": 11,
+                "global_id": "person_15"
+              }
+            ]
+          }
+        },
+        "cam_2": {
+          "processed_rows": 1861,
+          "held_rows": 1,
+          "fresh_track_observations": 3064,
+          "observed_local_id_count": 10,
+          "observed_global_id_count": 8,
+          "fresh_position_observations": 1029,
+          "partial_body_observations": 3,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 74.4583,
+            "ids": [
+              {
+                "track_id": 68,
+                "global_id": "person_14"
+              },
+              {
+                "track_id": 74,
+                "global_id": "person_17"
+              }
+            ]
+          }
+        },
+        "cam_entrance": {
+          "processed_rows": 382,
+          "held_rows": 0,
+          "fresh_track_observations": 732,
+          "observed_local_id_count": 3,
+          "observed_global_id_count": 4,
+          "fresh_position_observations": 394,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 74.4503,
+            "ids": [
+              {
+                "track_id": 1,
+                "global_id": "person_1"
+              }
+            ]
+          }
+        }
+      },
+      "recovery_events": {
+        "low:candidate": 40,
+        "low:continued": 2,
+        "low:geometry": 32,
+        "low:no_reference": 29,
+        "low:recovered": 1,
+        "low:stale_reference": 2
+      },
+      "tracker_stage_ms": {
+        "p50": 9.769563097506762,
+        "p95": 10.97586890682578
+      },
+      "scope": "Observed IDs and track observations; held rows excluded. No person ground truth, registered-name score, IDF1, HOTA, or end-to-end latency claimed."
+    },
+    "processed_rows": 2863,
+    "raw_detection_equal_rows": 2863,
+    "local_measurement_equal_rows": 2863,
+    "entrance_main_temporal_events": []
+  },
+  {
+    "file": "kaoqing-20261010_142755.jsonl.gz",
+    "baseline": {
+      "file": "baseline-kaoqing-20261010_142755.jsonl.gz",
+      "cameras": {
+        "cam_1": {
+          "processed_rows": 189,
+          "held_rows": 0,
+          "fresh_track_observations": 207,
+          "observed_local_id_count": 2,
+          "observed_global_id_count": 4,
+          "fresh_position_observations": 0,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 22.5851,
+            "ids": [
+              {
+                "track_id": 1,
+                "global_id": "person_3"
+              }
+            ]
+          }
+        },
+        "cam_2": {
+          "processed_rows": 566,
+          "held_rows": 0,
+          "fresh_track_observations": 2287,
+          "observed_local_id_count": 12,
+          "observed_global_id_count": 15,
+          "fresh_position_observations": 1523,
+          "partial_body_observations": 91,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 22.6066,
+            "ids": [
+              {
+                "track_id": 1,
+                "global_id": "person_4"
+              },
+              {
+                "track_id": 3,
+                "global_id": "person_6"
+              },
+              {
+                "track_id": 7,
+                "global_id": "person_2"
+              },
+              {
+                "track_id": 31,
+                "global_id": "person_3"
+              }
+            ]
+          }
+        },
+        "cam_entrance": {
+          "processed_rows": 152,
+          "held_rows": 0,
+          "fresh_track_observations": 491,
+          "observed_local_id_count": 8,
+          "observed_global_id_count": 9,
+          "fresh_position_observations": 199,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 22.5707,
+            "ids": [
+              {
+                "track_id": 1,
+                "global_id": "person_1"
+              },
+              {
+                "track_id": 34,
+                "global_id": "person_8"
+              }
+            ]
+          }
+        }
+      },
+      "recovery_events": {
+        "high:candidate": 74,
+        "high:continued": 66,
+        "high:geometry": 3,
+        "high:head_alignment": 2,
+        "high:no_reference": 7,
+        "high:recovered": 1,
+        "high:stale_reference": 1,
+        "low:candidate": 63,
+        "low:continued": 21,
+        "low:geometry": 95,
+        "low:head_alignment": 16,
+        "low:no_reference": 149,
+        "low:recovered": 3,
+        "low:stale_reference": 8
+      },
+      "tracker_stage_ms": {
+        "p50": 9.897935902699828,
+        "p95": 158.46864297054708
+      },
+      "scope": "Observed IDs and track observations; held rows excluded. No person ground truth, registered-name score, IDF1, HOTA, or end-to-end latency claimed."
+    },
+    "fixed": {
+      "file": "kaoqing-20261010_142755.jsonl.gz",
+      "cameras": {
+        "cam_1": {
+          "processed_rows": 189,
+          "held_rows": 0,
+          "fresh_track_observations": 207,
+          "observed_local_id_count": 2,
+          "observed_global_id_count": 4,
+          "fresh_position_observations": 0,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 22.5851,
+            "ids": [
+              {
+                "track_id": 1,
+                "global_id": "person_3"
+              }
+            ]
+          }
+        },
+        "cam_2": {
+          "processed_rows": 566,
+          "held_rows": 0,
+          "fresh_track_observations": 2287,
+          "observed_local_id_count": 12,
+          "observed_global_id_count": 15,
+          "fresh_position_observations": 1523,
+          "partial_body_observations": 91,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 22.6066,
+            "ids": [
+              {
+                "track_id": 1,
+                "global_id": "person_4"
+              },
+              {
+                "track_id": 3,
+                "global_id": "person_6"
+              },
+              {
+                "track_id": 7,
+                "global_id": "person_2"
+              },
+              {
+                "track_id": 31,
+                "global_id": "person_3"
+              }
+            ]
+          }
+        },
+        "cam_entrance": {
+          "processed_rows": 152,
+          "held_rows": 0,
+          "fresh_track_observations": 491,
+          "observed_local_id_count": 8,
+          "observed_global_id_count": 9,
+          "fresh_position_observations": 199,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 22.5707,
+            "ids": [
+              {
+                "track_id": 1,
+                "global_id": "person_1"
+              },
+              {
+                "track_id": 34,
+                "global_id": "person_8"
+              }
+            ]
+          }
+        }
+      },
+      "recovery_events": {
+        "high:candidate": 74,
+        "high:continued": 66,
+        "high:geometry": 3,
+        "high:head_alignment": 2,
+        "high:no_reference": 7,
+        "high:recovered": 1,
+        "high:stale_reference": 1,
+        "low:candidate": 63,
+        "low:continued": 21,
+        "low:geometry": 95,
+        "low:head_alignment": 16,
+        "low:no_reference": 149,
+        "low:recovered": 3,
+        "low:stale_reference": 8
+      },
+      "tracker_stage_ms": {
+        "p50": 9.508567862212658,
+        "p95": 157.64043596573174
+      },
+      "scope": "Observed IDs and track observations; held rows excluded. No person ground truth, registered-name score, IDF1, HOTA, or end-to-end latency claimed."
+    },
+    "processed_rows": 907,
+    "raw_detection_equal_rows": 907,
+    "local_measurement_equal_rows": 907,
+    "entrance_main_temporal_events": [
+      {
+        "seconds": 8.8075,
+        "source_global_id": "person_2",
+        "source_local_id": 2,
+        "local_id": 7,
+        "reid_score": 0.729213,
+        "match_margin": 1.0,
+        "evidence_count": 15
+      }
+    ]
+  },
+  {
+    "file": "multi_person_20261016-20261016_183228.jsonl.gz",
+    "baseline": {
+      "file": "baseline-multi_person_20261016-20261016_183228.jsonl.gz",
+      "cameras": {
+        "cam_1": {
+          "processed_rows": 1499,
+          "held_rows": 62,
+          "fresh_track_observations": 2355,
+          "observed_local_id_count": 13,
+          "observed_global_id_count": 18,
+          "fresh_position_observations": 942,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 179.9318,
+            "ids": [
+              {
+                "track_id": 37,
+                "global_id": "person_16"
+              }
+            ]
+          }
+        },
+        "cam_2": {
+          "processed_rows": 4489,
+          "held_rows": 51,
+          "fresh_track_observations": 5711,
+          "observed_local_id_count": 5,
+          "observed_global_id_count": 6,
+          "fresh_position_observations": 5226,
+          "partial_body_observations": 299,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 179.9593,
+            "ids": [
+              {
+                "track_id": 14,
+                "global_id": "person_17"
+              }
+            ]
+          }
+        },
+        "cam_entrance": {
+          "processed_rows": 1200,
+          "held_rows": 94,
+          "fresh_track_observations": 802,
+          "observed_local_id_count": 8,
+          "observed_global_id_count": 10,
+          "fresh_position_observations": 78,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 179.8769,
+            "ids": [
+              {
+                "track_id": 14,
+                "global_id": "person_19"
+              }
+            ]
+          }
+        }
+      },
+      "recovery_events": {
+        "high:candidate": 4,
+        "high:continued": 4,
+        "low:candidate": 321,
+        "low:continued": 289,
+        "low:geometry": 16,
+        "low:no_reference": 60,
+        "low:recovered": 7,
+        "low:stale_reference": 1
+      },
+      "tracker_stage_ms": {
+        "p50": 9.737190906889737,
+        "p95": 11.983952019363642
+      },
+      "scope": "Observed IDs and track observations; held rows excluded. No person ground truth, registered-name score, IDF1, HOTA, or end-to-end latency claimed."
+    },
+    "fixed": {
+      "file": "multi_person_20261016-20261016_183228.jsonl.gz",
+      "cameras": {
+        "cam_1": {
+          "processed_rows": 1499,
+          "held_rows": 62,
+          "fresh_track_observations": 2355,
+          "observed_local_id_count": 13,
+          "observed_global_id_count": 18,
+          "fresh_position_observations": 942,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 179.9318,
+            "ids": [
+              {
+                "track_id": 37,
+                "global_id": "person_16"
+              }
+            ]
+          }
+        },
+        "cam_2": {
+          "processed_rows": 4489,
+          "held_rows": 51,
+          "fresh_track_observations": 5711,
+          "observed_local_id_count": 5,
+          "observed_global_id_count": 6,
+          "fresh_position_observations": 5226,
+          "partial_body_observations": 299,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 179.9593,
+            "ids": [
+              {
+                "track_id": 14,
+                "global_id": "person_17"
+              }
+            ]
+          }
+        },
+        "cam_entrance": {
+          "processed_rows": 1200,
+          "held_rows": 94,
+          "fresh_track_observations": 802,
+          "observed_local_id_count": 8,
+          "observed_global_id_count": 10,
+          "fresh_position_observations": 78,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 179.8769,
+            "ids": [
+              {
+                "track_id": 14,
+                "global_id": "person_19"
+              }
+            ]
+          }
+        }
+      },
+      "recovery_events": {
+        "high:candidate": 4,
+        "high:continued": 4,
+        "low:candidate": 321,
+        "low:continued": 289,
+        "low:geometry": 16,
+        "low:no_reference": 60,
+        "low:recovered": 7,
+        "low:stale_reference": 1
+      },
+      "tracker_stage_ms": {
+        "p50": 10.419972124509513,
+        "p95": 12.134263990446925
+      },
+      "scope": "Observed IDs and track observations; held rows excluded. No person ground truth, registered-name score, IDF1, HOTA, or end-to-end latency claimed."
+    },
+    "processed_rows": 7188,
+    "raw_detection_equal_rows": 7188,
+    "local_measurement_equal_rows": 7188,
+    "entrance_main_temporal_events": []
+  },
+  {
+    "file": "yxq_side_20261009-20261009_134334.jsonl.gz",
+    "baseline": {
+      "file": "baseline-yxq_side_20261009-20261009_134334.jsonl.gz",
+      "cameras": {
+        "cam_1": {
+          "processed_rows": 740,
+          "held_rows": 51,
+          "fresh_track_observations": 464,
+          "observed_local_id_count": 3,
+          "observed_global_id_count": 4,
+          "fresh_position_observations": 93,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 88.7136,
+            "ids": [
+              {
+                "track_id": 4,
+                "global_id": "person_1"
+              }
+            ]
+          }
+        },
+        "cam_2": {
+          "processed_rows": 2219,
+          "held_rows": 134,
+          "fresh_track_observations": 1446,
+          "observed_local_id_count": 5,
+          "observed_global_id_count": 5,
+          "fresh_position_observations": 1146,
+          "partial_body_observations": 3,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 88.7474,
+            "ids": [
+              {
+                "track_id": 13,
+                "global_id": "person_1"
+              }
+            ]
+          }
+        },
+        "cam_entrance": {
+          "processed_rows": 593,
+          "held_rows": 40,
+          "fresh_track_observations": 301,
+          "observed_local_id_count": 5,
+          "observed_global_id_count": 7,
+          "fresh_position_observations": 160,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 88.7743,
+            "ids": [
+              {
+                "track_id": 9,
+                "global_id": "person_13"
+              }
+            ]
+          }
+        }
+      },
+      "recovery_events": {
+        "high:candidate": 5,
+        "high:continued": 2,
+        "high:recovered": 1,
+        "low:candidate": 4,
+        "low:geometry": 1,
+        "low:recovered": 1
+      },
+      "tracker_stage_ms": {
+        "p50": 9.396054549142718,
+        "p95": 10.584642877802253
+      },
+      "scope": "Observed IDs and track observations; held rows excluded. No person ground truth, registered-name score, IDF1, HOTA, or end-to-end latency claimed."
+    },
+    "fixed": {
+      "file": "yxq_side_20261009-20261009_134334.jsonl.gz",
+      "cameras": {
+        "cam_1": {
+          "processed_rows": 740,
+          "held_rows": 51,
+          "fresh_track_observations": 464,
+          "observed_local_id_count": 3,
+          "observed_global_id_count": 4,
+          "fresh_position_observations": 93,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 88.7136,
+            "ids": [
+              {
+                "track_id": 4,
+                "global_id": "person_1"
+              }
+            ]
+          }
+        },
+        "cam_2": {
+          "processed_rows": 2219,
+          "held_rows": 134,
+          "fresh_track_observations": 1446,
+          "observed_local_id_count": 5,
+          "observed_global_id_count": 5,
+          "fresh_position_observations": 1146,
+          "partial_body_observations": 3,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 88.7474,
+            "ids": [
+              {
+                "track_id": 13,
+                "global_id": "person_1"
+              }
+            ]
+          }
+        },
+        "cam_entrance": {
+          "processed_rows": 593,
+          "held_rows": 40,
+          "fresh_track_observations": 301,
+          "observed_local_id_count": 5,
+          "observed_global_id_count": 7,
+          "fresh_position_observations": 160,
+          "partial_body_observations": 0,
+          "duplicate_global_id_rows": 0,
+          "final_fresh_row": {
+            "seconds": 88.7743,
+            "ids": [
+              {
+                "track_id": 9,
+                "global_id": "person_13"
+              }
+            ]
+          }
+        }
+      },
+      "recovery_events": {
+        "high:candidate": 5,
+        "high:continued": 2,
+        "high:recovered": 1,
+        "low:candidate": 4,
+        "low:geometry": 1,
+        "low:recovered": 1
+      },
+      "tracker_stage_ms": {
+        "p50": 9.637929033488035,
+        "p95": 10.689976159483194
+      },
+      "scope": "Observed IDs and track observations; held rows excluded. No person ground truth, registered-name score, IDF1, HOTA, or end-to-end latency claimed."
+    },
+    "processed_rows": 3552,
+    "raw_detection_equal_rows": 3552,
+    "local_measurement_equal_rows": 3552,
+    "entrance_main_temporal_events": [
+      {
+        "seconds": 50.9813,
+        "source_global_id": "person_2",
+        "source_local_id": 5,
+        "local_id": 3,
+        "reid_score": 0.698291,
+        "match_margin": 1.0,
+        "evidence_count": 27
+      },
+      {
+        "seconds": 80.7174,
+        "source_global_id": "person_1",
+        "source_local_id": 6,
+        "local_id": 13,
+        "reid_score": 0.748634,
+        "match_margin": 1.0,
+        "evidence_count": 26
+      }
+    ]
+  }
+]
