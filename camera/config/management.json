@@ -9,7 +9,9 @@
   },
   "ppe_preparation": {
     "enabled": true,
-    "camera_ids": ["cam_entrance"],
+    "camera_ids": [
+      "cam_entrance"
+    ],
     "grace_seconds": 120,
     "end_on_confirmed_interaction": true
   },
@@ -56,7 +58,9 @@
         "environment.flame_recovered",
         "safety.no_mask",
         "safety.no_lab_coat",
-        "safety.no_gloves"
+        "safety.no_gloves",
+        "instrument.started",
+        "instrument.ended"
       ],
       "webhook_env": "LAB_FEISHU_EXPERIMENTERS_WEBHOOK",
       "secret_env": "LAB_FEISHU_EXPERIMENTERS_SECRET"
@@ -73,7 +77,9 @@
         "environment.flame_recovered",
         "safety.no_mask",
         "safety.no_lab_coat",
-        "safety.no_gloves"
+        "safety.no_gloves",
+        "instrument.started",
+        "instrument.ended"
       ],
       "webhook_env": "LAB_FEISHU_MANAGERS_WEBHOOK",
       "secret_env": "LAB_FEISHU_MANAGERS_SECRET"
@@ -94,8 +100,7 @@
     }
   ],
   "silent_events": [
-    "person.entered",
-    "instrument.started"
+    "person.entered"
   ],
   "evidence_required_events": [
     "safety.no_mask",

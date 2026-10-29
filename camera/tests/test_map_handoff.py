@@ -5,6 +5,15 @@ from map_handoff import map_snapshot, MapHandler
 
 
 class TransferAccountingTests(unittest.TestCase):
+    def test_health_does_not_read_upstream_or_require_authentication(self):
+        handler = object.__new__(MapHandler)
+        handler.path = '/health'
+        handler._json = Mock()
+        # No server/upstream attributes: liveness must remain independent.
+        handler.do_GET()
+        self.assertEqual(handler._json.call_args.args[0]['status'], 'alive')
+        self.assertFalse(handler._json.call_args.args[0]['checks_upstream'])
+
     def handler(self, sends):
         handler = object.__new__(MapHandler)
         handler.send_response = Mock()

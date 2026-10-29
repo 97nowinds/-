@@ -172,7 +172,7 @@ def main():
     handoff=Child('map_handoff',[python,str(ROOT/'map_handoff.py'),'--api',api,'--port',str(config['handoff_port']),
         '--credentials-file',str(runtime/'handoff-credentials.json'),'--sample-archive',str(runtime/'handoff-samples/archive')],ROOT,logger,port=config['handoff_port'])
     children=[tunnel,frontend,handoff];publishers={};credential_revision=None
-    opener=build_opener(ProxyHandler({}));api_failures=0
+    opener=build_opener(ProxyHandler({}));api_failures=0;transport_failures=0
     logger.info('Resident owner started; all output is metadata only')
     try:
         while True:
@@ -200,19 +200,30 @@ def main():
                    'publishers':{k:v.public() for k,v in publishers.items()},
                    'missing_camera_credentials':[k for k in ['cam_1','cam_2','cam_entrance'] if k not in publishers]}
             try:
-                with opener.open(api+'/api/state',timeout=3) as response:body=json.load(response)
+                with opener.open(api+'/api/state',timeout=8) as response:body=json.load(response)
                 state['backend']={'available':True,'cameras':[{'id':c['id'],'status':c['status'],
                     'capture_age_seconds':c.get('capture_age_seconds'),'tracker_error':bool(c.get('tracker_error'))} for c in body['cameras']]}
                 api_failures=0
+                transport_failures=0
             except Exception:
                 api_failures+=1;state['backend']={'available':False,'consecutive_failures':api_failures}
-                if api_failures>=3 and tunnel.process:tunnel.stop('API unreachable through tunnel');api_failures=0
+                # A slow state/model request is not evidence that the RTSP/SSH tunnel is broken.
+                try:
+                    with opener.open(api+'/api/health',timeout=3) as response:
+                        if response.status!=200:raise ValueError('transport health')
+                    transport_failures=0
+                    state['backend']['transport_available']=True
+                except Exception:
+                    transport_failures+=1
+                    state['backend']['transport_available']=False
+                if transport_failures>=3 and tunnel.process:
+                    tunnel.stop('transport health failed three times');transport_failures=0
             for child in [frontend,handoff]:
                 if child.process and time.monotonic()-child.started>30:
                     port=config['frontend_port'] if child is frontend else config['handoff_port']
-                    path='/management' if child is frontend else '/health'
+                    path='/health'
                     try:
-                        with opener.open('http://127.0.0.1:'+str(port)+path,timeout=2) as response:response.read(64)
+                        with opener.open('http://127.0.0.1:'+str(port)+path,timeout=8) as response:response.read(64)
                         child.failure_count=0;child.state='running'
                     except Exception:
                         child.failure_count+=1
@@ -229,4 +240,13 @@ def main():
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
 
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+    try:
+        main()
+    except Exception:
+        # A scheduled pythonw owner has no console; keep startup failures visible.
+        import traceback
+        (ROOT/'runtime').mkdir(exist_ok=True)
+        with (ROOT/'runtime/resident-startup-error.log').open('a',encoding='utf-8') as output:
+            traceback.print_exc(file=output)
+        raise

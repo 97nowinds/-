@@ -162,8 +162,11 @@ class FireTests(unittest.TestCase):
         client=SimpleNamespace(credentials={'app_id':'cli_synthetic'},upload_image=lambda jpeg:uploads.append(jpeg) or 'img_synthetic')
         with patch('feishu_app.EVIDENCE_CREDENTIALS',fake_path),patch('feishu_app.load_credentials',return_value={}),patch('feishu_app.FeishuAppClient',return_value=client):
             for _ in range(3):self.now+=2;self.assertTrue(self.service.deliver_once())
-        self.assertEqual(len(sent),3);self.assertEqual(len(uploads),1)
-        self.assertTrue(all(payload['msg_type']=='post' and '火焰' in payload['content']['post']['zh_cn']['title'] for _,payload in sent))
+        # Emergency text is immediate; the durable three-camera worker now
+        # owns scene uploads instead of blocking this first notification.
+        self.assertEqual(len(sent),3);self.assertEqual(len(uploads),0)
+        self.assertTrue(all(payload['msg_type']=='text' for _,payload in sent))
+        self.assertEqual(self.service.db.execute('SELECT count(*) FROM fire_snapshot_jobs').fetchone()[0],1)
 
     def test_fire_http_keeps_producer_and_camera_scope(self):
         from management_api import handle_management

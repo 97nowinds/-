@@ -15,7 +15,7 @@ import cv2
 SUBJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$")
 MIN_FREE_BYTES = 2 * 1024 * 1024 * 1024
 RECORDING_MAX_WIDTH = max(
-    640, min(2560, int(os.environ.get("LAB_RECORDING_MAX_WIDTH", "1280")))
+    640, min(2560, int(os.environ.get("LAB_RECORDING_MAX_WIDTH", "2560")))
 )
 RECORDING_QUEUE_SIZE = max(
     4, min(64, int(os.environ.get("LAB_RECORDING_QUEUE_SIZE", "16")))

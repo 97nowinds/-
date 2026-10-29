@@ -269,6 +269,8 @@ class BatchAssociator:
             result = observation.gallery.compare(target.gallery)
             if result.get("score") is not None:
                 return float(result["score"]), result
+            if result.get('typed_memory'):
+                return None, result
         score = _cosine(observation.appearance, target.appearance)
         return score, {
             "score": score,

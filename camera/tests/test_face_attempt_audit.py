@@ -1,9 +1,28 @@
 import unittest
-from face_attempt_audit import FaceAttemptAudit, run_face_attempt, warm_face_models
+from face_attempt_audit import FaceAttemptAudit, run_face_attempt, warm_face_models, scale_box
 from types import SimpleNamespace
 
 
 class FaceAuditTests(unittest.TestCase):
+    def test_native_input_preserves_local_track_and_returns_preview_coordinates(self):
+        import numpy as np
+        small = np.zeros((540, 960, 3), dtype=np.uint8)
+        native = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        calls = []
+        result = {"known": True, "person_id": "registered"}
+        def confirm(image, box, track):
+            calls.append((image is native, box, track))
+            return (320, 160, 128, 160), result
+        worker = SimpleNamespace(confirm_face_identity=confirm)
+        candidate = run_face_attempt(worker, small, (120, 60, 96, 240), 77, source_frame=native)
+        self.assertEqual(calls, [(True, (320, 160, 256, 640), 77)])
+        self.assertEqual(candidate[0], (120, 60, 48, 60))
+        self.assertIs(candidate[1], result)
+
+    def test_mapping_uses_actual_axes_and_clips_edges(self):
+        self.assertEqual(scale_box((-1, -2, 11, 12), (100, 200), (200, 600)), (0, 0, 30, 20))
+        self.assertEqual(scale_box((195, 95, 20, 20), (100, 200), (200, 600)), (585, 190, 15, 10))
+
     def test_fixed_face_shapes_warm_before_concurrent_work(self):
         seen = []
         def session():

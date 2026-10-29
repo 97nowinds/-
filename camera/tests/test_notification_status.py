@@ -13,7 +13,7 @@ from snapshot_registry import SnapshotRegistry
 
 
 class NotificationStatusTests(unittest.TestCase):
-    def test_deployed_config_routes_by_severity_and_keeps_routine_events_silent(self):
+    def test_deployed_config_notifies_instrument_events_and_keeps_person_entries_silent(self):
         with tempfile.TemporaryDirectory() as directory:
             config=json.loads((Path(__file__).resolve().parents[1]/'config/management.json').read_text(encoding='utf-8'))
             now=2000000000.0
@@ -24,11 +24,11 @@ class NotificationStatusTests(unittest.TestCase):
             base={'lab_id':config['lab_id'],'person_id':'synthetic-person',
                   'display_name':'合成测试人员','observed_at':iso(now)}
             try:
-                for kind in ['person.entered','instrument.started']:
+                for kind in ['person.entered','instrument.started','instrument.ended']:
                     event_id='synthetic-'+kind
                     service.record({**base,'event_id':event_id,'event_type':kind})
-                    self.assertEqual(service.db.execute('SELECT count(*) FROM outbox WHERE event_id=?',
-                        (event_id,)).fetchone()[0],0)
+                    routes={r[0] for r in service.db.execute('SELECT route_id FROM outbox WHERE event_id=?', (event_id,))}
+                    self.assertEqual(routes, set() if kind=='person.entered' else {'experimenters','managers'})
                 for severity,audiences,expected in [
                     ('L1','experimenters',{'experimenters'}),
                     ('L2','experimenters,managers',{'experimenters','managers'})]:

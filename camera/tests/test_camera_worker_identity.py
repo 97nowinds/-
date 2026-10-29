@@ -57,6 +57,25 @@ class CameraWorkerIdentityTests(unittest.TestCase):
         self.assertEqual(worker.identity_track_id, 1)
         self.assertNotIn(2, worker.track_identities)
 
+    def test_face_confirmation_has_camera_local_proof_but_is_not_shared_before_lock(self):
+        worker = self.worker()
+        for _ in range(3):
+            identity = worker.accept_face_result(self.known('person_a'), 'appearance', track_id=7)
+        self.assertEqual(identity['_face_local_id'],7)
+        self.assertEqual(identity['_face_camera_id'],'cam_entrance')
+        self.assertEqual(identity['_face_votes'],3)
+        self.assertEqual(worker.handoff.confirmations,[])
+
+    def test_lock_conflict_keeps_votes_but_not_a_published_name(self):
+        worker = self.worker()
+        for _ in range(3):worker.accept_face_result(self.known('person_a'),'a',track_id=7)
+        worker.clear_identity(7,keep_face_votes=True)
+        self.assertNotIn(7,worker.track_identities)
+        self.assertIsNone(worker.identity)
+        self.assertEqual(len(worker.identity_votes_by_track[7]),3)
+        worker.clear_identity(7)
+        self.assertNotIn(7,worker.identity_votes_by_track)
+
     def test_clearing_one_identity_preserves_other_tracks(self):
         worker = self.worker()
         worker.track_identities = {

@@ -16,6 +16,7 @@ from association import (
 )
 from mtmc_config import load_mtmc_config
 from reid_gallery import BodyQualityScorer, TrackFeatureGallery
+from tracklet_evidence import TrackletEvidence
 
 
 class YoloPersonTracker:
@@ -319,6 +320,9 @@ class CrossCameraTrackCoordinator:
         # New boxes without clean appearance remain eligible for recovery.
         # Their temporary global binding is not proof of a settled identity.
         self.local_recovery_pending = {}
+        self.tracklet_evidence = {}
+        self.tracklet_occluded = set()
+        self.identity_suspects = {}
         self.local_entry_states = {}
         self.redirects = {}
         self.redirect_limit = max(64, int(reid_config.get("redirect_limit", 256)))
@@ -374,7 +378,81 @@ class CrossCameraTrackCoordinator:
             min_quality=config["min_sample_quality"],
             duplicate_similarity=config["duplicate_similarity"],
             top_k=config["top_k"],
+            robust=config.get('tracklet_recovery_enabled', False),
         )
+
+    def _tracklet_confirmed(self, key, candidate, now, similarity, minimum=None, duration=None, body_kind=None):
+        settings = self.mtmc_config['reid']
+        if not settings.get('tracklet_recovery_enabled'):
+            return True
+        evidence = self.tracklet_evidence.get(key)
+        return bool(evidence and evidence.confirm(
+            candidate, self.global_galleries.get(candidate), now,
+            similarity=similarity, minimum=minimum or settings['tracklet_min_observations'],
+            duration=settings['tracklet_min_seconds'] if duration is None else duration,
+            max_gap=settings['tracklet_max_gap_seconds'], body_kind=body_kind,
+            full_min_similarity=settings['medium_similarity']))
+
+    def _guard_fresh_appearance(self, key, feature, kind, now, unix_time, support_feature=None):
+        """Freeze old memory and withdraw a suspect binding before admitting a crop."""
+        if not self.mtmc_config['reid'].get('tracklet_recovery_enabled'):
+            return False
+        vector = TrackFeatureGallery._normalize(feature)
+        if vector is None:
+            return False
+        with self.lock:
+            bound = self.local_bindings.get(key)
+            target = self.global_tracks.get(bound)
+            gallery = self.global_galleries.get(bound)
+            if not target or not gallery or (
+                    bound not in self.global_identities and target.get('observation_count', 0) < 3):
+                self.identity_suspects.pop(key, None)
+                return 'clean'
+            def score(memory):
+                refs = [s.feature for s in memory.samples
+                        if s.quality_details.get('body_kind', 'full') == kind]
+                primary = max((float(np.dot(vector, ref)) for ref in refs), default=None)
+                support = TrackFeatureGallery._normalize(support_feature)
+                upper_refs = [s.feature for s in memory.samples
+                              if s.quality_details.get('body_kind', 'full') == 'upper']
+                if primary is not None and support is not None and upper_refs:
+                    # Occluding benches change the full crop. Independent
+                    # torso agreement can retain a clean owner across this.
+                    secondary = max(float(np.dot(support, ref)) for ref in upper_refs)
+                    return (primary + secondary) / 2
+                return primary
+            own = score(gallery)
+            if own is None:
+                self.identity_suspects.pop(key, None)
+                return 'clean'
+            competitors = [score(g) for gid, g in self.global_galleries.items()
+                           if gid != bound and frozenset((gid, bound)) in self.distinct_global_pairs]
+            best = max((s for s in competitors if s is not None), default=-1.0)
+            config = self.mtmc_config['reid']
+            if own >= config['identity_switch_min_similarity'] and not (
+                    best >= config['high_similarity'] and best - own >= config['match_margin']):
+                self.identity_suspects.pop(key, None)
+                return 'clean'
+            prior = self.identity_suspects.get(key, {})
+            consecutive = now - prior.get('last_at', -1e9) <= config['tracklet_max_gap_seconds']
+            count = prior.get('count', 0) + 1 if consecutive and now > prior.get('last_at', now) else 1
+            first_at = prior.get('first_at', now) if consecutive else now
+            self.identity_suspects[key] = {'count': count, 'first_at': first_at, 'last_at': now,
+                                           'global_id': bound, 'score': own}
+            if count < config['tracklet_min_observations'] or now - first_at < config['tracklet_min_seconds'] - 1e-6:
+                return 'quarantine'
+            self.local_bindings.pop(key, None)
+            self.local_features.pop(key, None)
+            self.local_galleries[key] = self._new_gallery()
+            self.tracklet_evidence.pop(key, None)
+            self.relink_evidence.pop(key, None)
+            self.local_recovery_pending[key] = now
+            self.identity_suspects.pop(key, None)
+            self._record_event('identity_guard', camera_id=key[0], target_local_id=key[1],
+                               global_id=bound, accepted=False, confidence='low',
+                               reason='bound_track_appearance_changed', reid_score=own,
+                               competitor_score=best, unix_time=unix_time)
+            return 'detach'
 
     @staticmethod
     def similarity(first, second):
@@ -696,6 +774,8 @@ class CrossCameraTrackCoordinator:
                     else {}
                 )
                 reid_score = comparison.get("score")
+                if reid_score is None and comparison.get('typed_memory'):
+                    continue
                 if reid_score is None:
                     reid_score = self.similarity(
                         target.get("appearance"), item.get("appearance")
@@ -722,6 +802,7 @@ class CrossCameraTrackCoordinator:
                     "spatial_score": float(spatial_score),
                     "time_gap_seconds": float(age),
                     "final_score": float(score),
+                    "body_kind": comparison.get('body_kind'),
                     "partial_box_change": bool(
                         box[3] < target_box[3] * 0.70
                         or box[2] * box[3] < target_box[2] * target_box[3] * 0.60
@@ -753,7 +834,21 @@ class CrossCameraTrackCoordinator:
             detail = details[(row, column)]
             global_id = detail["global_id"]
             evidence_key = (camera_id, item["local_id"])
-            if detail["time_gap_seconds"] > settings["same_camera_relink_seconds"] or detail["partial_box_change"]:
+            enhanced = self.mtmc_config['reid'].get('tracklet_recovery_enabled', False)
+            if enhanced:
+                confirmed = self._tracklet_confirmed(
+                    evidence_key, global_id, now,
+                    settings.get('same_camera_recovery_min_similarity', .6)
+                    if detail['time_gap_seconds'] > settings['same_camera_relink_seconds']
+                    else self.same_camera_similarity_threshold, body_kind=detail.get('body_kind'))
+                evidence = self.tracklet_evidence.get(evidence_key)
+                self.relink_evidence[evidence_key] = {
+                    'candidate': global_id, 'last_at': now,
+                    'count': len(evidence.votes) if evidence else 0,
+                    'first_at': evidence.votes[0][0] if evidence and evidence.votes else now}
+                if not confirmed:
+                    continue
+            elif detail["time_gap_seconds"] > settings["same_camera_relink_seconds"] or detail["partial_box_change"]:
                 previous = self.relink_evidence.get(evidence_key, {})
                 same_candidate = previous.get("candidate") == global_id
                 count = int(previous.get("count", 0)) + 1 if same_candidate else 1
@@ -785,6 +880,8 @@ class CrossCameraTrackCoordinator:
                     self.local_galleries.pop(binding_key, None)
                     self.local_motion.pop(binding_key, None)
                     self.local_entry_states.pop(binding_key, None)
+                    self.tracklet_evidence.pop(binding_key, None)
+                    self.tracklet_occluded.discard(binding_key)
             self.local_bindings[(camera_id, item["local_id"])] = global_id
             assignments[item["local_id"]] = global_id
             self._record_event(
@@ -796,7 +893,7 @@ class CrossCameraTrackCoordinator:
                 candidate_global_id=global_id,
                 accepted=True,
                 confidence="high",
-                reason="same_camera_spatial_relink",
+                reason="same_camera_tracklet_relink" if enhanced else "same_camera_spatial_relink",
                 reid_score=round(detail["reid_score"], 6),
                 geometry_score=round(detail["spatial_score"], 6),
                 final_score=round(detail["final_score"], 6),
@@ -808,6 +905,8 @@ class CrossCameraTrackCoordinator:
         for key, evidence in list(self.relink_evidence.items()):
             if key[0] == camera_id and evidence["last_at"] < now:
                 self.relink_evidence.pop(key, None)
+                if key in self.tracklet_evidence:
+                    self.tracklet_evidence[key].reset_candidate()
         return assignments
 
     @staticmethod
@@ -1144,12 +1243,13 @@ class CrossCameraTrackCoordinator:
             if lock_owner and lock_owner != global_id:
                 owner_record = self.global_identities.get(lock_owner)
                 if self._identity_is_active(owner_record, now):
-                    # A retained name is not a live body. After the global
-                    # owner expires, a newly confirmed face can reclaim its
-                    # name without merging two trajectories or waiting 90s.
-                    if (lock_owner not in self.global_tracks
-                            and global_id in self.global_tracks
-                            and identity.get("identity_source") == "face"):
+                    # Identity retention is not a fresh body observation.
+                    # A proven face can reclaim a stale owner's registered
+                    # name without merging either trajectory.
+                    from face_recovery import can_reclaim_identity
+                    if can_reclaim_identity(
+                            self.global_tracks.get(lock_owner), self.global_tracks.get(global_id),
+                            identity, camera_id, now):
                         self._release_identity(lock_owner)
                     else:
                         # Never use a face crop to merge two existing bodies.
@@ -1180,12 +1280,28 @@ class CrossCameraTrackCoordinator:
                 target["identity"] = dict(locked_identity)
             return dict(locked_identity)
 
+    def identity_binding_is_current(self, identity, global_id, camera_id=None):
+        """Reject a worker's cached name after its local ID changed owner."""
+        with self.lock:
+            cached = (identity or {}).get('global_track_id')
+            seen = set()
+            while cached in self.redirects and cached not in seen:
+                seen.add(cached)
+                cached = self.redirects[cached]
+            person = (identity or {}).get('person_id')
+            return bool(cached == global_id and person
+                        and self.person_locks.get(person) == global_id
+                        and not any(s['global_id'] == global_id and (camera_id is None or k[0] == camera_id)
+                                    for k, s in self.identity_suspects.items()))
+
     def identity_for(self, global_id, camera_id, position=None, now=None):
         """Return identity after a spatial overlap or configured transition."""
         if not global_id:
             return None
         now = time.time() if now is None else float(now)
         with self.lock:
+            if any(k[0] == camera_id and s['global_id'] == global_id for k, s in self.identity_suspects.items()):
+                return None
             record = self.global_identities.get(global_id)
             if record is None:
                 return None
@@ -1255,6 +1371,12 @@ class CrossCameraTrackCoordinator:
         prepared = []
         track_inputs = []
         refresh_inputs = []
+        def crop_overlap(first, second):
+            left, top = max(first[0], second[0]), max(first[1], second[1])
+            right = min(first[0] + first[2], second[0] + second[2])
+            bottom = min(first[1] + first[3], second[1] + second[3])
+            intersection = max(0, right - left) * max(0, bottom - top)
+            return intersection / max(1, min(first[2] * first[3], second[2] * second[3]))
         for track in tracks:
             local_id = int(track["track_id"])
             box = tuple(track["box"])
@@ -1265,20 +1387,56 @@ class CrossCameraTrackCoordinator:
                 int(other["track_id"]) != local_id
                 and YoloPersonTracker.box_iou(box, other["box"])
                 >= self.mtmc_config["reid"]["occlusion_iou_threshold"]
+                or (self.mtmc_config['reid'].get('tracklet_recovery_enabled')
+                    and int(other['track_id']) != local_id
+                    and crop_overlap(box, other['box']) >= .4)
                 for other in tracks
             )
             # Crossing bodies produce mixed crops. Keep the last clean gallery
             # until separation, including the legacy single-vector fallback.
             # A recovered head/upper-body ROI is association evidence only;
             # never overwrite the clean full-body identity gallery with it.
-            needs_refresh = not occluded and not track.get("partial_body", False) and (
-                cached is None or monotonic_time - self.local_feature_attempts.get(key, cached[1]) >= self.feature_refresh_seconds
+            enhanced = self.mtmc_config['reid'].get('tracklet_recovery_enabled', False)
+            partial = bool(track.get('partial_body', False))
+            aspect = box[3] / max(box[2], 1)
+            clipped = (box[0] <= 1 or box[1] <= 1
+                       or box[0] + box[2] >= frame.shape[1] - 1
+                       or box[1] + box[3] >= frame.shape[0] - 1)
+            incomplete_head = enhanced and (aspect < .9 or box[1] < 0)
+            if enhanced and (clipped or aspect < 1.55):
+                partial = True
+            # Use a consistent head/torso extent on clean full-body views and
+            # truncated views. A head-only edge box supplies no body identity.
+            upper_box = (box[0], box[1], box[2], max(1, min(box[3], int(box[2] * 1.2))))
+            appearance_box = upper_box if enhanced and partial else box
+            evidence = self.tracklet_evidence.get(key)
+            bound = self.local_bindings.get(key)
+            unsettled = (bound is None or bound in self.pending or key in self.relink_evidence
+                         or key in self.local_recovery_pending or key in self.identity_suspects
+                         or evidence is None or len(evidence.samples) < 3)
+            interval = min(self.feature_refresh_seconds, self.mtmc_config['reid']['tracklet_refresh_seconds']) if enhanced and unsettled else self.feature_refresh_seconds
+            was_occluded = key in self.tracklet_occluded
+            if enhanced and occluded:
+                self.tracklet_occluded.add(key)
+                if evidence:
+                    evidence.reset_candidate()
+            needs_refresh = not occluded and (enhanced or not partial) and (
+                (cached is None and key not in self.local_feature_attempts)
+                or monotonic_time - self.local_feature_attempts.get(key, -1e9) >= interval
+                or (enhanced and was_occluded)
             )
-            quality = BodyQualityScorer.assess(frame, box) if needs_refresh else None
-            track_inputs.append((track, local_id, box, key, gallery, quality))
+            quality = (BodyQualityScorer.assess(frame, appearance_box) if not incomplete_head
+                       else {'score': 0.0, 'reason': 'head_only_not_body_memory'}) if needs_refresh else None
+            kind = 'upper' if enhanced and partial else 'full'
+            upper_quality = BodyQualityScorer.assess(frame, upper_box) if enhanced and needs_refresh and not partial else None
+            track_inputs.append((track, local_id, box, key, gallery, quality, kind, upper_quality))
             if needs_refresh and quality["score"] >= gallery.min_quality:
-                refresh_inputs.append((local_id, box))
+                refresh_inputs.append(((local_id, kind), appearance_box))
                 self.local_feature_attempts[key] = monotonic_time
+                if upper_quality and upper_quality['score'] >= gallery.min_quality:
+                    refresh_inputs.append(((local_id, 'upper'), upper_box))
+            if enhanced and not occluded:
+                self.tracklet_occluded.discard(key)
 
         refreshed = {}
         if refresh_inputs:
@@ -1295,19 +1453,37 @@ class CrossCameraTrackCoordinator:
                 for (local_id, _box), feature in zip(refresh_inputs, features)
             }
 
-        for track, local_id, box, key, gallery, quality in track_inputs:
+        for track, local_id, box, key, gallery, quality, kind, upper_quality in track_inputs:
             if quality is not None:
-                appearance = refreshed.get(local_id)
+                appearance = refreshed.get((local_id, kind))
                 if appearance is not None:
-                    gallery.add(
-                        appearance,
-                        monotonic_time=monotonic_time,
-                        unix_time=unix_time,
-                        quality=quality["score"],
-                        camera_id=camera_id,
-                        quality_details=quality,
-                    )
-                    representative = gallery.representative
+                    support = refreshed.get((local_id, 'upper')) if kind == 'full' else None
+                    guard = self._guard_fresh_appearance(key, appearance, kind, monotonic_time, unix_time, support)
+                    if guard == 'detach':
+                        gallery = self.local_galleries[key]
+                    if guard == 'quarantine':
+                        appearance = None
+                    details = {**quality, 'body_kind': kind}
+                    if appearance is not None:
+                        gallery.add(
+                            appearance,
+                            monotonic_time=monotonic_time,
+                            unix_time=unix_time,
+                            quality=quality["score"],
+                            camera_id=camera_id,
+                            quality_details=details,
+                        )
+                    if enhanced and appearance is not None:
+                        evidence = self.tracklet_evidence.setdefault(key, TrackletEvidence())
+                        upper = refreshed.get((local_id, 'upper')) if kind == 'full' else None
+                        evidence.add(appearance, monotonic_time, kind, quality=quality['score'], unix_time=unix_time,
+                                     support_feature=upper,
+                                     support_quality=upper_quality['score'] if upper_quality else None, box=box)
+                        if upper is not None and upper_quality:
+                            gallery.add(upper, monotonic_time=monotonic_time, unix_time=unix_time,
+                                        quality=upper_quality['score'], camera_id=camera_id,
+                                        quality_details={**upper_quality, 'body_kind': 'upper'})
+                    representative = gallery.representative_for(kind)
                     # The fallback must obey gallery admission and retain the
                     # real sample time when a new sample was rejected/duplicate.
                     if representative is not None:
@@ -1315,7 +1491,7 @@ class CrossCameraTrackCoordinator:
                             representative,
                             gallery.last_updated_monotonic,
                         )
-            appearance = gallery.representative
+            appearance = gallery.representative_for(kind)
             if appearance is None and self.local_features.get(key):
                 appearance = self.local_features[key][0]
             position = track.get("position")
@@ -1338,11 +1514,17 @@ class CrossCameraTrackCoordinator:
                     "position": position,
                     "geometry_trusted": not bool(track.get("position_estimated")),
                     "direction": direction,
-                    "gallery": gallery,
+                    "gallery": (self.tracklet_evidence[key].query_gallery(
+                                    gallery.min_quality, {kind, 'upper'} if kind == 'full'
+                                    and refreshed.get((local_id, 'upper')) is not None else {kind})
+                                if enhanced and key in self.tracklet_evidence else gallery),
+                    "memory_gallery": gallery,
                     "appearance": appearance,
                     "image_anchor": track.get("image_anchor"),
                     "image_box": (box[0]/frame.shape[1], box[1]/frame.shape[0], box[2]/frame.shape[1], box[3]/frame.shape[0]),
                     "clothing_tone": self.clothing_tone(frame, box),
+                    "fresh_appearance": refreshed.get((local_id, kind)) is not None,
+                    "body_kind": kind,
                 }
             )
         prepared.sort(key=lambda item: (str(camera_id), int(item["local_id"])))
@@ -1357,6 +1539,9 @@ class CrossCameraTrackCoordinator:
                     self.global_tracks.pop(global_id, None)
                     self.global_galleries.pop(global_id, None)
                     self.pending.pop(global_id, None)
+                    for key in [key for key, state in self.identity_suspects.items()
+                                if state['global_id'] == global_id]:
+                        self.identity_suspects.pop(key, None)
                     self._record_event(
                         "expire",
                         global_id=global_id,
@@ -1405,6 +1590,9 @@ class CrossCameraTrackCoordinator:
                 if item["local_id"] in relinked_results:
                     continue
                 key = (camera_id, item["local_id"])
+                if key in self.identity_suspects and self.local_bindings.get(key) in self.global_tracks:
+                    existing_results[item['local_id']] = self.local_bindings[key]
+                    continue
                 entry_state = self.local_entry_states.setdefault(key, {"inside": set(), "times": {}})
                 inside_entries = self.batch_associator.entry_gate_sources(camera_id, item.get("image_anchor"), item.get("image_box"))
                 for entry in inside_entries - entry_state["inside"]:
@@ -1525,6 +1713,28 @@ class CrossCameraTrackCoordinator:
                     decision = {**decision, "accepted": False, "confidence": "medium", "reason": "pending_pixel_continuity"}
                 previous_id = self.local_bindings.get(key)
                 candidate_id = decision.get("candidate_global_id")
+                enhanced = self.mtmc_config['reid'].get('tracklet_recovery_enabled', False)
+                fresh_confirmed = True
+                if enhanced and candidate_id and candidate_id != previous_id:
+                    if decision.get('match_margin', 0.0) < self.match_margin:
+                        evidence = self.tracklet_evidence.get(key)
+                        if evidence:
+                            evidence.reset_candidate()
+                        fresh_confirmed = False
+                    else:
+                        strong = bool(decision.get('accepted'))
+                        overlap_threshold = decision.get('temporal_overlap_min_similarity')
+                        threshold = (self.mtmc_config['reid']['high_similarity'] if strong
+                                     else overlap_threshold if overlap_threshold is not None
+                                     else self.mtmc_config['association']['pending_confirmation_similarity'])
+                        fresh_confirmed = self._tracklet_confirmed(
+                            key, candidate_id, monotonic_time, threshold,
+                            minimum=(None if strong else self.mtmc_config['association']['pending_confirmation_observations']),
+                            duration=(None if strong else 1.0 if overlap_threshold is not None else .4),
+                            body_kind=(decision.get('reid_details') or {}).get('body_kind'))
+                    if decision.get('accepted') and not fresh_confirmed:
+                        decision = {**decision, 'accepted': False, 'confidence': 'medium',
+                                    'reason': 'pending_fresh_tracklet'}
                 temporal_evidence = None
                 overlap_min = decision.get("temporal_overlap_min_similarity")
                 evidence_similarity = overlap_min if overlap_min is not None else self.mtmc_config["association"].get("pending_confirmation_similarity", 0.68)
@@ -1542,6 +1752,11 @@ class CrossCameraTrackCoordinator:
                     and decision.get("reid_score", 0.0) >= evidence_similarity
                     and decision.get("match_margin", 0.0) >= self.match_margin
                 ):
+                    if enhanced:
+                        if fresh_confirmed and item.get('fresh_appearance'):
+                            evidence = self.tracklet_evidence[key]
+                            decision = {**decision, 'accepted': True, 'confidence': 'high',
+                                        'reason': 'confirmed_fresh_tracklet', 'evidence_count': len(evidence.votes)}
                     old_evidence = self.pending.get(previous_id, {})
                     consecutive = (
                         old_evidence.get("candidate_global_id") == candidate_id
@@ -1551,7 +1766,13 @@ class CrossCameraTrackCoordinator:
                     count = old_evidence.get("evidence_count", 0) + 1 if consecutive else 1
                     first_at = old_evidence.get("first_evidence_at", monotonic_time) if consecutive else monotonic_time
                     temporal_evidence = {"evidence_mode": evidence_mode, "evidence_count": count, "first_evidence_at": first_at, "last_evidence_at": monotonic_time}
-                    if count >= required_observations and monotonic_time - first_at >= evidence_duration - 1e-6:
+                    if enhanced:
+                        evidence = self.tracklet_evidence.get(key)
+                        votes = list(evidence.votes) if evidence else []
+                        temporal_evidence = {'evidence_mode': 'fresh_tracklet', 'evidence_count': len(votes)}
+                        if votes:
+                            temporal_evidence.update(first_evidence_at=votes[0][0], last_evidence_at=votes[-1][0])
+                    if not enhanced and count >= required_observations and monotonic_time - first_at >= evidence_duration - 1e-6:
                         decision = {**decision, "accepted": True, "confidence": "high", "reason": "confirmed_temporal_candidate", "evidence_count": count}
                 created_global_id = False
                 if decision.get("accepted") and candidate_id in self.global_tracks:
@@ -1588,7 +1809,7 @@ class CrossCameraTrackCoordinator:
                         global_id = previous_id
                     else:
                         global_gallery = self._new_gallery()
-                        global_gallery.merge(item["gallery"])
+                        global_gallery.merge(item.get('memory_gallery', item['gallery']))
                         global_id = self._new_global(
                             monotonic_time,
                             camera_id,
@@ -1610,7 +1831,7 @@ class CrossCameraTrackCoordinator:
                     global_id = previous_id
                 else:
                     global_gallery = self._new_gallery()
-                    global_gallery.merge(item["gallery"])
+                    global_gallery.merge(item.get('memory_gallery', item['gallery']))
                     global_id = self._new_global(
                         monotonic_time,
                         camera_id,
@@ -1648,6 +1869,8 @@ class CrossCameraTrackCoordinator:
             for index, first_item in enumerate(prepared):
                 first = results[first_item["local_id"]]
                 for second_item in prepared[index + 1:]:
+                    if any((camera_id, item['local_id']) in self.identity_suspects for item in (first_item, second_item)):
+                        continue
                     second = results[second_item["local_id"]]
                     if first == second:
                         continue
@@ -1662,6 +1885,8 @@ class CrossCameraTrackCoordinator:
 
             for item in prepared:
                 global_id = results[item["local_id"]]
+                if (camera_id, item['local_id']) in self.identity_suspects:
+                    continue  # Do not move the frozen owner's appearance or motion anchor.
                 target = self.global_tracks[global_id]
                 previous_camera = self._camera_observation(target, camera_id)
                 pixel_velocity = None
@@ -1677,7 +1902,7 @@ class CrossCameraTrackCoordinator:
                         pixel_velocity = tuple(0.8 * old_velocity[i] + 0.2 * measured[i] for i in (0, 1))
                 camera_exits = dict((previous_camera or {}).get("recent_exit_gates") or {})
                 global_gallery = self.global_galleries.setdefault(global_id, self._new_gallery())
-                global_gallery.merge(item["gallery"])
+                global_gallery.merge(item.get('memory_gallery', item['gallery']))
                 appearance = global_gallery.representative
                 if appearance is None:
                     appearance = item["appearance"]
@@ -1913,7 +2138,9 @@ class CrossCameraTrackCoordinator:
                 "gallery": gallery.snapshot() if gallery is not None else self._new_gallery().snapshot(),
                 "confidence": (recent or {}).get("confidence", "existing"),
                 "final_match_score": (recent or {}).get("final_score"),
-                "pending": global_id in self.pending,
+                "pending": global_id in self.pending or key in self.identity_suspects,
+                "identity_pending": key in self.identity_suspects,
+                "tracklet_evidence": self.tracklet_evidence[key].snapshot() if key in self.tracklet_evidence else None,
                 "handoff_waiting": now < float(target.get("handoff_wait_until", 0.0)),
                 **self._count_state(global_id),
             }
@@ -1924,6 +2151,7 @@ class CrossCameraTrackCoordinator:
             return {
                 "algorithm_version": self.mtmc_config["algorithm_version"],
                 "association_algorithm": ASSOCIATION_ALGORITHM,
+                "tracklet_recovery_enabled": self.mtmc_config['reid'].get('tracklet_recovery_enabled', False),
                 "handoff_policy_path": getattr(self, "handoff_policy_path", None),
                 "handoff_hub_ids": sorted({t["hub_id"] for t in self.transitions if t.get("hub_id")}),
                 "active_global_tracks": len(self.global_tracks),
@@ -2082,6 +2310,11 @@ class CrossCameraTrackCoordinator:
             self.active_local_ids_by_camera.pop(camera_id, None)
             for key in [key for key in self.local_recovery_pending if key[0] == camera_id]:
                 self.local_recovery_pending.pop(key, None)
+            for key in [key for key in self.tracklet_evidence if key[0] == camera_id]:
+                self.tracklet_evidence.pop(key, None)
+            self.tracklet_occluded.difference_update(key for key in list(self.tracklet_occluded) if key[0] == camera_id)
+            for key in [key for key in self.identity_suspects if key[0] == camera_id]:
+                self.identity_suspects.pop(key, None)
 
     def reset_replay_cycle(self):
         """Discard all cross-camera evidence at a recording loop boundary."""
@@ -2094,6 +2327,8 @@ class CrossCameraTrackCoordinator:
                 self.distinct_global_pairs, self.stream_timestamps,
                 self.association_reservations,
                 self.relink_evidence, self.local_entry_states, self.local_recovery_pending,
+                self.tracklet_evidence, self.tracklet_occluded,
+                self.identity_suspects,
             ):
                 state.clear()
             self.recent_associations.clear()
@@ -2112,3 +2347,6 @@ class CrossCameraTrackCoordinator:
             self.relink_evidence.pop(key, None)
             self.local_recovery_pending.pop(key, None)
             self.local_entry_states.pop(key, None)
+            self.tracklet_evidence.pop(key, None)
+            self.tracklet_occluded.discard(key)
+            self.identity_suspects.pop(key, None)

@@ -34,7 +34,12 @@ def deliver(service):
         if changed!=1:return False
         service.last_send=now
     try:
-        if event.get('evidence_id'):
+        if event['event_type'] == 'environment.flame':
+            # Emergency text never waits for capture/upload. A durable worker
+            # supplements every destination with the same three-camera album.
+            payload=feishu_payload(service.message(event)+'\n三路现场快照随后补发；不代表三路均已检测到火焰。',
+                service.env.get(route.get('secret_env',''),''),service.wall())
+        elif event.get('evidence_id'):
             from alert_evidence import group_evidence_payload
             with service.image_lock:
                 if service.evidence is None or not EVIDENCE_CREDENTIALS.exists():raise ValueError('evidence transport unavailable')

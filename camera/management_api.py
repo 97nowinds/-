@@ -66,6 +66,11 @@ class ManagementRuntime:
         self.stop_event = threading.Event()
         self.last_poll_status = 'starting'
         self.thread = None
+        from instrument_event_sync import InstrumentEventSync
+        self.instrument_sync = InstrumentEventSync(self.service, server.member_client)
+        from fire_snapshot_album import FireSnapshotAlbums, FrozenSceneCapture
+        self.fire_albums = FireSnapshotAlbums(self.service, FrozenSceneCapture(
+            self.service, Path(config_path).parent.parent/'runtime'/'handoff-credentials.json'))
 
     def index(self):
         publisher = self.server.live_publisher
@@ -75,6 +80,8 @@ class ManagementRuntime:
 
     def start(self):
         self.service.start()
+        self.fire_albums.start()
+        self.instrument_sync.start()
         self.environment_thread=threading.Thread(target=self._poll_environment,daemon=True,name='lab-local-alarm')
         self.environment_thread.start()
         self.thread = threading.Thread(target=self._poll, daemon=True, name='lab-management-evidence')
@@ -109,6 +116,10 @@ class ManagementRuntime:
                         for row in body.get('analyses', []):
                             if isinstance(row, dict):
                                 try:
+                                    # Persistent instrument sessions are synchronized separately.
+                                    # Keep the strict authority/evidence gate for safety observations.
+                                    if row.get('evidence_type') not in {'fire', 'ppe', 'mask'}:
+                                        continue
                                     adapter=self.fire if row.get('evidence_type')=='fire' else self.evidence
                                     adapter.analysis({**row, 'time_domain': 'authority'}, self.index())
                                 except (ValueError, KeyError, TypeError):
@@ -119,6 +130,8 @@ class ManagementRuntime:
 
     def stop(self):
         self.stop_event.set()
+        self.fire_albums.stop()
+        self.instrument_sync.stop()
         if self.thread:
             self.thread.join(timeout=7)
         if getattr(self,'environment_thread',None):self.environment_thread.join(timeout=2)
@@ -180,13 +193,20 @@ def handle_management(handler, method):
                         event=json.loads(row['payload'])
                         if event.get('evidence_id')==match[1] and scoped(principal,event):
                             authorized=True;break
+                    if not authorized:
+                        for row in service.db.execute('SELECT e.payload,j.items FROM fire_snapshot_jobs j JOIN events e ON e.id=j.event_id'):
+                            event=json.loads(row['payload'])
+                            if (scoped(principal,event) and any(item.get('evidence_id')==match[1]
+                                    for item in json.loads(row['items']).values())):
+                                authorized=True;break
             if not authorized or service.evidence is None:
                 handler._send_json({'error':'evidence not available'},status=404)
             else:
                 handler._send_bytes(service.evidence.read(match[1]),'image/jpeg')
         elif method == 'GET' and path == '/api/management/events':
             handler._send_json({'events': service.events(principal), 'role': principal['role'],
-                                'poll_status': runtime.last_poll_status})
+                                'poll_status': runtime.last_poll_status,
+                                'instrument_sync': dict(runtime.instrument_sync.status) if hasattr(runtime, 'instrument_sync') else {'state': 'disabled'}})
         elif method == 'GET' and path == '/api/management/routes':
             if principal['role'] != 'admin':
                 raise PermissionError('admin required')

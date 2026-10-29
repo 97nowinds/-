@@ -52,10 +52,18 @@ const HARDWARE_URL = window.__LAB_HARDWARE_URL__ || null;
 const INTERACTION_URL = "/api/interaction-results/latest";
 const resultContract = window.__LAB_RESULT_CONTRACT__ || "";
 let latestAnalyses = [];
+let persistentInstrumentEvents = [];
+window.addEventListener('lab-instrument-history', ({detail}) => {
+  persistentInstrumentEvents = (detail.sessions || []).slice(0, 3).map(s => ({
+    camera_id:s.camera_id, display_name:s.person_label, instrument_name:s.instrument_name,
+    observed_at:s.ended_at || s.started_at,
+    interaction_label:s.ended_at ? `结束使用（${s.duration_seconds.toFixed(3)} 秒）` : '开始使用（结束待确认）',
+  }));
+});
 const interactionDeadlines = new Map();
 
 function currentInteractionEvents() {
-  if (!resultContract) return latestInteractionEvents;
+  if (!resultContract) return latestInteractionEvents.filter(item => !item.expires_at || Date.parse(item.expires_at)>Date.now());
   return latestInteractionEvents.filter((item) =>
     performance.now() < (interactionDeadlines.get(item.analysis_id) || 0));
 }
@@ -129,6 +137,17 @@ window.setInterval(updateDashboardClock, 1000);
 const DASHBOARD_REFRESH_INTERVAL_MS = 500;
 const SERVICE_DISCONNECT_FAILURES = 3;
 let consecutiveStateFailures = 0;
+let dashboardRefreshing = false;
+let dashboardTimer = null;
+let lastStateReceivedAt = 0;
+window.addEventListener('online', () => refresh());
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+window.setInterval(() => {
+  if (lastStateReceivedAt && Date.now()-lastStateReceivedAt>10000) {
+    serviceState.textContent = '数据已过期 · 自动重连中';
+    serviceState.className = 'service-state delayed';
+  }
+}, 1000);
 
 function formatElapsed(seconds) {
   const total = Math.max(0, Math.floor(Number(seconds) || 0));
@@ -274,19 +293,14 @@ function floorMapLabel(item) {
 }
 
 async function fetchState() {
-  const [response, hardwareResponse] = await Promise.all([
-    fetch(`${API_BASE}/api/dashboard`, {cache: "no-store"}),
+  const [state, environment] = await Promise.all([
+    LivePolling.fetchJSON(`${API_BASE}/api/dashboard`, {timeoutMs:5000}),
     HARDWARE_URL
-      ? fetch(HARDWARE_URL, {cache: "no-store"}).catch(() => null)
+      ? LivePolling.fetchJSON(HARDWARE_URL, {timeoutMs:2000}).catch(() => null)
       : Promise.resolve(null),
   ]);
-  if (!response.ok) throw new Error("状态接口不可用");
-  const state = await response.json();
-  if (hardwareResponse?.ok) {
-    const environment = await hardwareResponse.json().catch(() => null);
-    if (environment) state.environment = environment;
-  }
-  state.interaction_events = currentInteractionEvents();
+  if (environment) state.environment = environment;
+  state.interaction_events = [...persistentInstrumentEvents, ...currentInteractionEvents()];
   state.interaction_errors = latestInteractionErrors;
   state.interaction_analyses = latestAnalyses;
   return state;
@@ -296,8 +310,7 @@ function refreshInteractionResults() {
   const now = Date.now();
   if (now - instrumentAnchorsFetchedAt >= 30000) {
     instrumentAnchorsFetchedAt = now;
-    fetch("/api/instruments/anchors", {cache: "no-store"})
-      .then((response) => response.ok ? response.json() : Promise.reject(new Error("instrument anchors unavailable")))
+    LivePolling.fetchJSON("/api/instruments/anchors")
       .then((payload) => { instrumentAnchors = Array.isArray(payload?.instruments) ? payload.instruments : []; })
       .catch(() => { instrumentAnchors = []; });
   }
@@ -307,8 +320,7 @@ function refreshInteractionResults() {
   const resultUrl = resultContract === "lab-interaction-results-1.2"
     ? `${INTERACTION_URL}?contract=${encodeURIComponent(resultContract)}` : INTERACTION_URL;
   const requestedAt = performance.now();
-  fetch(resultUrl, {cache: "no-store"})
-    .then((response) => response.ok ? response.json() : Promise.reject(new Error("interaction unavailable")))
+  LivePolling.fetchJSON(resultUrl)
     .then((payload) => {
       if (resultContract && payload?.result_contract !== resultContract) throw new Error("result contract unavailable");
       latestInteractionEvents = Array.isArray(payload) ? payload : Array.isArray(payload?.results) ? payload.results : [];
@@ -875,6 +887,9 @@ function update(state) {
 }
 
 async function refresh() {
+  if (dashboardRefreshing) return;
+  dashboardRefreshing = true;
+  window.clearTimeout(dashboardTimer);
   try {
     refreshInteractionResults();
     let state;
@@ -883,11 +898,12 @@ async function refresh() {
     } catch (error) {
       consecutiveStateFailures += 1;
       const disconnected = consecutiveStateFailures >= SERVICE_DISCONNECT_FAILURES;
-      serviceState.textContent = disconnected ? "服务断开" : "刷新延迟";
+      serviceState.textContent = disconnected ? "连接中断 · 自动重连中" : "刷新延迟 · 正在重试";
       serviceState.className = `service-state ${disconnected ? "error" : "delayed"}`;
       return;
     }
     consecutiveStateFailures = 0;
+    lastStateReceivedAt = Date.now();
     update(state);
     serviceState.textContent = "服务在线";
     serviceState.className = "service-state online";
@@ -897,7 +913,11 @@ async function refresh() {
   } finally {
     // Video preview uses its own synchronized loop.  This is only state/map
     // refresh and must stay below the backend's 50 ms publication rate.
-    window.setTimeout(refresh, DASHBOARD_REFRESH_INTERVAL_MS);
+    dashboardRefreshing = false;
+    const delay = consecutiveStateFailures
+      ? Math.min(10000, DASHBOARD_REFRESH_INTERVAL_MS * 2 ** Math.min(consecutiveStateFailures, 5))
+      : DASHBOARD_REFRESH_INTERVAL_MS;
+    dashboardTimer = window.setTimeout(refresh, delay);
   }
 }
 

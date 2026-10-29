@@ -19,11 +19,27 @@ def warm_face_models(engine):
         model.session.run(None, {model.session.get_inputs()[0].name: value})
 
 
-def run_face_attempt(worker, frame, box, track_id):
+def scale_box(box, from_shape, to_shape):
+    """Map an xywh box between full-view images using their actual dimensions."""
+    import math
+    sx, sy = to_shape[1] / from_shape[1], to_shape[0] / from_shape[0]
+    x, y, w, h = box
+    left, top = max(0, math.floor(x*sx)), max(0, math.floor(y*sy))
+    right = min(to_shape[1], math.ceil((x+w)*sx))
+    bottom = min(to_shape[0], math.ceil((y+h)*sy))
+    return left, top, max(0, right-left), max(0, bottom-top)
+
+
+def run_face_attempt(worker, frame, box, track_id, *, source_frame=None):
     """Isolate a failed optional face stage without assigning an identity."""
     started = time.perf_counter()
     try:
-        candidate = worker.confirm_face_identity(frame, box, track_id)
+        face_frame = source_frame if source_frame is not None else frame
+        face_box = scale_box(box, frame.shape, face_frame.shape) if source_frame is not None else box
+        candidate = worker.confirm_face_identity(face_frame, face_box, track_id)
+        if candidate is not None and source_frame is not None:
+            detected_box, result = candidate
+            candidate = (scale_box(detected_box, face_frame.shape, frame.shape), result)
     except Exception as error:
         worker.face_recognition_error = type(error).__name__ + ": face attempt failed"
         worker.face_attempt_audit.record(
@@ -48,7 +64,9 @@ class FaceAttemptAudit:
                   else result.get("reason") or "score_or_margin_rejected")
         distance = (result or {}).get("distance")
         item = {
+            "completed_at": time.time(),
             "track_id": track_id, "reason": reason,
+            "person_id": (result or {}).get("person_id") if (result or {}).get("known") else None,
             "detect_embed_ms": round(detection_ms, 3), "total_ms": round(total_ms, 3),
             "face_size_px": list(face_box[2:]) if face_box else None,
             "similarity": (result or {}).get("similarity", None if distance is None else 1-distance),

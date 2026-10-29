@@ -197,12 +197,17 @@ class MapHandler(BaseHTTPRequestHandler):
         if self.path.split('?')[0] not in ('/api/handoff/map', '/api/handoff/positions', '/health'):
             self.send_error(404)
             return
+        if self.path == '/health':
+            # Local liveness must not wait for the upstream SSH/API request.
+            # The resident owner checks the backend separately. Map/positions
+            # still report upstream failure and never invent current people.
+            self._json({'status': 'alive', 'service': 'lab-map-handoff',
+                        'service_revision': 'joint-demo-minimal-r1',
+                        'checks_upstream': False})
+            return
         try:
             payload = read_snapshot(self.server.api_base)
-            if self.path == '/health':
-                payload = {'status': payload['backend_status'], 'service': 'lab-map-handoff',
-                           'service_revision': 'joint-demo-minimal-r1'}
-            elif self.path.split('?')[0] == '/api/handoff/positions':
+            if self.path.split('?')[0] == '/api/handoff/positions':
                 payload.pop('layout')
             body = json.dumps(payload, ensure_ascii=False).encode()
             self.send_response(503 if payload.get('backend_status') == 'unavailable' and self.path != '/api/handoff/map' else 200)

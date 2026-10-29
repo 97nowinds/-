@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-KINDS = {'person.entered', 'instrument.started', 'safety.no_mask', 'safety.no_lab_coat', 'safety.no_gloves',
+KINDS = {'person.entered', 'instrument.started', 'instrument.ended', 'safety.no_mask', 'safety.no_lab_coat', 'safety.no_gloves',
          'environment.flame','environment.flame_recovered'}
 ROLES = {'admin', 'producer'}
 
@@ -122,6 +122,8 @@ class ManagementNotifications:
         from fire_fusion import FireFusion
         self.fire_fusion=FireFusion(self)
         self.image_lock=threading.RLock()
+        from fire_snapshot_album import initialize as initialize_fire_snapshots
+        initialize_fire_snapshots(self)
         with self.db:
             columns={row[1] for row in self.db.execute('PRAGMA table_info(outbox)')}
             for name,declaration in [('priority','INTEGER DEFAULT 0'),('lease_until','REAL DEFAULT 0'),('claim','TEXT')]:
@@ -212,6 +214,8 @@ class ManagementNotifications:
                         continue
                     self.db.execute('INSERT INTO outbox(event_id,route_id,state,due,priority) VALUES(?,?,?,?,?)',
                                     (item['event_id'], route['id'], 'pending', self.wall(),3 if item.get('severity')=='L3' else 1))
+            from fire_snapshot_album import enqueue as enqueue_fire_snapshots
+            enqueue_fire_snapshots(self, item)
             self._audit('system', 'event.record', item['event_id'])
         return True
 
@@ -239,6 +243,11 @@ class ManagementNotifications:
                     item.update(acknowledged_by=row['acknowledged_by'], acknowledged_at=row['acknowledged_at'],
                                 deliveries=[dict(r) for r in self.db.execute(
                                     'SELECT route_id,state,attempts,error FROM outbox WHERE event_id=?', (row['id'],))])
+                    album = self.db.execute('SELECT items,state FROM fire_snapshot_jobs WHERE event_id=?', (row['id'],)).fetchone()
+                    if album:
+                        item['fire_snapshots'] = {'state': album['state'], 'cameras': json.loads(album['items']),
+                            'deliveries': [dict(r) for r in self.db.execute(
+                                'SELECT route_id,state,attempts,error FROM fire_snapshot_deliveries WHERE event_id=?', (row['id'],))]}
                     output.append(item)
                 if len(output) >= 100:
                     break
@@ -268,6 +277,15 @@ class ManagementNotifications:
 
     @staticmethod
     def message(event):
+        if event['event_type'] in {'instrument.started', 'instrument.ended'} and event.get('session_id'):
+            from datetime import timedelta
+            local = lambda at: datetime.fromtimestamp(stamp(at), timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
+            ending = ('\n结束：' + local(event['ended_at']) + '\n时长：' + event['duration_seconds'] + ' 秒'
+                      if event.get('ended_at') else '\n结束：尚未取得有效结束判断')
+            return (f"实验室仪器记录｜{'开始使用' if event['event_type'].endswith('started') else '结束使用'}"
+                    f"\n人员：{event['display_name']}\n仪器：{event['instrument_name']}"
+                    f"\n摄像头：{event['camera_id']}\n开始：{local(event['started_at'])}{ending}"
+                    f"\n时间依据：源画面（北京时间）\n会话：{event['session_id']}\n事件：{event['event_id']}")
         if event['event_type'].startswith('environment.'):
             stage=event.get('fire_stage')
             title=('【L3 紧急】视觉与硬件双源火焰确认，需现场核查' if stage=='dual_confirmed' else

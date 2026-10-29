@@ -66,11 +66,13 @@ class TrackFeatureGallery:
         min_quality=0.45,
         duplicate_similarity=0.985,
         top_k=3,
+        robust=False,
     ):
         self.capacity = int(capacity)
         self.min_quality = float(min_quality)
         self.duplicate_similarity = float(duplicate_similarity)
         self.top_k = int(top_k)
+        self.robust = bool(robust)
         self.samples = []
         self.rejected_samples = 0
         self.duplicate_samples = 0
@@ -99,7 +101,11 @@ class TrackFeatureGallery:
     ):
         vector = self._normalize(feature)
         quality = float(quality)
-        if vector is None or quality < self.min_quality:
+        details = dict(quality_details or {})
+        kind = details.get('body_kind', 'full')
+        if (vector is None or not np.isfinite(quality) or quality < self.min_quality
+                or kind not in ('full', 'upper') or details.get('contaminated')
+                or details.get('occluded')):
             self.rejected_samples += 1
             return False
         monotonic_time = time.monotonic() if monotonic_time is None else float(monotonic_time)
@@ -110,10 +116,12 @@ class TrackFeatureGallery:
             unix_time,
             quality,
             str(camera_id),
-            dict(quality_details or {}),
+            details,
         )
         if self.samples:
-            similarities = [float(np.dot(vector, item.feature)) for item in self.samples]
+            similarities = [float(np.dot(vector, item.feature))
+                            if item.quality_details.get('body_kind', 'full') == kind else -2.0
+                            for item in self.samples]
             duplicate_index = int(np.argmax(similarities))
             if similarities[duplicate_index] >= self.duplicate_similarity:
                 self.duplicate_samples += 1
@@ -135,6 +143,10 @@ class TrackFeatureGallery:
     def _prune_one(self):
         utilities = []
         for index, sample in enumerate(self.samples):
+            kind = sample.quality_details.get('body_kind', 'full')
+            if self.robust and sum(s.quality_details.get('body_kind', 'full') == kind for s in self.samples) == 1:
+                utilities.append(float('inf'))
+                continue
             others = [
                 float(np.dot(sample.feature, other.feature))
                 for other_index, other in enumerate(self.samples)
@@ -146,15 +158,37 @@ class TrackFeatureGallery:
 
     @property
     def representative(self):
-        if not self.samples:
+        return self.representative_for('full')
+
+    def representative_for(self, kind):
+        samples = [s for s in self.samples if s.quality_details.get('body_kind', 'full') == kind]
+        if not samples:
             return None
-        weights = np.asarray([sample.quality for sample in self.samples], dtype=np.float32)
-        vectors = np.asarray([sample.feature for sample in self.samples], dtype=np.float32)
+        weights = np.asarray([sample.quality for sample in samples], dtype=np.float32)
+        vectors = np.asarray([sample.feature for sample in samples], dtype=np.float32)
         vector = np.average(vectors, axis=0, weights=weights)
         norm = float(np.linalg.norm(vector))
         return vector / norm if norm > 1e-8 else None
 
     def compare(self, other):
+        if self.robust and other is not None:
+            results = []
+            for kind in ('full', 'upper'):
+                first = [s for s in self.samples if s.quality_details.get('body_kind', 'full') == kind]
+                second = [s for s in other.samples if s.quality_details.get('body_kind', 'full') == kind]
+                if not first or not second:
+                    continue
+                matrix = np.asarray([s.feature for s in first]) @ np.asarray([s.feature for s in second]).T
+                # Each crop gets only one nearest-reference vote. A single
+                # accidental pair cannot occupy all top-k slots.
+                votes = np.max(matrix, axis=1)
+                results.append({'score': round(float(np.median(votes)), 6),
+                                'best_score': float(np.max(matrix)), 'pair_count': int(matrix.size),
+                                'top_k': len(votes), 'quality': float(np.mean([s.quality for s in first])),
+                                'body_kind': kind, 'typed_memory': True})
+            return max(results, key=lambda r: r['score']) if results else {
+                'score': None, 'best_score': None, 'pair_count': 0, 'top_k': 0,
+                'quality': 0.0, 'typed_memory': True}
         if other is None or not self.samples or not other.samples:
             return {
                 "score": None,
@@ -209,4 +243,6 @@ class TrackFeatureGallery:
             "duplicate_samples": self.duplicate_samples,
             "last_updated_at": self.last_updated_unix,
             "camera_ids": sorted({sample.camera_id for sample in self.samples}),
+            "body_kinds": {kind: sum(s.quality_details.get('body_kind', 'full') == kind for s in self.samples)
+                           for kind in ('full', 'upper')},
         }

@@ -112,7 +112,7 @@ class FeishuAppClient:
 
 
 
-    def upload_image(self, jpeg):
+    def upload_image(self, jpeg, *, timeout=8):
         if not isinstance(jpeg, bytes) or not jpeg.startswith(b'\xff\xd8') or len(jpeg) > 10 * 1024 * 1024:
             raise FeishuError('证据图片必须是10MB以内的JPEG')
         import secrets
@@ -123,7 +123,7 @@ class FeishuAppClient:
         req = Request(BASE+'/im/v1/images', data=data, method='POST', headers={
             'Authorization':'Bearer '+self.token(), 'Content-Type':'multipart/form-data; boundary='+boundary})
         try:
-            with urlopen(req,timeout=8) as response:
+            with urlopen(req,timeout=timeout) as response:
                 result=json.loads(response.read(65536))
         except HTTPError as exc:
             try: result=json.loads(exc.read(65536))

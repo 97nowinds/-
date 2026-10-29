@@ -15,6 +15,8 @@ def notification_status(runtime):
         } for route in service.config['routes']]
         outbox = {row[0]: row[1] for row in service.db.execute(
             'SELECT state,count(*) FROM outbox GROUP BY state')}
+        fire_albums = {row[0]: row[1] for row in service.db.execute(
+            'SELECT state,count(*) FROM fire_snapshot_deliveries GROUP BY state')}
         producer = any(p['role'] == 'producer' and bool(service.env.get(p['token_env']))
                        for p in service.config.get('principals', []))
         silent = list(service.config.get('silent_events', []))
@@ -37,6 +39,8 @@ def notification_status(runtime):
         'groups': groups, 'silent_events': silent, 'ppe_rules': rules,
         'ppe_preparation': dict(service.config.get('ppe_preparation',{})),
         'outbox_counts': outbox,
+        'fire_snapshot_delivery_counts': fire_albums,
+        'fire_snapshot_cameras': ['cam_1', 'cam_2', 'cam_entrance'],
         'evidence_upload_configured': evidence,
         'producer_auth_configured': producer,
         'fresh_snapshot_count': snapshots,
@@ -44,6 +48,7 @@ def notification_status(runtime):
         'member_polling_configured': runtime.server.member_client is not None,
         'snapshot_publisher_enabled': runtime.server.live_publisher is not None,
         'poll_status': runtime.last_poll_status,
+        'instrument_sync': dict(runtime.instrument_sync.status) if hasattr(runtime, 'instrument_sync') else {'state': 'disabled'},
         'readiness_blockers': blockers,
         'meaning': 'Configuration and local readiness only; not proof of delivery or detection accuracy.',
     }

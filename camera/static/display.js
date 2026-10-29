@@ -10,9 +10,7 @@
   $('fullscreen').onclick = async () => { try { if (document.fullscreenElement) await document.exitFullscreen(); else await document.documentElement.requestFullscreen(); } catch { text('fullscreen','全屏不可用'); } };
   document.addEventListener('fullscreenchange', () => text('fullscreen', document.fullscreenElement ? '退出全屏' : '全屏展示'));
   async function get(url) {
-    const response = await fetch(url, {cache:'no-store', signal:AbortSignal.timeout(4500)});
-    if (!response.ok) throw new Error('数据不可用');
-    return response.json();
+    return LivePolling.fetchJSON(url, {timeoutMs:4500});
   }
   function svg(tag, attrs, label) {
     const el = document.createElementNS('http://www.w3.org/2000/svg', tag);

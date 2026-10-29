@@ -1130,6 +1130,34 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         self.assertEqual(coordinator.person_locks["p1"], first)
         self.assertNotIn(second, coordinator.global_identities)
 
+    def test_fresh_face_reclaims_registered_name_without_merging_retained_tracks(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        old = coordinator._new_global(1, 'cam_1', None, None, local_id=11)
+        new = coordinator._new_global(10, 'cam_2', None, None, local_id=77)
+        original = {'known':True,'person_id':'p1','name':'registered'}
+        coordinator.set_identity(old, original, 'cam_1', now=1)
+        confirmed = {**original,'identity_source':'face','_face_votes':3,
+                     '_face_confirmed_monotonic':10,'_face_camera_id':'cam_2','_face_local_id':77}
+        result = coordinator.set_identity(new, confirmed, 'cam_2', now=10.1)
+        self.assertIsNotNone(result)
+        self.assertEqual(coordinator.person_locks['p1'],new)
+        self.assertNotIn(old,coordinator.global_identities)
+        self.assertIn(old,coordinator.global_tracks)
+        self.assertIn(new,coordinator.global_tracks)
+        self.assertNotIn(old,coordinator.redirects)
+        self.assertIsNone(coordinator.set_identity(old,original,'cam_1',now=10.2))
+
+    def test_fresh_old_body_blocks_even_three_face_votes(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        old = coordinator._new_global(9.5, 'cam_1', None, None, local_id=11)
+        new = coordinator._new_global(10, 'cam_2', None, None, local_id=77)
+        identity = {'known':True,'person_id':'p1','name':'registered'}
+        coordinator.set_identity(old,identity,'cam_1',now=9.5)
+        confirmed = {**identity,'identity_source':'face','_face_votes':3,
+                     '_face_confirmed_monotonic':10,'_face_camera_id':'cam_2','_face_local_id':77}
+        self.assertIsNone(coordinator.set_identity(new,confirmed,'cam_2',now=10.1))
+        self.assertEqual(coordinator.person_locks['p1'],old)
+
     def test_entrance_face_conflict_does_not_merge_active_people(self):
         coordinator = self.coordinator(self.UncalibratedFloorMap())
         indoor = coordinator._new_global(1, "cam_1", None, {"x": 9.5, "y": 4.5})

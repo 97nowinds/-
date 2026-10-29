@@ -6,9 +6,8 @@
     <title>实验室智能安全监测大屏</title>
     <link rel="stylesheet" href="/static/styles.css?v=state-retry-20260923">
     <script src="/static/instrument_location.js"></script>
-      <link rel="stylesheet" href="/static/display.css?v=original-layout-20261009">
   </head>
-  <body class="presentation-only">
+  <body>
     <main class="app-shell dashboard-shell">
       <header class="topbar display-topbar">
         <div class="display-clock" aria-label="当前时间">
@@ -34,10 +33,21 @@
 
       <section class="dashboard-layout">
         <div class="display-main">
+          <section class="display-panel monitoring-panel">
+            <header class="display-panel-header">
+              <div>
+                <span class="panel-index">01</span>
+                <h2>实时监控画面</h2>
+              </div>
+              <span class="panel-caption">REAL-TIME MONITORING</span>
+            </header>
+            <section class="video-grid" id="videoGrid"></section>
+          </section>
+
           <aside class="floor-map-panel display-panel">
           <header>
             <div>
-              <span class="panel-index">01</span>
+              <span class="panel-index">02</span>
               <h2>实验室实时位置</h2>
               <span class="panel-caption">LIVE POSITION MAP</span>
             </div>
@@ -133,7 +143,7 @@
 
       <footer class="display-footer">
         <span>AI VISION SAFETY PLATFORM</span>
-        <span>人员位置 · 仪器交互 · 环境状态持续更新</span>
+        <span>画面实时 · 地图每 5 秒更新</span>
       </footer>
     </main>
 
@@ -186,6 +196,6 @@
         </footer>
       </form>
     </dialog>
-    <script src="/static/app.js?v=display-no-video-20261009"></script>
+    <script src="/static/app.js?v=map-sample-20260924"></script>
   </body>
 </html>

@@ -1,6 +1,7 @@
 """Validated configuration for the incremental MTMC pipeline."""
 
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 
@@ -45,6 +46,12 @@ DEFAULT_CONFIG = {
         "high_similarity": 0.82,
         "medium_similarity": 0.70,
         "match_margin": 0.08,
+        "tracklet_recovery_enabled": False,
+        "tracklet_refresh_seconds": 0.15,
+        "tracklet_min_observations": 3,
+        "tracklet_min_seconds": 0.2,
+        "tracklet_max_gap_seconds": 0.5,
+        "identity_switch_min_similarity": 0.30,
     },
     "association": {
         "window_seconds": 0.75,
@@ -135,6 +142,11 @@ def validate_config(config):
         "reid.high_similarity": (-1.0, 1.0, False),
         "reid.medium_similarity": (-1.0, 1.0, False),
         "reid.match_margin": (0.0, 1.0, False),
+        "reid.tracklet_refresh_seconds": (0.05, 2.0, False),
+        "reid.tracklet_min_observations": (2, 12, True),
+        "reid.tracklet_min_seconds": (0.1, 3.0, False),
+        "reid.tracklet_max_gap_seconds": (0.1, 3.0, False),
+        "reid.identity_switch_min_similarity": (0.0, 1.0, False),
         "association.window_seconds": (0.01, 10.0, False),
         "association.global_track_ttl_seconds": (0.1, 300.0, False),
         "association.same_camera_relink_seconds": (0.1, 10.0, False),
@@ -162,6 +174,10 @@ def validate_config(config):
     for path, (minimum, maximum, integer) in ranges.items():
         _number(config, path, minimum, maximum, integer=integer)
     reid = config["reid"]
+    if not isinstance(reid.get('tracklet_recovery_enabled'), bool):
+        raise MTMCConfigError('reid.tracklet_recovery_enabled must be boolean')
+    if reid['tracklet_recovery_enabled'] and reid['gallery_capacity'] < 2:
+        raise MTMCConfigError('typed full/upper memory requires gallery_capacity >= 2')
     if reid["medium_similarity"] > reid["high_similarity"]:
         raise MTMCConfigError("reid.medium_similarity cannot exceed high_similarity")
     association = config["association"]
@@ -187,7 +203,13 @@ def validate_config(config):
 def load_mtmc_config(path=None):
     path = Path(path) if path is not None else Path(__file__).parent / "config" / "mtmc.json"
     override = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    return validate_config(_merge(DEFAULT_CONFIG, override))
+    config = _merge(DEFAULT_CONFIG, override)
+    runtime_switch = os.environ.get('LAB_TRACKLET_RECOVERY_ENABLED')
+    if runtime_switch is not None:
+        if runtime_switch not in ('0', '1'):
+            raise MTMCConfigError('LAB_TRACKLET_RECOVERY_ENABLED must be 0 or 1')
+        config['reid']['tracklet_recovery_enabled'] = runtime_switch == '1'
+    return validate_config(config)
 
 
 def public_config(config):

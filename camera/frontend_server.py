@@ -512,6 +512,9 @@ class FrontendHandler(SimpleHTTPRequestHandler):
             f'window.__LAB_RESULT_CONTRACT__ = {json.dumps(os.environ.get("LAB_MEMBER_RESULT_CONTRACT", ""))};</script>'
         )
         html = html.replace("</head>", f"  {bootstrap}\n  </head>", 1)
+        html = html.replace('</head>', '<script src="/static/live_polling.js?v=20261027"></script></head>', 1)
+        if path in {TEMPLATE, DISPLAY_TEMPLATE}:
+            html = html.replace('</body>', '<script src="/static/instrument_events.js?v=20261026"></script></body>')
         self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_GET(self):
@@ -519,6 +522,9 @@ class FrontendHandler(SimpleHTTPRequestHandler):
             return
         parsed = urlsplit(self.path)
         route = parsed.path
+        if route == '/health':
+            self._send_json({'status':'ok', 'service':'lab-frontend'})
+            return
         if route in {"/api/handoff/map", "/api/handoff/positions"}:
             try:
                 payload = read_snapshot(self.server.api_base)
@@ -572,6 +578,13 @@ class FrontendHandler(SimpleHTTPRequestHandler):
             return
         if route == "/api/interaction-results/latest":
             self._proxy_interaction_results(parsed.query)
+            return
+        if route == "/api/instrument-events":
+            runtime = self.server.management
+            if runtime is None:
+                self._send_json({'sessions': [], 'sync': {'state': 'disabled'}}, status=503)
+            else:
+                self._send_json(runtime.instrument_sync.snapshot())
             return
         if route == "/api/instruments/anchors":
             self._send_json(json.loads(INSTRUMENT_CONFIG.read_text(encoding="utf-8")))
@@ -1283,6 +1296,16 @@ def main():
     )
     member_url = os.environ.get("LAB_MEMBER_SERVICE_URL", "").strip()
     member_token = os.environ.get("LAB_MEMBER_SERVICE_TOKEN", "").strip()
+    sync_config = ROOT / 'config' / 'instrument_sync.json'
+    if not member_url and not member_token and sync_config.exists():
+        config = json.loads(sync_config.read_text(encoding='utf-8'))
+        if config.get('enabled'):
+            from instrument_event_sync import read_receiver_token
+            member_url = config['receiver_url']
+            member_token = read_receiver_token(config['credential_target'])
+            os.environ.update(LAB_MEMBER_SERVICE_URL=member_url, LAB_MEMBER_SERVICE_TOKEN=member_token,
+                              LAB_MEMBER_SERVICE_DIRECT='1',
+                              LAB_MEMBER_RESULT_CONTRACT=config.get('result_contract', ''))
     server.member_client = None
     server.member_integration_status = {"configured": False, "status": "disabled"}
     if member_url or member_token:

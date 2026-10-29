@@ -15,6 +15,7 @@ import time
 from handoff_transport import AuthoritySync, bearer_authorized, load_demo_config
 from map_handoff import map_snapshot
 from hd_snapshot import encode_detection_snapshot
+from face_recovery import cached_identity_is_current
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
@@ -1232,12 +1233,15 @@ class CameraWorker:
                 votes_for_track.append(result["person_id"])
                 person_id, votes = Counter(votes_for_track).most_common(1)[0]
                 if votes >= IDENTITY_VOTES_REQUIRED and person_id == result["person_id"]:
-                    identity = {**result, "identity_source": "face"}
+                    identity = {**result, "identity_source": "face",
+                                "_face_confirmed_monotonic": time.monotonic(),
+                                "_face_votes": votes, "_face_camera_id": self.camera["id"],
+                                "_face_local_id": track_id}
                     self.track_identities[track_id] = identity
                     self.identity = identity
                     self.identity_track_id = track_id
                     self.handoff_unknown_count = 0
-                    self.handoff.confirm(self.camera["id"], identity, appearance)
+                    # Share only after set_identity grants the registered identity lock.
                     return identity
             else:
                 votes_for_track.append(None)
@@ -1271,11 +1275,12 @@ class CameraWorker:
         self.identity = None
         self.identity_track_id = None
 
-    def clear_identity(self, track_id=None):
+    def clear_identity(self, track_id=None, *, keep_face_votes=False):
         if track_id is not None:
             track_id = int(track_id)
             self.track_identities.pop(track_id, None)
-            self.identity_votes_by_track.pop(track_id, None)
+            if not keep_face_votes:
+                self.identity_votes_by_track.pop(track_id, None)
             if self.identity_track_id == track_id:
                 self.identity_track_id = None
             self._sync_primary_identity()
@@ -1584,6 +1589,16 @@ class CameraWorker:
             position = track["position"]
             global_id = batch_global_ids[local_id]
             global_ids_by_local_id[local_id] = global_id
+            if (local_id in self.track_identities and not cached_identity_is_current(
+                    self.coordinator, self.track_identities[local_id], global_id)):
+                self.clear_identity(local_id)
+            if (self.coordinator.mtmc_config['reid'].get('tracklet_recovery_enabled')
+                    and local_id in self.track_identities
+                    and not self.coordinator.identity_binding_is_current(
+                        self.track_identities[local_id], global_id, self.camera['id'])):
+                # Clear before rendering/export, rather than drawing a stale
+                # name once and only rejecting it at the end of this frame.
+                self.clear_identity(local_id)
             # A confirmed identity stored by cam_1 is adopted by cam_2 only
             # after this target is physically inside the overlap zone.
             if local_id not in self.track_identities:
@@ -1710,6 +1725,7 @@ class CameraWorker:
         should_check_face = bool(
             self.camera["face_recognition"]
             and self.face_recognition_ready
+            and should_infer and not hold_cached_tracks
             and tracks
             and now - self.last_face_attempt_at
             >= self.camera["face_interval_seconds"]
@@ -1723,7 +1739,8 @@ class CameraWorker:
                 self.last_face_attempt_track_id = target_local_id
                 self.face_attempt_count += 1
                 candidate = run_face_attempt(
-                    self, frame, target_track["box"], target_track.get("track_id")
+                    self, frame, target_track["box"], target_track.get("track_id"),
+                    source_frame=raw_handoff_frame,
                 )
                 if candidate is not None:
                     face_box, face_result = candidate
@@ -1751,10 +1768,10 @@ class CameraWorker:
                     identity,
                     self.camera["id"],
                     current_position,
-                    now=now,
+                    now=time.monotonic(),
                 )
                 if locked_identity is None:
-                    self.clear_identity(identity_local_id)
+                    self.clear_identity(identity_local_id, keep_face_votes=identity.get("identity_source") == "face")
                 else:
                     self.track_identities[identity_local_id] = locked_identity
                     if self.identity_track_id == identity_local_id:

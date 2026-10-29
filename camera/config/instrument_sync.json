@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "receiver_url": "http://127.0.0.1:8765",
+  "credential_target": "LabInteraction1070Ti/local-receiver"
+}
