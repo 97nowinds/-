@@ -3096,6 +3096,17 @@ def api_face_registration():
     return jsonify(face_registration.status())
 
 
+@app.route('/api/face-adaptation/reload', methods=['POST'])
+def api_face_adaptation_reload():
+    token_path=BASE_DIR/'runtime'/'face-adaptation.token'
+    if not token_path.exists() or not bearer_authorized(request.headers, token_path.read_text().strip()):
+        return jsonify({'error':'maintenance authorization required'}),403
+    if face_registration.status().get('active'):
+        return jsonify({'error':'registration session active'}),409
+    face_store.reload()
+    return jsonify({'ok':True})
+
+
 @app.route("/api/face-registration/start", methods=["POST"])
 def api_face_registration_start():
     try:

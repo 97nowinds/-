@@ -518,6 +518,9 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_GET(self):
+        from face_adaptation_api import handle_face_calibration
+        if handle_face_calibration(self, 'GET'):
+            return
         if handle_management(self, 'GET'):
             return
         parsed = urlsplit(self.path)
@@ -618,6 +621,9 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         self.send_error(404, "frontend resource not found")
 
     def do_POST(self):
+        from face_adaptation_api import handle_face_calibration
+        if handle_face_calibration(self, 'POST'):
+            return
         if handle_management(self, 'POST'):
             return
         route = urlsplit(self.path).path

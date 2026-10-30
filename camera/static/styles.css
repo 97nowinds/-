@@ -775,3 +775,9 @@ body {
   .information-rail { grid-template-columns: 1fr; }
   .floor-map-panel { min-height: 360px; }
 }
+
+/* Keep calibration reachable when the dashboard toolbar collapses. */
+.people-panel header .face-calibration-entry { display: inline-flex; align-items: center; min-height: 32px; padding: 4px 8px; border: 1px solid #39818e; border-radius: 5px; color: #86e4e1; background: #103647; text-decoration: none; font-size: 12px; white-space: nowrap; }
+.people-panel header .face-calibration-entry:hover { background: #185365; }
+
+.display-topbar .topbar-actions .tool-link.face-calibration-top { display: inline-flex !important; align-items: center; color: #8ff5dc; border-color: #399d87; background: #103f43; }

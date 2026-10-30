@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>实验室智能安全监测大屏</title>
-    <link rel="stylesheet" href="/static/styles.css?v=state-retry-20260923">
+    <link rel="stylesheet" href="/static/styles.css?v=face-entry-top-20261030">
     <script src="/static/instrument_location.js"></script>
   </head>
   <body>
@@ -26,6 +26,7 @@
           </button>
           <a id="recordingReviewLink" class="tool-link" href="/recordings">路线复核</a>
           <a id="faceCaptureLink" class="tool-link" href="/faces">人脸采集</a>
+          <a class="tool-link face-calibration-top" href="/face-calibration">人脸补充标定</a>
           <a id="calibrationLink" class="tool-link" href="/annotate">地图四点标定</a>
           <span id="serviceState" class="service-state">连接中</span>
         </div>
@@ -134,7 +135,7 @@
           <section class="people-panel display-panel">
             <header>
               <h2>已注册人员</h2>
-              <span>原有样本库</span>
+              <a class="face-calibration-entry" href="/face-calibration">人脸补充标定 ↗</a>
             </header>
             <div id="peopleList" class="people-list"></div>
           </section>
@@ -197,5 +198,13 @@
       </form>
     </dialog>
     <script src="/static/app.js?v=map-sample-20260924"></script>
-  </body>
+  <script>
+// Calibration is hosted by the local frontend, including when this dashboard is served by the GPU API.
+if (location.port !== '5173') {
+  const calibrationUrl = new URL('/face-calibration', location.href);
+  calibrationUrl.port = '5173';
+  document.querySelectorAll('a[href="/face-calibration"]').forEach(link => { link.href = calibrationUrl.href; });
+}
+</script>
+</body>
 </html>
