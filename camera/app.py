@@ -1107,7 +1107,11 @@ class CameraWorker:
             for track in tracks
             if int(track["track_id"]) not in self.track_identities
         ]
-        candidates = unidentified or tracks
+        clock = time.time()
+        overdue = [track for track in tracks
+                   if int(track['track_id']) in self.track_identities
+                   and clock-self.face_attempts_by_track.get(int(track['track_id']), clock) >= 3]
+        candidates = tracks if overdue else unidentified or tracks
         # In a crowd, do not let one large but repeatedly unrecognizable face
         # monopolize every ArcFace attempt. Prefer the least recently checked
         # local track, using face size/confidence only as the tie breaker.
@@ -1143,7 +1147,7 @@ class CameraWorker:
             faces = [record["box"] for record in records]
         else:
             gray, faces = self.detect_faces(crop)
-        if not faces:
+        if len(faces) != 1:
             return None
 
         crop_center_x = crop.shape[1] / 2.0
@@ -1178,10 +1182,20 @@ class CameraWorker:
         detection = self.detect_face_in_person_box(frame, person_box)
         detection_ms = (time.perf_counter() - audit_started) * 1000
         if detection is None:
+            if track_id is not None:
+                self.identity_votes_by_track[int(track_id)].clear()
             self.face_attempt_audit.record(track_id=track_id, detection_ms=detection_ms,
                 total_ms=(time.perf_counter()-audit_started)*1000)
             return None
         face_box, face, aligned_face, embedding = detection
+        from identity_revalidation import face_owned_by_body
+        if not face_owned_by_body(face_box, person_box, getattr(self, '_face_peer_boxes', ())):
+            if track_id is not None:
+                self.identity_votes_by_track[int(track_id)].clear()
+            self.face_attempt_audit.record(track_id=track_id, detection_ms=detection_ms,
+                total_ms=(time.perf_counter()-audit_started)*1000,
+                result={'known': False, 'reason': 'ambiguous_face_owner'})
+            return None
         appearance = self.handoff.appearance(frame, person_box)
         result = self.face_store.predict(
             face,
@@ -1229,6 +1243,14 @@ class CameraWorker:
         if track_id is not None:
             track_id = int(track_id)
             votes_for_track = self.identity_votes_by_track[track_id]
+            now = time.monotonic()
+            if not hasattr(self, '_face_vote_times'):
+                self._face_vote_times = {}
+            previous_at = self._face_vote_times.get(track_id, now)
+            if not votes_for_track or now-previous_at > 10 or (votes_for_track and
+                    votes_for_track[-1] != (result.get('person_id') if result['known'] else None)):
+                votes_for_track.clear()
+                self._face_vote_times[track_id] = now
             if result["known"]:
                 votes_for_track.append(result["person_id"])
                 person_id, votes = Counter(votes_for_track).most_common(1)[0]
@@ -1236,7 +1258,7 @@ class CameraWorker:
                     identity = {**result, "identity_source": "face",
                                 "_face_confirmed_monotonic": time.monotonic(),
                                 "_face_votes": votes, "_face_camera_id": self.camera["id"],
-                                "_face_local_id": track_id}
+                                "_face_local_id": track_id, "_face_revalidation": True}
                     self.track_identities[track_id] = identity
                     self.identity = identity
                     self.identity_track_id = track_id
@@ -1281,12 +1303,14 @@ class CameraWorker:
             self.track_identities.pop(track_id, None)
             if not keep_face_votes:
                 self.identity_votes_by_track.pop(track_id, None)
+                getattr(self, '_face_vote_times', {}).pop(track_id, None)
             if self.identity_track_id == track_id:
                 self.identity_track_id = None
             self._sync_primary_identity()
             return
         self.track_identities.clear()
         self.identity_votes_by_track.clear()
+        getattr(self, '_face_vote_times', {}).clear()
         self.identity = None
         self.identity_track_id = None
         self.identity_votes.clear()
@@ -1741,6 +1765,8 @@ class CameraWorker:
                 candidate = run_face_attempt(
                     self, frame, target_track["box"], target_track.get("track_id"),
                     source_frame=raw_handoff_frame,
+                    peer_boxes=[item['box'] for item in tracks
+                                if item['track_id'] != target_track['track_id']],
                 )
                 if candidate is not None:
                     face_box, face_result = candidate

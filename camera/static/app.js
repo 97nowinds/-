@@ -57,7 +57,7 @@ window.addEventListener('lab-instrument-history', ({detail}) => {
   persistentInstrumentEvents = (detail.sessions || []).slice(0, 3).map(s => ({
     camera_id:s.camera_id, display_name:s.person_label, instrument_name:s.instrument_name,
     observed_at:s.ended_at || s.started_at,
-    interaction_label:s.ended_at ? `结束使用（${s.duration_seconds.toFixed(3)} 秒）` : '开始使用（结束待确认）',
+    interaction_label:s.ended_at ? `结束使用（${s.duration_seconds.toFixed(3)} 秒）` : s.status==='interrupted' ? `中断／结束未确认（${s.interruption_reason}）` : '开始使用（结束待确认）',
   }));
 });
 const interactionDeadlines = new Map();

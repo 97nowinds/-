@@ -1,0 +1,10 @@
+﻿camera,gallery,attempts,correct_candidate_passes,pass_rate,confirmation_count,first_confirmation_seconds,detected_track_samples,confirmed_correct_track_samples,offline_confirmed_track_sample_coverage,other_identity_passes
+cam_1,current,206,1,0.0048543689320388345,0,,925,0,0.0,0
+cam_1,target_added,206,2,0.009708737864077669,0,,925,0,0.0,0
+cam_1,all_added,206,2,0.009708737864077669,0,,925,0,0.0,0
+cam_2,current,203,10,0.04926108374384237,1,64.79668116569519,938,28,0.029850746268656716,0
+cam_2,target_added,203,15,0.07389162561576355,3,20.236180067062378,938,676,0.720682302771855,0
+cam_2,all_added,203,15,0.07389162561576355,3,20.236180067062378,938,676,0.720682302771855,0
+cam_entrance,current,20,0,0.0,0,,55,0,0.0,0
+cam_entrance,target_added,20,1,0.05,0,,55,0,0.0,0
+cam_entrance,all_added,20,1,0.05,0,,55,0,0.0,0

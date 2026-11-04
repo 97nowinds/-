@@ -248,6 +248,14 @@ class ManagementNotifications:
                         item['fire_snapshots'] = {'state': album['state'], 'cameras': json.loads(album['items']),
                             'deliveries': [dict(r) for r in self.db.execute(
                                 'SELECT route_id,state,attempts,error FROM fire_snapshot_deliveries WHERE event_id=?', (row['id'],))]}
+                    if item.get('session_id'):
+                        table=self.db.execute("SELECT 1 FROM sqlite_master WHERE name='instrument_sessions'").fetchone()
+                        current=self.db.execute('SELECT payload FROM instrument_sessions WHERE id=?',(item['session_id'],)).fetchone() if table else None
+                        if current:
+                            observation=json.loads(current[0])
+                            item.update(lifecycle_status=observation['status'],
+                                        interruption_reason=observation.get('interruption_reason'),
+                                        last_valid_source_at=observation.get('last_valid_source_at'))
                     output.append(item)
                 if len(output) >= 100:
                     break

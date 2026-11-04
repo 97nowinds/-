@@ -30,12 +30,14 @@ def scale_box(box, from_shape, to_shape):
     return left, top, max(0, right-left), max(0, bottom-top)
 
 
-def run_face_attempt(worker, frame, box, track_id, *, source_frame=None):
+def run_face_attempt(worker, frame, box, track_id, *, source_frame=None, peer_boxes=()):
     """Isolate a failed optional face stage without assigning an identity."""
     started = time.perf_counter()
     try:
         face_frame = source_frame if source_frame is not None else frame
         face_box = scale_box(box, frame.shape, face_frame.shape) if source_frame is not None else box
+        worker._face_peer_boxes = [scale_box(peer, frame.shape, face_frame.shape)
+                                  if source_frame is not None else peer for peer in peer_boxes]
         candidate = worker.confirm_face_identity(face_frame, face_box, track_id)
         if candidate is not None and source_frame is not None:
             detected_box, result = candidate
@@ -49,6 +51,8 @@ def run_face_attempt(worker, frame, box, track_id, *, source_frame=None):
         logging.error("Face attempt failed camera=%s error_type=%s",
                       worker.camera["id"], type(error).__name__)
         return None
+    finally:
+        worker._face_peer_boxes = ()
     worker.face_recognition_error = None
     return candidate
 

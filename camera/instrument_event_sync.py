@@ -53,7 +53,7 @@ class InstrumentEventSync:
         if any(not isinstance(row.get(k), str) or not 0 < len(row[k]) <= 256 for k in required):
             raise ValueError('Invalid receiver session')
         start, last = stamp(row['started_at']), stamp(row['last_observed_at'])
-        if last < start or row['status'] not in {'open', 'ended'}:
+        if last < start or row['status'] not in {'open', 'ended', 'interrupted'}:
             raise ValueError('Invalid session time or state')
         end = row.get('ended_at')
         if row['status'] == 'ended':
@@ -65,7 +65,7 @@ class InstrumentEventSync:
         elif end is not None or row.get('duration_seconds') is not None:
             raise ValueError('Open session must not have an invented end')
         return {k: row.get(k) for k in (*required, 'ended_at', 'duration_seconds',
-                                      'observed_duration_seconds')}
+                                      'observed_duration_seconds', 'interruption_reason', 'last_valid_source_at', 'observation_window_seconds')}
 
     def ingest(self, body):
         if not isinstance(body, dict) or not isinstance(body.get('sessions'), list):

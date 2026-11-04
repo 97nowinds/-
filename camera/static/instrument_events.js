@@ -24,7 +24,7 @@
       for (const s of data.sessions.slice(0,20)) {
         const row=document.createElement('tr');
         for (const value of [s.person_label,s.camera_id,s.instrument_name,time(s.started_at),time(s.ended_at),
-          s.duration_seconds == null ? '尚未结束' : `${s.duration_seconds.toFixed(3)} 秒`,s.status==='ended'?'已结束':'未取得结束判断']) cell(row,value);
+          s.duration_seconds == null ? '尚未结束' : `${s.duration_seconds.toFixed(3)} 秒`,s.status==='ended'?'已结束':s.status==='interrupted'?'中断／结束未确认：'+s.interruption_reason:'未取得结束判断']) cell(row,value);
         table.append(row);
       }
       if (!data.sessions.length) { const row=document.createElement('tr'); cell(row,'暂无有效仪器使用事件'); table.append(row); }

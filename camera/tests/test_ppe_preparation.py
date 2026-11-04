@@ -77,7 +77,12 @@ class PreparationTests(unittest.TestCase):
         self.assertTrue(self.service.preparation.active('student',self.now+1))
         self.assertTrue(adapter.analysis({**row,'is_interacting':True},index))
         self.assertFalse(self.service.preparation.active('student',self.now+1))
-        self.assertEqual(self.service.db.execute('SELECT count(*) FROM outbox').fetchone()[0],0)
+        # Instrument notifications are independently configurable. Ending the
+        # preparation window must never synthesize a PPE violation.
+        queued = self.service.db.execute(
+            'SELECT e.payload FROM outbox o JOIN events e ON e.id=o.event_id').fetchall()
+        self.assertTrue(all(json.loads(row[0])['event_type']=='instrument.started'
+                            for row in queued))
 
     def test_confirmed_operation_ends_preparation_without_making_a_violation(self):
         self.service.preparation.finish('student',self.now+40,'confirmed_instrument_interaction')

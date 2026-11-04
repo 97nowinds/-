@@ -3,7 +3,7 @@
   "ssh_jump": "xqyi@10.137.145.22",
   "ssh_target": "xqyi@lnx",
   "ssh_identity": "~/.ssh/lab_rtsp_ed25519",
-  "api_port": 15001,
+  "api_port": 15011,
   "ingest_port": 18554,
   "frontend_port": 5173,
   "handoff_port": 5175,
@@ -12,3 +12,4 @@
   "management_enabled": true,
   "hardware_port": "COM3"
 }
+

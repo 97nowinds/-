@@ -1236,7 +1236,10 @@ class CrossCameraTrackCoordinator:
             existing_person = (existing or {}).get("identity", {}).get("person_id")
             if existing_person and existing_person != person_id:
                 if self._identity_is_active(existing, now):
-                    return None
+                    from identity_revalidation import can_replace_local_identity
+                    if not can_replace_local_identity(self.global_tracks.get(global_id),
+                                                      identity, camera_id, now):
+                        return None
                 self._release_identity(global_id)
 
             lock_owner = self.person_locks.get(person_id)

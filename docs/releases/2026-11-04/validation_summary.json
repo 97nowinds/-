@@ -1,0 +1,419 @@
+{
+  "ppe_training": {
+    "mask": {
+      "training_rows": 25,
+      "development_holdout": {
+        "n": 23,
+        "correct": 22,
+        "wrong": 1,
+        "unknown": 0,
+        "correct_over_all": 0.9565217391304348,
+        "coverage": 1.0,
+        "binary_correct": 22,
+        "per_class": {
+          "worn": {
+            "n": 7,
+            "correct": 6
+          },
+          "not_worn": {
+            "n": 16,
+            "correct": 16
+          }
+        }
+      }
+    },
+    "lab_coat": {
+      "training_rows": 57,
+      "development_holdout": {
+        "n": 22,
+        "correct": 17,
+        "wrong": 2,
+        "unknown": 3,
+        "correct_over_all": 0.7727272727272727,
+        "coverage": 0.8636363636363636,
+        "binary_correct": 18,
+        "per_class": {
+          "worn": {
+            "n": 19,
+            "correct": 16
+          },
+          "not_worn": {
+            "n": 3,
+            "correct": 1
+          }
+        }
+      }
+    }
+  },
+  "ppe_reload_validation": {
+    "passed": true,
+    "cases": [
+      {
+        "item": "mask",
+        "sample_id": "4affb941c02dffe7ba9c3ec974ed5d53",
+        "prediction": {
+          "state": "not_worn",
+          "worn_score": 0.05975906178355217,
+          "score_is_calibrated_probability": false,
+          "visibility_checked": false,
+          "mode": "experimental",
+          "notification_eligible": false
+        },
+        "reference_score": 0.05975906178355217
+      },
+      {
+        "item": "mask",
+        "sample_id": "93b700c983bc4a478762a0da6d675f9d",
+        "prediction": {
+          "state": "worn",
+          "worn_score": 0.997385561466217,
+          "score_is_calibrated_probability": false,
+          "visibility_checked": false,
+          "mode": "experimental",
+          "notification_eligible": false
+        },
+        "reference_score": 0.997385561466217
+      },
+      {
+        "item": "lab_coat",
+        "sample_id": "4affb941c02dffe7ba9c3ec974ed5d53",
+        "prediction": {
+          "state": "worn",
+          "worn_score": 0.9999681711196899,
+          "score_is_calibrated_probability": false,
+          "visibility_checked": false,
+          "mode": "experimental",
+          "notification_eligible": false
+        },
+        "reference_score": 0.9999681711196899
+      },
+      {
+        "item": "lab_coat",
+        "sample_id": "93b700c983bc4a478762a0da6d675f9d",
+        "prediction": {
+          "state": "worn",
+          "worn_score": 1.0,
+          "score_is_calibrated_probability": false,
+          "visibility_checked": false,
+          "mode": "experimental",
+          "notification_eligible": false
+        },
+        "reference_score": 1.0
+      }
+    ]
+  },
+  "instrument_sampling": {
+    "before": {
+      "counts": {
+        "insufficient_history": 19,
+        "queued": 3
+      },
+      "decision_counts": {
+        "no_interaction": 3
+      }
+    },
+    "after": {
+      "counts": {
+        "insufficient_history": 7,
+        "queued": 15
+      },
+      "decision_counts": {
+        "no_interaction": 9,
+        "interaction_started": 1,
+        "interaction_active": 5
+      }
+    }
+  },
+  "instrument_deployment": {
+    "changed": "scheduler.buffer_seconds",
+    "before": 3.5,
+    "after": 6.5,
+    "maximum_frames": 32,
+    "unchanged_model_frame_count": 3,
+    "unchanged_model_target_span_seconds": 2,
+    "config_validation": "all three instrument profiles matched canonical catalog",
+    "files": [
+      {
+        "path": "/cluster/dataX/xqyi/joint-migration-20261026/8765/最新版/模块/configs/instrument_registry/runtime_profile.json",
+        "sha256": "39e4de8be492f12f94dbf8a8b913c84f5b3c6f7132aab2bf80ae8df256a98653"
+      },
+      {
+        "path": "/cluster/dataX/xqyi/joint-migration-20261026/8765/临时实时交互网页测试/configs/instrument_001.json",
+        "sha256": "5319cb86eceaeb4742d2de37b7d2d300260f71bb628c416d834bc03bc5e28a34"
+      },
+      {
+        "path": "/cluster/dataX/xqyi/joint-migration-20261026/8765/临时实时交互网页测试/configs/instrument_003.json",
+        "sha256": "45bf1d64da15fbbae878238858ca611121ae2961dd2971181af95c8621e9860a"
+      },
+      {
+        "path": "/cluster/dataX/xqyi/joint-migration-20261026/8765/临时实时交互网页测试/configs/instrument_006.json",
+        "sha256": "bba2b3d8be50eba0245211008260821244718362a67cec95c808cf598bc59664"
+      }
+    ],
+    "backup": "/cluster/home/xqyi/lab-safety-host/camera/runtime/instrument-sampling-fix-20261104/production_backup",
+    "service_restart": true
+  },
+  "face_gallery": {
+    "recording": "normal_single_2k_20261027/20261027_141441",
+    "gallery_status": "approved samples not enrolled; temporary in-memory comparison only",
+    "summary": {
+      "cam_2": {
+        "current": {
+          "attempts": 203,
+          "correct_candidate_passes": 10,
+          "other_identity_passes": 0,
+          "candidate_pass_over_all_attempts": 0.04926108374384237,
+          "reason_counts": {
+            "no_face": 61,
+            "score_or_margin_rejected": 123,
+            "known_candidate": 10,
+            "face_too_small": 9
+          },
+          "three_consecutive_confirmations": [
+            {
+              "camera_id": "cam_2",
+              "local_id": 13,
+              "person_id": "person001",
+              "seconds": 64.79668116569519,
+              "frame_index": 1620
+            }
+          ],
+          "detected_track_samples": 938,
+          "correct_confirmed_track_samples": 28,
+          "wrong_confirmed_track_samples": 0,
+          "offline_confirmed_track_sample_coverage": 0.029850746268656716
+        },
+        "target_added": {
+          "attempts": 203,
+          "correct_candidate_passes": 15,
+          "other_identity_passes": 0,
+          "candidate_pass_over_all_attempts": 0.07389162561576355,
+          "reason_counts": {
+            "no_face": 61,
+            "score_or_margin_rejected": 118,
+            "known_candidate": 15,
+            "face_too_small": 9
+          },
+          "three_consecutive_confirmations": [
+            {
+              "camera_id": "cam_2",
+              "local_id": 2,
+              "person_id": "person001",
+              "seconds": 20.236180067062378,
+              "frame_index": 505
+            },
+            {
+              "camera_id": "cam_2",
+              "local_id": 13,
+              "person_id": "person001",
+              "seconds": 64.79668116569519,
+              "frame_index": 1620
+            },
+            {
+              "camera_id": "cam_2",
+              "local_id": 24,
+              "person_id": "person001",
+              "seconds": 105.20608115196228,
+              "frame_index": 2630
+            }
+          ],
+          "detected_track_samples": 938,
+          "correct_confirmed_track_samples": 676,
+          "wrong_confirmed_track_samples": 0,
+          "offline_confirmed_track_sample_coverage": 0.720682302771855
+        },
+        "all_added": {
+          "attempts": 203,
+          "correct_candidate_passes": 15,
+          "other_identity_passes": 0,
+          "candidate_pass_over_all_attempts": 0.07389162561576355,
+          "reason_counts": {
+            "no_face": 61,
+            "score_or_margin_rejected": 118,
+            "known_candidate": 15,
+            "face_too_small": 9
+          },
+          "three_consecutive_confirmations": [
+            {
+              "camera_id": "cam_2",
+              "local_id": 2,
+              "person_id": "person001",
+              "seconds": 20.236180067062378,
+              "frame_index": 505
+            },
+            {
+              "camera_id": "cam_2",
+              "local_id": 13,
+              "person_id": "person001",
+              "seconds": 64.79668116569519,
+              "frame_index": 1620
+            },
+            {
+              "camera_id": "cam_2",
+              "local_id": 24,
+              "person_id": "person001",
+              "seconds": 105.20608115196228,
+              "frame_index": 2630
+            }
+          ],
+          "detected_track_samples": 938,
+          "correct_confirmed_track_samples": 676,
+          "wrong_confirmed_track_samples": 0,
+          "offline_confirmed_track_sample_coverage": 0.720682302771855
+        }
+      },
+      "cam_1": {
+        "current": {
+          "attempts": 206,
+          "correct_candidate_passes": 1,
+          "other_identity_passes": 0,
+          "candidate_pass_over_all_attempts": 0.0048543689320388345,
+          "reason_counts": {
+            "no_face": 193,
+            "score_or_margin_rejected": 5,
+            "known_candidate": 1,
+            "face_too_small": 7
+          },
+          "three_consecutive_confirmations": [],
+          "detected_track_samples": 925,
+          "correct_confirmed_track_samples": 0,
+          "wrong_confirmed_track_samples": 0,
+          "offline_confirmed_track_sample_coverage": 0.0
+        },
+        "target_added": {
+          "attempts": 206,
+          "correct_candidate_passes": 2,
+          "other_identity_passes": 0,
+          "candidate_pass_over_all_attempts": 0.009708737864077669,
+          "reason_counts": {
+            "no_face": 193,
+            "known_candidate": 2,
+            "score_or_margin_rejected": 4,
+            "face_too_small": 7
+          },
+          "three_consecutive_confirmations": [],
+          "detected_track_samples": 925,
+          "correct_confirmed_track_samples": 0,
+          "wrong_confirmed_track_samples": 0,
+          "offline_confirmed_track_sample_coverage": 0.0
+        },
+        "all_added": {
+          "attempts": 206,
+          "correct_candidate_passes": 2,
+          "other_identity_passes": 0,
+          "candidate_pass_over_all_attempts": 0.009708737864077669,
+          "reason_counts": {
+            "no_face": 193,
+            "known_candidate": 2,
+            "score_or_margin_rejected": 4,
+            "face_too_small": 7
+          },
+          "three_consecutive_confirmations": [],
+          "detected_track_samples": 925,
+          "correct_confirmed_track_samples": 0,
+          "wrong_confirmed_track_samples": 0,
+          "offline_confirmed_track_sample_coverage": 0.0
+        }
+      },
+      "cam_entrance": {
+        "current": {
+          "attempts": 20,
+          "correct_candidate_passes": 0,
+          "other_identity_passes": 0,
+          "candidate_pass_over_all_attempts": 0.0,
+          "reason_counts": {
+            "no_face": 11,
+            "score_or_margin_rejected": 8,
+            "face_blurry": 1
+          },
+          "three_consecutive_confirmations": [],
+          "detected_track_samples": 55,
+          "correct_confirmed_track_samples": 0,
+          "wrong_confirmed_track_samples": 0,
+          "offline_confirmed_track_sample_coverage": 0.0
+        },
+        "target_added": {
+          "attempts": 20,
+          "correct_candidate_passes": 1,
+          "other_identity_passes": 0,
+          "candidate_pass_over_all_attempts": 0.05,
+          "reason_counts": {
+            "no_face": 11,
+            "score_or_margin_rejected": 7,
+            "known_candidate": 1,
+            "face_blurry": 1
+          },
+          "three_consecutive_confirmations": [],
+          "detected_track_samples": 55,
+          "correct_confirmed_track_samples": 0,
+          "wrong_confirmed_track_samples": 0,
+          "offline_confirmed_track_sample_coverage": 0.0
+        },
+        "all_added": {
+          "attempts": 20,
+          "correct_candidate_passes": 1,
+          "other_identity_passes": 0,
+          "candidate_pass_over_all_attempts": 0.05,
+          "reason_counts": {
+            "no_face": 11,
+            "score_or_margin_rejected": 7,
+            "known_candidate": 1,
+            "face_blurry": 1
+          },
+          "three_consecutive_confirmations": [],
+          "detected_track_samples": 55,
+          "correct_confirmed_track_samples": 0,
+          "wrong_confirmed_track_samples": 0,
+          "offline_confirmed_track_sample_coverage": 0.0
+        }
+      }
+    },
+    "overall": {
+      "current": {
+        "attempts": 429,
+        "correct_candidate_passes": 11,
+        "candidate_pass_over_all_attempts": 0.02564102564102564,
+        "detected_track_samples": 1918,
+        "correct_confirmed_track_samples": 28,
+        "offline_confirmed_track_sample_coverage": 0.014598540145985401,
+        "other_identity_passes": 0
+      },
+      "target_added": {
+        "attempts": 429,
+        "correct_candidate_passes": 18,
+        "candidate_pass_over_all_attempts": 0.04195804195804196,
+        "detected_track_samples": 1918,
+        "correct_confirmed_track_samples": 676,
+        "offline_confirmed_track_sample_coverage": 0.3524504692387904,
+        "other_identity_passes": 0
+      },
+      "all_added": {
+        "attempts": 429,
+        "correct_candidate_passes": 18,
+        "candidate_pass_over_all_attempts": 0.04195804195804196,
+        "detected_track_samples": 1918,
+        "correct_confirmed_track_samples": 676,
+        "offline_confirmed_track_sample_coverage": 0.3524504692387904,
+        "other_identity_passes": 0
+      }
+    },
+    "added_counts": {
+      "006": 12,
+      "person001": 16,
+      "person3": 6,
+      "person4": 3,
+      "person8": 10,
+      "person1": 0,
+      "person2": 0,
+      "person7": 0
+    },
+    "same_recording_samples_excluded": 4,
+    "limitations": [
+      "Saved body tracks are fixed; detector and ReID were not retrained or changed.",
+      "Coverage is offline three-consecutive-vote coverage of saved body-track samples before global identity locks, not exact online name display or frame-annotated identity accuracy.",
+      "This single-person positive recording cannot measure multi-person false identity rate.",
+      "Four approved reference images originating from this test recording were excluded from all expanded galleries.",
+      "The temporary gallery is not enrolled or reloaded into production."
+    ]
+  }
+}

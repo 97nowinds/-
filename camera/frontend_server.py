@@ -515,6 +515,7 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         html = html.replace('</head>', '<script src="/static/live_polling.js?v=20261027"></script></head>', 1)
         if path in {TEMPLATE, DISPLAY_TEMPLATE}:
             html = html.replace('</body>', '<script src="/static/instrument_events.js?v=20261026"></script></body>')
+            html = html.replace('</body>', '<script src="/static/ppe_replay.js?v=20261103"></script></body>')
         self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
 
     def do_GET(self):
@@ -525,6 +526,18 @@ class FrontendHandler(SimpleHTTPRequestHandler):
             return
         parsed = urlsplit(self.path)
         route = parsed.path
+        if route in {'/api/ppe/replay-test', '/api/ppe/replay-test/evidence.jpg'}:
+            if self.client_address[0] not in {'127.0.0.1', '::1'}:
+                self._send_json({'error': 'local replay test only'}, status=403)
+                return
+            base = ROOT / 'runtime' / 'ppe-replay-test'
+            if route.endswith('.jpg'):
+                self._send_bytes((base / 'evidence22.jpg').read_bytes(), 'image/jpeg')
+            else:
+                report = base / 'report.json'
+                self._send_json(json.loads(report.read_text(encoding='utf-8')) if report.exists()
+                                else {'test_mode': 'not_run'})
+            return
         if route == '/health':
             self._send_json({'status':'ok', 'service':'lab-frontend'})
             return

@@ -1,0 +1,182 @@
+{
+  "runtime_profile.json": {
+    "schema_version": "temporary_live_web_0.1",
+    "status": "temporary_manual_candidate_test_only",
+    "cross_service_status": "not_used",
+    "production_ready": false,
+    "model": {
+      "frame_count": 3,
+      "temporal_span_seconds": 2,
+      "downsample_mode": "4x",
+      "max_new_tokens": 1,
+      "dtype": "bfloat16",
+      "attention": "sdpa"
+    },
+    "scheduler": {
+      "buffer_seconds": 6.5,
+      "max_frames_per_camera": 32,
+      "candidate_interval_seconds": 0.8,
+      "max_frame_age_seconds": 2,
+      "minimum_temporal_span_seconds": 1.8,
+      "result_ttl_seconds": 5,
+      "strategy": "latest_only_single_manual_candidate",
+      "batching": false
+    },
+    "localization": {
+      "detector": "opencv_aruco_apriltag_36h11",
+      "transform": "partial_affine",
+      "quality_gate": true,
+      "last_good_geometry": true,
+      "homography_allowed": false,
+      "fixed_roi_fallback_allowed": false
+    }
+  },
+  "instrument_001.json": {
+    "schema_version": "temporary_live_web_0.1",
+    "instrument_archive": {
+      "catalog": "../../最新版/模块/configs/instrument_registry/catalog.json",
+      "instrument_id": "instrument_001"
+    },
+    "status": "temporary_manual_candidate_test_only",
+    "cross_service_status": "not_used",
+    "production_ready": false,
+    "model": {
+      "frame_count": 3,
+      "temporal_span_seconds": 2.0,
+      "downsample_mode": "4x",
+      "max_new_tokens": 1,
+      "dtype": "bfloat16",
+      "attention": "sdpa"
+    },
+    "scheduler": {
+      "buffer_seconds": 6.5,
+      "max_frames_per_camera": 32,
+      "candidate_interval_seconds": 0.8,
+      "max_frame_age_seconds": 2.0,
+      "minimum_temporal_span_seconds": 1.8,
+      "result_ttl_seconds": 5.0,
+      "strategy": "latest_only_single_manual_candidate",
+      "batching": false
+    },
+    "localization": {
+      "detector": "opencv_aruco_apriltag_36h11",
+      "transform": "partial_affine",
+      "quality_gate": true,
+      "last_good_geometry": true,
+      "homography_allowed": false,
+      "fixed_roi_fallback_allowed": false
+    },
+    "cameras": {
+      "cam_2": {
+        "roi_mode": "fixed_reference_pixels",
+        "view_id": "lab_camera_view_1",
+        "instrument_id": "instrument_001",
+        "instrument_name": "精密电子天平",
+        "tag_id": 41,
+        "calibration": "../../最新版/模块/configs/confirmed_runtime_assets/instrument_001_tag41_roi_v2_candidate.json",
+        "quality_thresholds": "../../最新版/模块/configs/phase2_pilot_confirmed/instrument_001_tag41_geometry_thresholds_20260921.json",
+        "component_focus": {
+          "roi": "../../最新版/模块/configs/confirmed_runtime_assets/instrument_001_control_panel_roi_candidate.json",
+          "polygon_key": "control_panel_roi_reference_px",
+          "component_name": "BUTTON PANEL DETAIL",
+          "presentation": "marker_and_inset",
+          "interaction_definition": "品红色多边形只用于标明精密电子天平的按键操作区域，右侧是同一区域的放大图；标记和放大图本身绝不是交互证据。只有画面中清楚可见指定人员的手、手掌或手指进入或覆盖品红色多边形内部时才输出1。手仅在附近、看不清是否进入、人员只是靠近或观察、以及操作旁边的超声波清洗机时都输出0。"
+        }
+      }
+    }
+  },
+  "instrument_003.json": {
+    "schema_version": "temporary_live_web_0.1",
+    "instrument_archive": {
+      "catalog": "../../最新版/模块/configs/instrument_registry/catalog.json",
+      "instrument_id": "instrument_003"
+    },
+    "status": "temporary_manual_candidate_test_only",
+    "cross_service_status": "not_used",
+    "production_ready": false,
+    "model": {
+      "frame_count": 3,
+      "temporal_span_seconds": 2.0,
+      "downsample_mode": "4x",
+      "max_new_tokens": 1,
+      "dtype": "bfloat16",
+      "attention": "sdpa"
+    },
+    "scheduler": {
+      "buffer_seconds": 6.5,
+      "max_frames_per_camera": 32,
+      "candidate_interval_seconds": 0.8,
+      "max_frame_age_seconds": 2.0,
+      "minimum_temporal_span_seconds": 1.8,
+      "result_ttl_seconds": 5.0,
+      "strategy": "latest_only_single_manual_candidate",
+      "batching": false
+    },
+    "localization": {
+      "detector": "opencv_aruco_apriltag_36h11",
+      "transform": "partial_affine",
+      "quality_gate": true,
+      "last_good_geometry": true,
+      "homography_allowed": false,
+      "fixed_roi_fallback_allowed": false
+    },
+    "cameras": {
+      "cam_2": {
+        "roi_mode": "fixed_reference_pixels",
+        "view_id": "lab_camera_view_1",
+        "instrument_id": "instrument_003",
+        "instrument_name": "超声波清洗机",
+        "tag_id": 31,
+        "calibration": "../../最新版/模块/configs/phase2_pilot_confirmed/instrument_003_tag31_calibration_20260921.json",
+        "quality_thresholds": "../../最新版/模块/configs/phase2_pilot_confirmed/instrument_003_tag31_geometry_thresholds_20260921.json"
+      }
+    }
+  },
+  "instrument_006.json": {
+    "schema_version": "temporary_live_web_0.1",
+    "instrument_archive": {
+      "catalog": "../../最新版/模块/configs/instrument_registry/catalog.json",
+      "instrument_id": "instrument_006"
+    },
+    "status": "temporary_manual_candidate_test_only",
+    "cross_service_status": "not_used",
+    "production_ready": false,
+    "model": {
+      "frame_count": 3,
+      "temporal_span_seconds": 2.0,
+      "downsample_mode": "4x",
+      "max_new_tokens": 1,
+      "dtype": "bfloat16",
+      "attention": "sdpa"
+    },
+    "scheduler": {
+      "buffer_seconds": 6.5,
+      "max_frames_per_camera": 32,
+      "candidate_interval_seconds": 0.8,
+      "max_frame_age_seconds": 2.0,
+      "minimum_temporal_span_seconds": 1.8,
+      "result_ttl_seconds": 5.0,
+      "strategy": "latest_only_single_manual_candidate",
+      "batching": false
+    },
+    "localization": {
+      "detector": "opencv_aruco_apriltag_36h11",
+      "transform": "partial_affine",
+      "quality_gate": true,
+      "last_good_geometry": true,
+      "homography_allowed": false,
+      "fixed_roi_fallback_allowed": false
+    },
+    "cameras": {
+      "cam_1": {
+        "roi_mode": "fixed_reference_pixels",
+        "view_id": "lab_camera_view_2",
+        "instrument_id": "instrument_006",
+        "instrument_name": "高速离心机",
+        "tag_id": 21,
+        "calibration": "../../最新版/模块/configs/phase2_pilot_confirmed/instrument_006_tag21_calibration_fixed_20261007.json",
+        "quality_thresholds": "../../最新版/模块/configs/phase2_pilot_confirmed/instrument_006_tag21_geometry_thresholds_recalibrated_20260920.json"
+      }
+    }
+  }
+}
