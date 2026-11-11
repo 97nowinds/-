@@ -5,7 +5,7 @@ const LabTwin3D = (() => {
 
   function create(host) {
     const T = window.THREE;
-    const renderer = new T.WebGLRenderer({antialias:true, alpha:true});
+    const renderer = new T.WebGLRenderer({antialias:true, alpha:true, preserveDrawingBuffer:true});
     renderer.setPixelRatio(Math.min(devicePixelRatio, 1.25));
     renderer.toneMapping = T.ACESFilmicToneMapping;
     renderer.shadowMap.enabled = true;

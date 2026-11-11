@@ -6,6 +6,8 @@
   html,body,#scene { width:100%; height:100%; margin:0; overflow:hidden; }
   #scene { position:relative; background:#071624; }
   #scene .twin-reset, #scene .twin-stage-hint { display:none; }
+  #scene canvas { position:absolute; opacity:0; }
+  #scene .rendered-model { position:absolute; inset:0; width:100%; height:100%; }
 </style>
 <div id="scene" class="twin-viewport"></div>
 <script src="three-r160.min.js"></script>
@@ -15,11 +17,29 @@
   const info = gl?.getExtension("WEBGL_debug_renderer_info");
   window.labRendererGPU = info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : null;
   gl?.getExtension("WEBGL_lose_context")?.loseContext();
-  window.renderLabFrame = ({map, equipment, trails, view}) => {
+  window.renderLabFrame = async ({map, equipment, trails, view}) => {
     if (!LabTwin3D.render(document.querySelector("#scene"), map, equipment,
         person => person.label, new Map(trails))) throw new Error("WebGL unavailable");
     LabTwin3D.setCamera(view);
-    return new Promise(resolve => requestAnimationFrame(() =>
-      requestAnimationFrame(() => resolve(LabTwin3D.instrumentBounds()))));
+    const canvas = document.querySelector("#scene canvas");
+    const sample = document.createElement("canvas");
+    sample.width = sample.height = 32;
+    const context = sample.getContext("2d", {willReadFrequently:true});
+    context.drawImage(canvas, 0, 0, 32, 32);
+    const pixels = context.getImageData(0, 0, 32, 32).data;
+    const colors = new Set();
+    for (let i = 0; i < pixels.length; i += 4) {
+      colors.add((pixels[i] << 16) | (pixels[i+1] << 8) | pixels[i+2]);
+    }
+    if (colors.size < 8) throw new Error("3D canvas returned a blank frame");
+    let model = document.querySelector("#scene .rendered-model");
+    if (!model) {
+      model = document.createElement("img");
+      model.className = "rendered-model";
+      canvas.after(model);
+    }
+    model.src = canvas.toDataURL("image/png");
+    await model.decode();
+    return LabTwin3D.instrumentBounds();
   };
 </script>

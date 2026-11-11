@@ -115,6 +115,7 @@ const ClusterTwin = (() => {
       schedule();
     }, {passive:false});
     root.classList.add("cluster-twin");
+    root.style.zIndex = "2";
     root.append(frame,status,reset);
     host.append(root);
   }

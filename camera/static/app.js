@@ -641,7 +641,10 @@ function renderFloorMap(floorMap) {
   updateFloorTrails(floorMap);
   floorMapSvg.parentElement.classList.toggle("twin-viewport", twinView);
   const clusterTwin = typeof ClusterTwin === "undefined" ? null : ClusterTwin;
-  const webgl = twinView && clusterTwin?.render(floorMapSvg.parentElement, floorMap, equipment, personLabel, floorTrails);
+  const clusterFrame = twinView && clusterTwin?.render(floorMapSvg.parentElement, floorMap, equipment, personLabel, floorTrails);
+  const localTwin = typeof LabTwin3D === "undefined" ? null : LabTwin3D;
+  const webgl = clusterFrame || (twinView && localTwin?.render(floorMapSvg.parentElement, floorMap, equipment, personLabel, floorTrails));
+  if (clusterFrame || !twinView) localTwin?.hide();
   if (!twinView) clusterTwin?.hide();
   twinLayer.style.display = twinView && !webgl ? "" : "none";
   for (const layer of [floorMapStatic, floorMapPeopleLayer, floorMapTrailsLayer]) {
