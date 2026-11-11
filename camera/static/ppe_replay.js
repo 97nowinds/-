@@ -1,4 +1,5 @@
 (() => {
+  if (document.body.classList.contains('presentation-blue')) return;
   const section = document.createElement('section');
   section.id = 'ppeReplayTest';
   section.style.cssText = 'margin:20px 0;padding:20px;border:2px solid #eab308;border-radius:12px;background:#11283c;color:white';

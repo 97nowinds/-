@@ -129,7 +129,7 @@ class SafetyTests(unittest.TestCase):
         secret_path=root/'synthetic.dpapi';secret_path.write_bytes(b'synthetic')
         credentials={'management_admin_token':'synthetic-admin','groups':{name:{'webhook':'https://synthetic.invalid'}
             for name in ['experimenters','managers','administrators']}}
-        server=SimpleNamespace(api_base='http://127.0.0.1:15001',live_publisher=None)
+        server=SimpleNamespace(api_base='http://127.0.0.1:15001',live_publisher=None,member_client=None)
         with patch.object(feishu_app,'EVIDENCE_CREDENTIALS',secret_path),patch.object(feishu_app,'load_credentials',return_value=credentials):
             runtime=ManagementRuntime(server,path)
             self.assertEqual({r['id'] for r in runtime.service.config['routes']},{'experimenters','managers','administrators'})
@@ -139,20 +139,61 @@ class SafetyTests(unittest.TestCase):
             try:self.assertEqual(restored.service.config['routes'],custom)
             finally:restored.service.db.close()
 
-    def test_ppe_distinct_frames_unknown_reset_and_escalation(self):
-        self.service.config['ppe_confirmation']={'minimum_frames':3,'minimum_seconds':2,'maximum_gap_seconds':5,'escalation_seconds':6}
+    def record_warning(self, candidate, person='p1'):
+        suffix = 'red' if candidate['severity'] == 'L3' else 'yellow:'+candidate['warning_number']
+        return self.service.record({**candidate, 'event_id': candidate['incident_id']+':'+suffix,
+            'event_type': 'safety.no_mask', 'lab_id': 'lab', 'person_id': person,
+            'observed_at': iso(self.now)})
+
+    def test_five_ppe_warnings_then_one_admin_escalation(self):
+        settings = {'minimum_frames':3, 'minimum_seconds':2, 'maximum_gap_seconds':5,
+                    'escalation_seconds':6}
+        self.config['ppe_confirmation'] = self.service.config['ppe_confirmation'] = settings
+        path = Path(self.temp.name)/'state.db'
+        outputs = []
+        for frame in range(29):
+            self.now += 2
+            candidate = self.service.ppe_policy.observe('p1', 'safety.no_mask', None, self.now,
+                'f'+str(frame), 'unknown' if frame == 4 else 'not_worn')
+            if candidate:
+                self.assertTrue(self.record_warning(candidate))
+                self.assertFalse(self.record_warning(candidate))
+                outputs.append(candidate)
+            if frame == 12:
+                self.service.db.close()
+                self.service = ManagementNotifications(path, self.config, self.env,
+                    wall=lambda:self.now, sender=lambda url,payload:self.sent.append((url,payload)))
+            self.service.deliver_once()
+        self.assertEqual([(e['severity'],e['warning_number']) for e in outputs],
+                         [('L1',str(n)) for n in range(1,6)]+[('L3','5')])
+        self.assertEqual(len({e['incident_id'] for e in outputs}),1)
+        self.assertEqual(sum(url.endswith('experimenters') for url,_ in self.sent),5)
+        self.assertEqual(sum(url.endswith('managers') for url,_ in self.sent),4)
+        admins = [payload for url,payload in self.sent if url.endswith('administrators')]
+        self.assertEqual(len(admins),1)
+        self.assertIn('连续五次黄色警告',admins[0]['content']['text'])
+        self.assertEqual(self.service.incidents.display_warnings(),[
+            {'event_type':'safety.no_mask','severity':'L3','observed_at':
+             self.service.events(self.admin)[0]['observed_at'],'warning_number':'5'}])
+        self.service.ppe_policy.observe('p1','safety.no_mask',None,self.now+1,'recovery','worn')
+        self.assertEqual(self.service.incidents.display_warnings(),[])
+
+    def test_acknowledgement_cancels_pending_ppe_warnings_and_stops_escalation(self):
+        self.service.config['ppe_confirmation']={'minimum_frames':2,'minimum_seconds':1,
+            'maximum_gap_seconds':5,'escalation_seconds':6}
         policy=self.service.ppe_policy
         self.assertIsNone(policy.observe('p1','safety.no_mask',None,self.now,'f1','not_worn'))
-        self.assertIsNone(policy.observe('p1','safety.no_mask',None,self.now+2,'f1','not_worn'))
-        policy.observe('p1','safety.no_mask',None,self.now+3,'f2','unknown')
-        self.assertIsNone(policy.observe('p1','safety.no_mask',None,self.now+4,'f3','not_worn'))
-        policy.observe('p1','safety.no_mask',None,self.now+5,'f4','not_worn')
-        first=policy.observe('p1','safety.no_mask',None,self.now+6,'f5','not_worn');self.assertEqual(first['severity'],'L1')
-        policy.observe('p1','safety.no_mask',None,self.now+8,'f6','not_worn')
-        self.assertIsNone(policy.observe('p1','safety.no_mask',None,self.now+10,'f7','not_worn'))
-        escalation=policy.observe('p1','safety.no_mask',None,self.now+12,'f8','not_worn')
-        self.assertEqual(escalation['severity'],'L2');self.assertEqual(escalation['incident_id'],first['incident_id'])
-        self.assertIsNone(policy.observe('p1','safety.no_mask',None,self.now+13,'f9','worn'))
+        self.now+=1
+        self.assertIsNone(policy.observe('p1','safety.no_mask',None,self.now,'f1','not_worn'))
+        candidate=policy.observe('p1','safety.no_mask',None,self.now,'f2','not_worn')
+        self.assertTrue(self.record_warning(candidate))
+        self.service.incidents.transition(self.admin,candidate['incident_id'],'ack')
+        for frame in range(12):
+            self.now+=2
+            self.assertIsNone(policy.observe('p1','safety.no_mask',None,self.now,'new'+str(frame),'not_worn'))
+        self.assertFalse(self.service.deliver_once())
+        self.assertEqual(self.service.events(self.admin)[0]['deliveries'][0]['state'],'cancelled')
+        self.assertEqual(self.service.incidents.display_warnings(),[])
 
     def test_registry_shared_immutable_encrypted_and_expiring(self):
         path=Path(self.temp.name)/'registry.db'

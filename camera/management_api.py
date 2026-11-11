@@ -38,7 +38,7 @@ class ManagementRuntime:
                     ppe=['safety.no_mask','safety.no_lab_coat','safety.no_gloves']
                     routes=[{'id':key,'audience':key,'transport':'webhook','labs':[config['lab_id']],
                         'event_types':(['environment.flame','environment.flame_recovered']+
-                                       (ppe if key in {'experimenters','managers'} else [])),
+                                       ppe),
                         'webhook_env':'LAB_FEISHU_'+key.upper()+'_WEBHOOK',
                         'secret_env':'LAB_FEISHU_'+key.upper()+'_SECRET'} for key in audiences]
                     with self.service.lock,self.service.db:
@@ -49,6 +49,7 @@ class ManagementRuntime:
                             if {r['id'] for r in self.service.config['routes']}<={'laboratory_group'}:
                                 self.service.set_routes({'id':'runtime-policy-migration','role':'admin'},routes)
                             self.service.db.execute('INSERT INTO settings VALUES(?,?)',('group_policy_version','20261015'))
+        self._enable_admin_escalation()
         from alert_evidence import AlertEvidence
         import os
         image_token=os.environ.get('LAB_HANDOFF_IMAGE_READ_TOKEN','')
@@ -65,12 +66,32 @@ class ManagementRuntime:
         self.shared_index=SnapshotTrackIndex(max_snapshots=1200)
         self.stop_event = threading.Event()
         self.last_poll_status = 'starting'
+        self.ppe_live_status = {'state': 'waiting', 'received_frames': 0}
+        self.handoff_credentials = handoff_credentials
         self.thread = None
         from instrument_event_sync import InstrumentEventSync
         self.instrument_sync = InstrumentEventSync(self.service, server.member_client)
         from fire_snapshot_album import FireSnapshotAlbums, FrozenSceneCapture
         self.fire_albums = FireSnapshotAlbums(self.service, FrozenSceneCapture(
             self.service, Path(config_path).parent.parent/'runtime'/'handoff-credentials.json'))
+
+    def _enable_admin_escalation(self):
+        service = self.service
+        with service.lock, service.db:
+            key = 'ppe_admin_escalation_route_v1'
+            if service.db.execute('SELECT 1 FROM settings WHERE key=?', (key,)).fetchone():
+                return
+            routes = service.config['routes']
+            for route in routes:
+                if (route.get('audience', route['id']) == 'administrators'
+                        and route['webhook_env'] == 'LAB_FEISHU_ADMINISTRATORS_WEBHOOK'
+                        and set(route['event_types']) == {'environment.flame', 'environment.flame_recovered'}):
+                    upgraded = {**route, 'event_types': route['event_types'] +
+                                ['safety.no_mask', 'safety.no_lab_coat', 'safety.no_gloves']}
+                    service.set_routes({'id':'runtime-policy-migration', 'role':'admin'},
+                                       [upgraded if item is route else item for item in routes])
+                    break
+            service.db.execute('INSERT INTO settings VALUES(?,?)', (key, 'applied'))
 
     def index(self):
         publisher = self.server.live_publisher
@@ -156,7 +177,7 @@ def handle_management(handler, method):
         handler._send_json({'error': 'authentication required'}, status=401)
         return True
     try:
-        if principal['role'] == 'producer' and path != '/api/management/evidence':
+        if principal['role'] == 'producer' and path not in {'/api/management/evidence', '/api/management/ppe-live'}:
             raise PermissionError('producer can only submit evidence')
         if method=='GET' and path=='/api/management/me':
             handler._send_json({k:v for k,v in principal.items() if k!='token_env'})
@@ -217,6 +238,29 @@ def handle_management(handler, method):
             with service.lock:
                 rows = [dict(row) for row in service.db.execute('SELECT * FROM audit ORDER BY id DESC LIMIT 100')]
             handler._send_json({'audit': rows})
+        elif method == 'POST' and path == '/api/management/ppe-live':
+            if principal['role'] != 'producer' or service.config['lab_id'] not in principal.get('labs', []):
+                raise PermissionError('producer scope required')
+            length = int(handler.headers.get('Content-Length', '0'))
+            if not 0 < length <= 262144:
+                raise ValueError('invalid PPE body size')
+            body = json.loads(handler.rfile.read(length))
+            if body['frozen']['camera_id'] not in principal.get('cameras', []):
+                raise PermissionError('producer camera scope required')
+            from urllib.request import Request, build_opener, ProxyHandler
+            from management_notifications import iso
+            from ppe_live_ingress import ingest
+            try:
+                credentials = json.loads(runtime.handoff_credentials.read_text(encoding='utf-8-sig'))
+                request = Request('http://127.0.0.1:5177/api/handoff/time-sync',
+                    data=json.dumps({'probe_id': 'ppe_authority', 'client_sent_at': iso(service.wall())}).encode(),
+                    headers={'Content-Type': 'application/json', 'Authorization': 'Bearer '+credentials['sync_read_token']})
+                with build_opener(ProxyHandler({})).open(request, timeout=3) as response:
+                    authority = json.load(response)['authority_clock']
+            except OSError:
+                handler._send_json({'error': 'time authority unavailable'}, status=503)
+                return True
+            handler._send_json(ingest(runtime, body, authority))
         elif method == 'POST' and path in {'/api/management/ack', '/api/management/routes', '/api/management/evidence'}:
             length = int(handler.headers.get('Content-Length', '0'))
             if length < 1 or length > 16384:

@@ -1,3 +1,32 @@
-{
-  "instruments": []
+{"instruments": [],
+  "equipment": [
+    {"instrument_id": "map_fume_hood", "name": "通风橱 1 号", "placement_group": "第一列", "kind": "fume_hood"},
+    {"instrument_id": "map_fume_hood_2", "name": "通风橱 2 号", "placement_group": "第一列", "kind": "fume_hood"},
+    {"instrument_id": "map_hood_computer", "name": "电脑", "placement_group": "第一列", "kind": "computer"},
+    {"instrument_id": "map_ultrapure_water_system", "name": "超纯水机", "placement_group": "第一列", "kind": "water_system"},
+    {"instrument_id": "map_hot_oven", "name": "烘箱（热）", "placement_group": "第二列", "kind": "oven"},
+    {"instrument_id": "instrument_001", "name": "精密电子天平 1 号", "kind": "balance", "placement_group": "第二列"},
+    {"instrument_id": "instrument_001_map_2", "name": "精密电子天平 2 号", "kind": "balance", "placement_group": "第二列"},
+    {"instrument_id": "instrument_001_map_4", "name": "精密电子天平 4 号", "kind": "balance", "placement_group": "第二列"},
+    {"instrument_id": "instrument_007", "name": "智能恒温加热台", "kind": "heater", "placement_group": "第二列"},
+    {"instrument_id": "map_ultrasonic_cleaner_extra", "name": "超声波清洁器", "kind": "cleaner", "placement_group": "第二列"},
+    {"instrument_id": "instrument_003", "name": "超声波清洗机", "kind": "cleaner", "placement_group": "第二列"},
+    {"instrument_id": "map_electronic_scale", "name": "电子秤", "kind": "scale", "placement_group": "第二列"},
+    {"instrument_id": "instrument_008", "name": "多点式磁力搅拌机", "kind": "stirrer", "placement_group": "第二列"},
+    {"instrument_id": "map_vacuum_oven", "name": "真空烘箱", "placement_group": "第三列", "kind": "vacuum_oven"},
+    {"instrument_id": "map_vacuum_pump_col3", "name": "真空泵（第三列）", "placement_group": "第三列", "kind": "pump"},
+    {"instrument_id": "map_magnetic_stirrer", "name": "磁力搅拌机", "kind": "single_stirrer", "placement_group": "第三列"},
+    {"instrument_id": "map_water_bath", "name": "水浴锅", "placement_group": "第三列", "kind": "bath"},
+    {"instrument_id": "map_viscometer", "name": "粘度计", "placement_group": "第三列", "kind": "viscometer"},
+    {"instrument_id": "map_electric_stirrer", "name": "电动搅拌机", "kind": "overhead_stirrer", "placement_group": "第三列"},
+    {"instrument_id": "map_grinder", "name": "粉碎机", "placement_group": "第三列", "kind": "grinder"},
+    {"instrument_id": "instrument_006", "name": "高速离心机", "kind": "centrifuge", "placement_group": "第三列"},
+    {"instrument_id": "map_mixer", "name": "搅拌机", "kind": "overhead_stirrer", "placement_group": "第三列"},
+    {"instrument_id": "map_freeze_dryer", "name": "冻干机", "placement_group": "第四列", "kind": "freeze_dryer"},
+    {"instrument_id": "map_vacuum_pump_col4", "name": "真空泵（第四列）", "placement_group": "第四列", "kind": "pump"},
+    {"instrument_id": "map_suction_dryer", "name": "抽干机", "placement_group": "第四列", "kind": "dryer"},
+    {"instrument_id": "map_ultrasonic_cell_disruptor", "name": "超声波细胞粉碎机", "placement_group": "第四列", "kind": "sonicator"},
+    {"instrument_id": "map_reagent_cabinet", "name": "药品柜", "placement_group": "存放设施", "kind": "reagent_cabinet"},
+    {"instrument_id": "map_chemical_storage", "name": "化学品存放区", "placement_group": "存放设施", "kind": "chemical_cabinet"}
+  ]
 }

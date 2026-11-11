@@ -5,7 +5,7 @@ import json
 import math
 import threading
 
-from management_notifications import iso, stamp, scoped
+from management_notifications import iso, stamp, route_accepts
 
 
 def read_receiver_token(target):
@@ -108,11 +108,11 @@ class InstrumentEventSync:
                     service._audit('instrument-sync', 'event.record', event['event_id'])
                     # Backfill history into the backend; only new, recent transitions notify groups.
                     age = service.wall() - stamp(at)
-                    if stamp(at) < self.notify_since or not -2 <= age <= 300:
+                    if (event['event_type'] in service.config.get('silent_events', [])
+                            or stamp(at) < self.notify_since or not -2 <= age <= 300):
                         continue
                     for route in service.config['routes']:
-                        if event['event_type'] in route['event_types'] and scoped(
-                                dict(role='route', labs=route['labs'], instruments=route.get('instruments')), event):
+                        if route_accepts(route, event):
                             service.db.execute('INSERT OR IGNORE INTO outbox(event_id,route_id,state,due,priority) '
                                 'VALUES(?,?,?,?,?)', (event['event_id'], route['id'], 'pending', service.wall(), 1))
 
@@ -127,8 +127,15 @@ class InstrumentEventSync:
 
     def snapshot(self):
         with self.service.lock:
-            rows = [json.loads(r[0]) for r in self.service.db.execute(
-                'SELECT payload FROM instrument_sessions ORDER BY json_extract(payload,\'$.started_at\') DESC LIMIT 200')]
+            rows = []
+            for session, event in self.service.db.execute(
+                    "SELECT s.payload,e.payload FROM instrument_sessions s "
+                    "LEFT JOIN events e ON e.id='instrument:'||s.id||':started' "
+                    "ORDER BY json_extract(s.payload,'$.started_at') DESC LIMIT 200"):
+                row = json.loads(session)
+                if event:
+                    row['person_id'] = json.loads(event).get('person_id')
+                rows.append(row)
         return {'sessions': rows, 'sync': dict(self.status), 'generated_at': iso(self.service.wall()),
                 'time_domain': 'source_frame'}
 

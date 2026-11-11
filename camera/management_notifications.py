@@ -14,7 +14,7 @@ from pathlib import Path
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
@@ -43,6 +43,16 @@ def scoped(principal, event):
     cameras = principal.get('cameras')
     return ((not event.get('instrument_id') or instruments is None or event['instrument_id'] in instruments)
             and (not event.get('camera_id') or cameras is None or event['camera_id'] in cameras))
+
+
+def route_accepts(route, event):
+    principal = dict(role='route', labs=route['labs'], instruments=route.get('instruments'))
+    audience = route.get('audience', route['id'])
+    if event['event_type'].startswith('safety.'):
+        if (event.get('severity') == 'L3') != (audience == 'administrators'):
+            return False
+    return (event['event_type'] in route['event_types'] and scoped(principal, event)
+            and (not event.get('audiences') or audience in event['audiences'].split(',')))
 
 
 def feishu_payload(text, secret='', now=None):
@@ -171,10 +181,10 @@ class ManagementNotifications:
         fields = {'event_id', 'event_type', 'lab_id', 'person_id', 'display_name',
                   'camera_id', 'snapshot_id', 'track_id', 'global_id',
                   'instrument_id', 'instrument_name', 'observed_at', 'evidence_source', 'evidence_id',
-                  'severity','incident_id','device_id','audiences','fire_stage','zone_id','sources','image_observed_at',
-                  'hardware_observed_at','visual_observed_at'}
+                  'severity','incident_id','device_id','audiences','warning_number','fire_stage','zone_id','sources','image_observed_at',
+                  'hardware_observed_at','visual_observed_at','source_frame_id','time_domain'}
         item = {k: v for k, v in event.items() if k in fields}
-        item.setdefault('severity','L0' if item.get('event_type') in {'person.entered','instrument.started'} else 'L1')
+        item.setdefault('severity','L0' if item.get('event_type') in {'person.entered','instrument.started','instrument.ended'} else 'L1')
         if (item.get('event_type') not in KINDS or item.get('lab_id') != self.config['lab_id']
                 or not item.get('event_id') or (not item.get('person_id') and
                     not (item['event_type'].startswith('environment.') and item.get('device_id')))):
@@ -191,6 +201,8 @@ class ManagementNotifications:
             encoded = json.dumps(item, ensure_ascii=False, sort_keys=True)
             previous = self.db.execute('SELECT payload FROM events WHERE id=?', (item['event_id'],)).fetchone()
             if previous:
+                if item.get('warning_number'):
+                    return False
                 if previous['payload'] != encoded:
                     raise ValueError('event_id conflict')
                 return False
@@ -202,16 +214,14 @@ class ManagementNotifications:
                 if (not item.get('incident_id') and item.get('severity')!='L3' and
                         (old['event_type'], old.get('person_id'), old.get('instrument_id')) == semantic):
                     return False
+            if item.get('warning_number') and not self.ppe_policy.commit_warning(item, stamp(item['observed_at'])):
+                return False
             self.db.execute('INSERT INTO events(id,payload,received) VALUES(?,?,?)',
                             (item['event_id'], encoded, self.wall()))
             if item.get('incident_id') and item['event_type'].startswith('safety.'):
                 self.incidents.note_ppe(item)
             for route in self.config.get('routes', []):
-                principal = dict(role='route', labs=route['labs'], instruments=route.get('instruments'))
-                if (item['event_type'] not in self.config.get('silent_events', [])
-                        and item['event_type'] in route['event_types'] and scoped(principal, item)):
-                    if item.get('audiences') and route.get('audience',route['id']) not in item['audiences'].split(','):
-                        continue
+                if item['event_type'] not in self.config.get('silent_events', []) and route_accepts(route, item):
                     self.db.execute('INSERT INTO outbox(event_id,route_id,state,due,priority) VALUES(?,?,?,?,?)',
                                     (item['event_id'], route['id'], 'pending', self.wall(),3 if item.get('severity')=='L3' else 1))
             from fire_snapshot_album import enqueue as enqueue_fire_snapshots
@@ -286,7 +296,6 @@ class ManagementNotifications:
     @staticmethod
     def message(event):
         if event['event_type'] in {'instrument.started', 'instrument.ended'} and event.get('session_id'):
-            from datetime import timedelta
             local = lambda at: datetime.fromtimestamp(stamp(at), timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
             ending = ('\n结束：' + local(event['ended_at']) + '\n时长：' + event['duration_seconds'] + ' 秒'
                       if event.get('ended_at') else '\n结束：尚未取得有效结束判断')
@@ -313,7 +322,15 @@ class ManagementNotifications:
                       'safety.no_gloves':'未戴手套'}[event['event_type']]+'（防护检测结果）'
         camera='\n摄像头：'+event['camera_id'] if event.get('camera_id') else ''
         snapshot='\n快照：'+event['snapshot_id'] if event.get('snapshot_id') else ''
-        return f"实验室通知 {event.get('severity','')}\n{name} {action}\n实验室：{event['lab_id']}{camera}\n观测时间：{event['observed_at']}{snapshot}\n事件：{event['event_id']}"
+        heading = '实验室通知 '+event.get('severity','')
+        if event.get('warning_number'):
+            if event['severity'] == 'L3':
+                heading = '🔴 实验室红色预警｜连续五次黄色警告后仍未整改，请管理员核查'
+            else:
+                heading = f"🟡 实验室黄色警告｜第 {event['warning_number']}/5 次"
+        observed = datetime.fromtimestamp(stamp(event['observed_at']), timezone(timedelta(hours=8)))
+        observed = observed.isoformat(sep=' ', timespec='milliseconds')
+        return f"{heading}\n{name} {action}\n实验室：{event['lab_id']}{camera}\n画面时间（北京时间）：{observed}{snapshot}\n事件：{event['event_id']}"
 
     def deliver_once(self):
         from notification_delivery import deliver
@@ -398,26 +415,26 @@ class EvidenceAdapter:
             kind = 'instrument.started'
         event=self.base(kind,matched,row['captured_at'],'ppe_detector' if mask or ppe_type else 'member_minicpm')
         if mask or ppe_type:
-            event.update(policy_result)
-            if event.get('incident_id'):event['event_id']=event['incident_id']+':'+event['severity']
+            event.update(policy_result, time_domain='authority')
+            if frame.get('source_frame_id'):
+                event['source_frame_id'] = str(frame['source_frame_id'])
+            if event.get('warning_number'):
+                suffix = 'red' if event['severity'] == 'L3' else 'yellow:'+event['warning_number']
+                event['event_id'] = event['incident_id']+':'+suffix
         if self.service.cooling_down(event):
             return False
-        if kind in self.service.config.get('evidence_required_events', []):
-            if self.service.evidence is None:
-                if event.get('incident_id'):self.service.ppe_policy.retry(event['incident_id'],event['severity'])
-                return False
+        required = kind in self.service.config.get('evidence_required_events', [])
+        if required and self.service.evidence is None:
+            return False
+        if required or (self.service.evidence and kind in self.service.config.get('evidence_optional_events', [])):
             try:
-                event['evidence_id']=self.service.evidence.capture(matched,index)
+                event['evidence_id'] = self.service.evidence.capture(matched, index)
             except Exception:
-                if event.get('incident_id'):self.service.ppe_policy.retry(event['incident_id'],event['severity'])
-                with self.service.lock,self.service.db:
-                    self.service._audit('system','evidence.unavailable',str(row.get('snapshot_id','unknown'))[:128])
-                return False
-        try:
-            return self.service.record(event)
-        except Exception:
-            if event.get('incident_id'):self.service.ppe_policy.retry(event['incident_id'],event['severity'])
-            raise
+                with self.service.lock, self.service.db:
+                    self.service._audit('system', 'evidence.unavailable', str(row.get('snapshot_id', 'unknown'))[:128])
+                if required:
+                    return False
+        return self.service.record(event)
 
     def cameras(self, state):
         # Relative entry sequence uses host receipt clock, never compares GPU wall clocks.

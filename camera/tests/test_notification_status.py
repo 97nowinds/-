@@ -13,7 +13,7 @@ from snapshot_registry import SnapshotRegistry
 
 
 class NotificationStatusTests(unittest.TestCase):
-    def test_deployed_config_notifies_instrument_events_and_keeps_person_entries_silent(self):
+    def test_deployed_config_keeps_instrument_events_and_person_entries_silent(self):
         with tempfile.TemporaryDirectory() as directory:
             config=json.loads((Path(__file__).resolve().parents[1]/'config/management.json').read_text(encoding='utf-8'))
             now=2000000000.0
@@ -28,10 +28,11 @@ class NotificationStatusTests(unittest.TestCase):
                     event_id='synthetic-'+kind
                     service.record({**base,'event_id':event_id,'event_type':kind})
                     routes={r[0] for r in service.db.execute('SELECT route_id FROM outbox WHERE event_id=?', (event_id,))}
-                    self.assertEqual(routes, set() if kind=='person.entered' else {'experimenters','managers'})
+                    self.assertEqual(routes, set())
                 for severity,audiences,expected in [
                     ('L1','experimenters',{'experimenters'}),
-                    ('L2','experimenters,managers',{'experimenters','managers'})]:
+                    ('L2','experimenters,managers',{'experimenters','managers'}),
+                    ('L3','administrators',{'administrators'})]:
                     event_id='synthetic-ppe-'+severity
                     service.record({**base,'event_id':event_id,'event_type':'safety.no_mask',
                         'severity':severity,'audiences':audiences,'incident_id':'synthetic-incident',

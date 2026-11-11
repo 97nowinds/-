@@ -59,7 +59,7 @@ def set_policy(service,actor,policy):
             state=json.loads(row['payload'])
             if not state['emitted']:service.db.execute('DELETE FROM ppe_states WHERE key=?',(row['key'],))
             else:
-                state.update(frames=[],continuous_since=None,escalation_since=None)
+                state.update(frames=[],continuous_since=None)
                 service.db.execute('UPDATE ppe_states SET payload=? WHERE key=?',(json.dumps(state),row['key']))
         service.config={**service.config,**json.loads(json.dumps(policy))}
         persisted={k:service.config[k] for k in ('ppe_rules','ppe_confirmation','ppe_preparation') if k in service.config}

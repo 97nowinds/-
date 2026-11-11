@@ -117,6 +117,50 @@ h2 { font-size: 16px; }
 .floor-map-panel > header strong { color: #dbe3ea; font-size: 13px; }
 .floor-map-viewport { width: 100%; aspect-ratio: 12 / 7; padding: 8px; background: #0d1115; }
 .floor-map-viewport svg { display: block; width: 100%; height: 100%; }
+.map-equipment-shadow { fill: #08151f; opacity: .75; }
+.map-equipment-body { fill: #143e54; stroke: #6ee5ff; stroke-width: 2; }
+.map-equipment-icon { fill: none; stroke: #d5faff; stroke-width: 1.6; stroke-linejoin: round; }
+.map-equipment-label { fill: #e1faff; stroke: #10222d; stroke-width: 4; paint-order: stroke; font-size: 16px; }
+#equipmentSelect { background: #142432; color: #d5faff; border: 1px solid #47788f; border-radius: 4px; }
+.floor-map-legend [hidden] { display: none; }
+.floor-map-viewport.twin-viewport {
+  background: radial-gradient(ellipse at 53% 42%, #1a3346 0%, #0d1d2c 58%, #08131f 100%);
+}
+.twin-label { font-size: 15px; font-weight: 600; }
+.twin-fixture-label { font-size: 14px; letter-spacing: .08em; }
+.twin-webgl { position: absolute; inset: 0; z-index: 1; }
+.twin-webgl[hidden], .twin-tag[hidden] { display: none; }
+.twin-webgl canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+.twin-webgl canvas:active { cursor: grabbing; }
+.twin-webgl-labels { position: absolute; inset: 0; pointer-events: none; }
+.cluster-twin { container-type: size; pointer-events: none; }
+.cluster-twin-frame { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: min(100%, 156.25cqh); aspect-ratio: 25 / 16; }
+.cluster-twin-frame img { width: 100%; height: 100%; cursor: grab; touch-action: none; pointer-events: auto; }
+.cluster-twin-hotspots { position: absolute; inset: 0; }
+.cluster-twin-hotspot { position: absolute; padding: 0; border: 0; background: transparent;
+  border-radius: 4px; pointer-events: auto; cursor: pointer; }
+.cluster-twin-hotspot:is(:hover,:focus-visible) { outline: 2px solid #9ddfff; }
+.cluster-twin .twin-reset { pointer-events: auto; }
+.twin-tag {
+  position: absolute; transform: translate(-50%, -100%); white-space: nowrap;
+  padding: 4px 8px; color: #eaf6fb; border: 1px solid #567385;
+  background: #0e2332e8; border-radius: 6px; font-size: 11px;
+}
+.twin-tag.identified { border-color: #62dfbe; }
+.twin-tag.unknown { border-color: #ffaf73; }
+.twin-tag.equipment { pointer-events: auto; cursor: pointer; border-color: #5ca5ca; }
+.twin-tag.equipment:hover, .twin-tag.equipment:focus-visible { background: #204e6b; border-color: #9ddfff; }
+.twin-reset { position: absolute; right: 10px; bottom: 10px; }
+.twin-stage-caption, .twin-stage-hint {
+  position: absolute; left: 14px; pointer-events: none;
+  color: #bbdef6; font-size: 12px;
+}
+.twin-stage-caption {
+  top: 13px; padding: 5px 9px; letter-spacing: .12em; border-left: 2px solid #73d9ff;
+  background: linear-gradient(90deg, #123854d9, #12385410);
+}
+.twin-stage-hint { bottom: 14px; color: #a0bdd4; }
 .map-room { fill: #141a20; stroke: #73808c; stroke-width: 4; }
 .map-fixture { fill: #2e3942; stroke: #64717d; stroke-width: 3; }
 .map-fixture.instrument { fill: #3b3330; stroke: #8a756a; }
@@ -681,6 +725,10 @@ body {
 .event-row time { color: #5a9bc0; font: 700 9px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .event-row strong { overflow: hidden; color: #cdeef8; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .event-row span { padding: 2px 5px; border: 1px solid rgba(55, 197, 255, 0.32); color: #6edbff; font-size: 8px; }
+.event-row.normal { background: #133c34; border-left-color: #85f5bd; }
+.event-row.normal span { color: #85f5bd; border-color: #85f5bd; }
+.event-row.warning { background: #49391d; border-left-color: #ffdc80; }
+.event-row.alarm { background: #542933; border-left-color: #ffaaa6; }
 .event-row.warning span { border-color: rgba(255, 187, 81, 0.45); color: #ffc967; }
 .event-row.alarm span { border-color: rgba(255, 88, 88, 0.55); color: #ff8a86; }
 .event-row.placeholder { background: rgba(8, 46, 77, 0.3); }
@@ -781,3 +829,55 @@ body {
 .people-panel header .face-calibration-entry:hover { background: #185365; }
 
 .display-topbar .topbar-actions .tool-link.face-calibration-top { display: inline-flex !important; align-items: center; color: #8ff5dc; border-color: #399d87; background: #103f43; }
+
+.presentation-layout {
+  grid-template-columns: minmax(200px, 1fr) minmax(0, 3.2fr) minmax(200px, 1fr);
+  grid-template-areas: "cameras focus overview";
+}
+.presentation-layout > .display-main {
+  grid-area: focus;
+  grid-template-rows: minmax(0, 1fr) clamp(250px, 33vh, 360px);
+  min-height: 0;
+}
+.presentation-layout > .monitoring-panel { grid-area: cameras; overflow: auto; }
+.presentation-layout > .monitoring-panel .video-grid { grid-template-columns: 1fr; }
+.presentation-layout > .information-rail {
+  grid-area: overview;
+  grid-template-rows: auto auto minmax(140px, 1fr);
+  overflow: auto;
+}
+.presentation-layout .floor-map-panel { border-color: #4295b6; }
+.presentation-layout .floor-map-panel h2 { font-size: 17px; }
+.presentation-layout .event-panel { display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.presentation-layout .event-panel h2 { font-size: 19px; }
+.presentation-layout .event-feed {
+  height: auto;
+  grid-template-rows: none;
+  grid-auto-rows: minmax(42px, auto);
+  align-content: start;
+  overflow: auto;
+}
+.presentation-layout .event-row {
+  grid-template-columns: 70px minmax(0, 1fr) auto;
+  padding: 8px 12px;
+}
+.presentation-layout .event-row strong { font-size: 16px; white-space: normal; overflow-wrap: anywhere; }
+.presentation-layout .event-row time,
+.presentation-layout .event-row span { font-size: 12px; }
+
+@media (max-width: 1100px) {
+  .presentation-layout {
+    height: auto;
+    min-height: 0;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas: "focus focus" "cameras overview";
+  }
+  .presentation-layout > .display-main { grid-template-rows: minmax(390px, 55vh) 300px; }
+  .presentation-layout > .information-rail { grid-template-columns: 1fr; }
+  body:has(.presentation-layout) { overflow: auto; }
+}
+@media (max-width: 680px) {
+  .presentation-layout { grid-template-columns: 1fr; grid-template-areas: "focus" "cameras" "overview"; }
+  .presentation-layout > .display-main { grid-template-rows: 360px 280px; }
+  .presentation-layout .event-row { grid-template-columns: 58px minmax(0, 1fr) auto; padding-inline: 6px; }
+}

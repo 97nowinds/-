@@ -16,6 +16,8 @@ class SafetyIncidents:
             if 'person_id' not in columns:service.db.execute('ALTER TABLE incidents ADD COLUMN person_id TEXT')
             if 'instrument_id' not in columns:service.db.execute('ALTER TABLE incidents ADD COLUMN instrument_id TEXT')
             if 'camera_id' not in columns:service.db.execute('ALTER TABLE incidents ADD COLUMN camera_id TEXT')
+            if 'warning_event_id' not in columns:
+                service.db.execute('ALTER TABLE incidents ADD COLUMN warning_event_id TEXT')
             if 'zone_id' not in columns:service.db.execute('ALTER TABLE incidents ADD COLUMN zone_id TEXT')
 
     def observe_environment(self,sample):
@@ -84,6 +86,27 @@ class SafetyIncidents:
         s.db.execute('INSERT OR IGNORE INTO incidents(id,lab,kind,active,state,opened,last_observed,person_id,instrument_id,camera_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
             (event['incident_id'],event['lab_id'],'ppe',1,'open',s.wall(),s.wall(),event['person_id'],event.get('instrument_id'),event.get('camera_id')))
 
+        if event.get('warning_number'):
+            from management_notifications import stamp
+            s.db.execute('UPDATE incidents SET warning_event_id=?,last_observed=? WHERE id=?',
+                         (event['event_id'], stamp(event['observed_at']), event['incident_id']))
+
+    def ppe_open(self, incident, before_red=False):
+        row = self.service.db.execute(
+            "SELECT warning_event_id FROM incidents WHERE id=? AND kind='ppe' AND active=1 AND state='open'",
+            (incident,)).fetchone()
+        return row is not None and not (before_red and (row['warning_event_id'] or '').endswith(':red'))
+
+    def display_warnings(self):
+        # The public display only needs status, never identities or evidence.
+        with self.service.lock:
+            rows = self.service.db.execute(
+                "SELECT e.payload FROM incidents i JOIN events e ON e.id=i.warning_event_id "
+                "WHERE i.kind='ppe' AND i.active=1 AND i.state='open' "
+                "ORDER BY i.warning_event_id LIKE '%:red' DESC,i.last_observed DESC LIMIT 9").fetchall()
+        fields = ('event_type', 'severity', 'observed_at', 'warning_number')
+        return [{field: item[field] for field in fields} for item in (json.loads(row[0]) for row in rows)]
+
     def recover_ppe(self,incident,observed):
         s=self.service
         with s.lock,s.db:
@@ -111,4 +134,7 @@ class SafetyIncidents:
                 if not isinstance(note,str) or not note.strip() or len(note)>1000:raise ValueError('inspection note required')
                 s.db.execute("UPDATE incidents SET state='closed',closed_by=?,note=? WHERE id=?",(principal['id'],note.strip(),incident))
             else:raise ValueError('unknown incident action')
+            if action == 'ack' and row['kind'] == 'ppe':
+                s.db.execute("UPDATE outbox SET state='cancelled' WHERE state='pending' AND event_id LIKE ?",
+                             (incident+':%',))
             s._audit(principal['id'],'incident.'+action,incident)

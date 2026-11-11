@@ -90,11 +90,22 @@ class PreparationTests(unittest.TestCase):
         self.assertIsNone(self.observation(44))
         self.assertEqual(self.observation(46)['severity'],'L1')
 
+    def record_first_warning(self):
+        self.observation(120)
+        self.observation(123)
+        first = self.observation(125)
+        recorded_at = self.now + 125
+        self.service.wall = lambda: recorded_at
+        self.assertTrue(self.service.record({**first, 'event_id':first['incident_id']+':yellow:1',
+            'event_type':'safety.no_mask', 'lab_id':self.config['lab_id'], 'person_id':'student',
+            'observed_at':iso(recorded_at)}))
+        return first
+
     def test_escalation_waits_sixty_seconds_after_first_reminder(self):
-        self.observation(120);self.observation(123);first=self.observation(125)
+        first=self.record_first_warning()
         for sec in range(130,185,5):self.assertIsNone(self.observation(sec))
         result=self.observation(185)
-        self.assertEqual(result['severity'],'L2')
+        self.assertEqual((result['severity'], result['warning_number']), ('L1', '2'))
         self.assertEqual(result['incident_id'],first['incident_id'])
         self.assertEqual(result['audiences'],'experimenters,managers')
 
@@ -108,12 +119,12 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(self.service.db.execute("SELECT state FROM outbox WHERE event_id='synthetic-reminder'").fetchone()[0],'cancelled')
 
     def test_unknown_interrupts_continuous_escalation_time(self):
-        self.observation(120);self.observation(123);self.observation(125)
+        self.record_first_warning()
         self.observation(130,'unknown')
         for sec in range(180,241,5):
             result=self.observation(sec)
             if sec<240:self.assertIsNone(result)
-        self.assertEqual(result['severity'],'L2')
+        self.assertEqual((result['severity'], result['warning_number']), ('L1', '2'))
 
     def test_operation_before_first_face_cannot_later_grant_preparation(self):
         self.service.preparation.finish('working-student',self.now,'confirmed_instrument_interaction')

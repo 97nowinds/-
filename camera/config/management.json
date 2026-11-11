@@ -2,6 +2,9 @@
   "lab_id": "lab_main",
   "event_max_age_seconds": 15,
   "require_authority_snapshot": true,
+  "ppe_live": {
+    "enabled": true
+  },
   "audience_labels": {
     "experimenters": "学生实验人员群",
     "managers": "负责师兄师姐群",
@@ -93,20 +96,22 @@
       ],
       "event_types": [
         "environment.flame",
-        "environment.flame_recovered"
+        "environment.flame_recovered",
+        "safety.no_mask",
+        "safety.no_lab_coat",
+        "safety.no_gloves"
       ],
       "webhook_env": "LAB_FEISHU_ADMINISTRATORS_WEBHOOK",
       "secret_env": "LAB_FEISHU_ADMINISTRATORS_SECRET"
     }
   ],
   "silent_events": [
-    "person.entered"
+    "person.entered",
+    "instrument.started",
+    "instrument.ended"
   ],
-  "evidence_required_events": [
-    "safety.no_mask",
-    "safety.no_lab_coat",
-    "safety.no_gloves"
-  ],
+  "evidence_required_events": ["safety.no_gloves"],
+  "evidence_optional_events": ["safety.no_mask", "safety.no_lab_coat"],
   "ppe_rules": {
     "mask": {
       "enabled": true,
@@ -129,6 +134,7 @@
   },
   "evidence_image_origins": [
     "http://127.0.0.1:5175",
+    "http://127.0.0.1:5177",
     "http://192.168.31.127:5175"
   ]
 }

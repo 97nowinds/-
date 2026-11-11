@@ -4,8 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>实验室智能安全监测大屏</title>
-    <link rel="stylesheet" href="/static/styles.css?v=face-entry-top-20261030">
-    <script src="/static/instrument_location.js"></script>
+    <link rel="stylesheet" href="/static/styles.css?v=cluster-twin">
+    <script src="/static/instrument_location.js?v=nearby"></script>
   </head>
   <body>
     <main class="app-shell dashboard-shell">
@@ -58,13 +58,16 @@
             </div>
           </header>
           <div class="floor-map-viewport">
-            <svg id="floorMapSvg" viewBox="0 0 1200 700" role="img" aria-label="实验室人员实时位置俯视图">
+            <svg id="floorMapSvg" viewBox="0 0 1200 700" role="img" aria-label="实验室仪器和人员实时位置">
               <g id="floorMapStatic"></g>
               <g id="floorMapTrails"></g>
               <g id="floorMapPeople"></g>
             </svg>
           </div>
           <div class="floor-map-legend" aria-label="地图图例">
+            <button type="button" id="twinToggle" class="tool-link" aria-pressed="false">切换立体图</button>
+            <label>仪器点位 <select id="equipmentSelect"><option value="">加载仪器</option></select></label>
+            <span id="equipmentFeedback" role="status"></span>
             <span><i class="legend-person identified"></i>已确认</span>
             <span><i class="legend-person unknown"></i>未注册</span>
             <span><i class="legend-overlap"></i>重叠区</span>
@@ -197,7 +200,9 @@
         </footer>
       </form>
     </dialog>
-    <script src="/static/app.js?v=map-sample-20260924"></script>
+    <script src="/static/lab_twin.js?v=2"></script>
+    <script src="/static/cluster_twin.js?v=2"></script>
+    <script src="/static/app.js?v=cluster-twin-2"></script>
   <script>
 // Calibration is hosted by the local frontend, including when this dashboard is served by the GPU API.
 if (location.port !== '5173') {

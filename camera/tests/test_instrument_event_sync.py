@@ -4,6 +4,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from instrument_event_sync import InstrumentEventSync
 from management_notifications import ManagementNotifications, iso
 
@@ -13,9 +16,6 @@ class InstrumentSyncTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.now = 1793020000.0
         config = json.loads((Path(__file__).parents[1] / 'config/management.json').read_text(encoding='utf-8'))
-        for route in config['routes']:
-            if route['id'] in {'experimenters', 'managers'}:
-                route['event_types'] += ['instrument.started', 'instrument.ended']
         self.sent = []
         self.service = ManagementNotifications(Path(self.temp.name) / 'test.sqlite3', config,
             environ={r['webhook_env']: 'https://example.invalid' for r in config['routes']},
@@ -35,19 +35,16 @@ class InstrumentSyncTests(unittest.TestCase):
             observed_duration_seconds=9.0 if ended else 0.0, status='ended' if ended else 'open')
         return {'sessions': [row], 'people': []}
 
-    def test_start_end_idempotent_across_restart_and_delivery(self):
+    def test_start_end_idempotent_across_restart_and_kept_silent(self):
         self.sync.ingest(self.body())
         self.sync.ingest(self.body())
         self.now += 9
         self.sync.ingest(self.body(True, age=9))
         InstrumentEventSync(self.service, None).ingest(self.body(True, age=9))
         self.assertEqual(self.service.db.execute('SELECT COUNT(*) FROM events').fetchone()[0], 2)
-        self.assertEqual(self.service.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 4)
-        for _ in range(4):
-            self.now += 2
-            self.assertTrue(self.service.deliver_once())
-        self.assertEqual(len(self.sent), 4)
-        self.assertTrue(any('时长：9.0 秒' in p['content']['text'] for p in self.sent))
+        self.assertEqual(self.service.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
+        self.assertFalse(self.service.deliver_once())
+        self.assertEqual(self.sent, [])
         self.assertEqual(self.sync.snapshot()['sessions'][0]['duration_seconds'], 9)
 
     def test_backfill_does_not_notify_and_gap_does_not_end(self):

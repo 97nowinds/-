@@ -35,8 +35,13 @@ def notification_status(runtime):
     if not any(g['webhook_configured'] and 'safety.no_mask' in g['event_types']
                and g['audience'] == 'experimenters' for g in groups):
         blockers.append('experimenters_ppe_route_missing')
+    enabled_ppe = {'safety.no_'+kind for kind, rule in rules.items() if rule['enabled']}
+    if enabled_ppe and not any(g['webhook_configured'] and enabled_ppe <= set(g['event_types'])
+                               and g['audience'] == 'administrators' for g in groups):
+        blockers.append('administrators_ppe_route_missing')
     return {
         'groups': groups, 'silent_events': silent, 'ppe_rules': rules,
+        'ppe_live': dict(getattr(runtime, 'ppe_live_status', {})),
         'ppe_preparation': dict(service.config.get('ppe_preparation',{})),
         'outbox_counts': outbox,
         'fire_snapshot_delivery_counts': fire_albums,

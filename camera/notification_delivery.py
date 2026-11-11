@@ -4,7 +4,7 @@ import uuid
 
 
 def deliver(service):
-    from management_notifications import scoped,stamp,feishu_payload
+    from management_notifications import route_accepts,stamp,feishu_payload
     from feishu_app import EVIDENCE_CREDENTIALS,FeishuAppClient,load_credentials
     now=service.wall()
     with service.lock,service.db:
@@ -17,10 +17,11 @@ def deliver(service):
         if event.get('severity')!='L3' and now-stamp(event['observed_at'])>service.config.get('delivery_max_age_seconds',300):
             service.db.execute("UPDATE outbox SET state='expired' WHERE event_id=? AND route_id=?",(row['event_id'],row['route_id']))
             return True
-        allowed=route and event['event_type'] in route['event_types'] and scoped(
-            dict(role='route',labs=route['labs'],instruments=route.get('instruments')),event)
-        if allowed and event.get('audiences'):
-            allowed=route.get('audience',route['id']) in event['audiences'].split(',')
+        allowed = (route and event['event_type'] not in service.config.get('silent_events', [])
+                   and route_accepts(route, event))
+        if event.get('warning_number'):
+            allowed = allowed and service.incidents.ppe_open(
+                event['incident_id'], before_red=event['severity'] != 'L3')
         if not allowed:
             service.db.execute("UPDATE outbox SET state='cancelled' WHERE event_id=? AND route_id=?",(row['event_id'],row['route_id']))
             return True
@@ -39,6 +40,10 @@ def deliver(service):
             # supplements every destination with the same three-camera album.
             payload=feishu_payload(service.message(event)+'\n三路现场快照随后补发；不代表三路均已检测到火焰。',
                 service.env.get(route.get('secret_env',''),''),service.wall())
+        elif event.get('warning_number') and event['severity'] == 'L3':
+            # Escalation text must reach administrators even if image upload is unavailable.
+            payload = feishu_payload(service.message(event)+'\n证据与处置记录：实验室通知管理 → 告警处置',
+                                     service.env.get(route.get('secret_env', ''), ''), service.wall())
         elif event.get('evidence_id'):
             from alert_evidence import group_evidence_payload
             with service.image_lock:
@@ -56,7 +61,7 @@ def deliver(service):
                     with service.lock,service.db:
                         service.db.execute('INSERT OR REPLACE INTO evidence_uploads VALUES(?,?,?)',(event['evidence_id'],app_id,key))
             payload=group_evidence_payload(service.message(event),key,service.env.get(route.get('secret_env',''),''),service.wall(),
-                title='实验室火焰报警｜证据快照' if event['event_type'].startswith('environment.') else '实验室防护告警｜证据快照')
+                title='实验室火焰报警｜证据快照' if event['event_type'].startswith('environment.') else '🟡 实验室防护警告｜证据快照')
         else:payload=feishu_payload(service.message(event),service.env.get(route.get('secret_env',''),''),service.wall())
         service.sender(url,payload)
         state,error='sent',None

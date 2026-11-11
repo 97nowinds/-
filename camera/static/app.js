@@ -23,6 +23,20 @@ const floorMapPeopleList = document.querySelector("#floorMapPeopleList");
 const dashboardTime = document.querySelector("#dashboardTime");
 const dashboardDate = document.querySelector("#dashboardDate");
 const eventFeed = document.querySelector("#eventFeed");
+const fullscreenButton = document.querySelector("#displayFullscreen");
+if (fullscreenButton) {
+  fullscreenButton.addEventListener("click", async () => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await document.documentElement.requestFullscreen();
+    } catch {
+      fullscreenButton.textContent = "请按 F11 全屏";
+    }
+  });
+  document.addEventListener("fullscreenchange", () => {
+    fullscreenButton.textContent = document.fullscreenElement ? "退出全屏" : "全屏展示";
+  });
+}
 const recordingControlButton = document.querySelector("#recordingControlButton");
 const recordingControlLabel = document.querySelector("#recordingControlLabel");
 const recordingDialog = document.querySelector("#recordingDialog");
@@ -49,13 +63,18 @@ const API_BASE = (
   location.origin
 ).replace(/\/$/, "");
 const HARDWARE_URL = window.__LAB_HARDWARE_URL__ || null;
+const useScreenProxy = ["127.0.0.1", "localhost", "[::1]"].includes(new URL(API_BASE, location.href).hostname)
+  && !new URLSearchParams(location.search).has("api");
+const screenDashboardUrl = useScreenProxy ? "/api/screen/dashboard" : `${API_BASE}/api/dashboard`;
+const screenVideoBase = useScreenProxy ? "/api/screen" : API_BASE;
 const INTERACTION_URL = "/api/interaction-results/latest";
 const resultContract = window.__LAB_RESULT_CONTRACT__ || "";
 let latestAnalyses = [];
 let persistentInstrumentEvents = [];
 window.addEventListener('lab-instrument-history', ({detail}) => {
   persistentInstrumentEvents = (detail.sessions || []).slice(0, 3).map(s => ({
-    camera_id:s.camera_id, display_name:s.person_label, instrument_name:s.instrument_name,
+    camera_id:s.camera_id, person_id:s.person_id, instrument_name:s.instrument_name,
+    last_observed_at:s.last_observed_at, session_status:s.status,
     observed_at:s.ended_at || s.started_at,
     interaction_label:s.ended_at ? `结束使用（${s.duration_seconds.toFixed(3)} 秒）` : s.status==='interrupted' ? `中断／结束未确认（${s.interruption_reason}）` : '开始使用（结束待确认）',
   }));
@@ -96,7 +115,79 @@ let floorPeopleListSignature = "";
 let eventFeedSignature = "";
 let latestInteractionEvents = [];
 let latestInteractionErrors = [];
-let instrumentAnchors = [];
+
+let equipment = [];
+let placementMap = null;
+const equipmentSelect = document.querySelector("#equipmentSelect");
+const equipmentFeedback = document.querySelector("#equipmentFeedback");
+const equipmentMap = document.querySelector("#floorMapSvg");
+const twinToggle = document.querySelector("#twinToggle");
+const twinLayer = createSvg("g", {});
+floorMapSvg.append(twinLayer);
+let twinView = Boolean(twinToggle && !equipmentSelect);
+
+if (twinToggle) {
+  twinToggle.addEventListener("click", () => {
+    twinView = !twinView;
+    if (placementMap) renderFloorMap(placementMap);
+  });
+}
+
+function refreshEquipment(payload) {
+  equipment = Array.isArray(payload.equipment) ? payload.equipment : [];
+  if (!equipmentSelect) return;
+  const selected = equipmentSelect.value;
+  equipmentSelect.replaceChildren(new Option("选择仪器后点击实验台", ""));
+  const groups = new Map();
+  for (const item of equipment) {
+    const option = new Option(item.name, item.instrument_id);
+    if (!item.placement_group) {
+      equipmentSelect.append(option);
+      continue;
+    }
+    if (!groups.has(item.placement_group)) {
+      const group = document.createElement("optgroup");
+      group.label = item.placement_group;
+      equipmentSelect.append(group);
+      groups.set(item.placement_group, group);
+    }
+    groups.get(item.placement_group).append(option);
+  }
+  equipmentSelect.value = selected;
+}
+
+if (equipmentSelect && equipmentMap) {
+  equipmentMap.addEventListener("click", async event => {
+    const id = equipmentSelect.value;
+    const matrix = equipmentMap.getScreenCTM();
+    if (twinView || !id || !placementMap || !matrix || equipmentSelect.disabled) return;
+    const point = new DOMPoint(event.clientX, event.clientY).matrixTransform(matrix.inverse());
+    const x = point.x / FLOOR_VIEWBOX.width * placementMap.width_m;
+    const y = point.y / FLOOR_VIEWBOX.height * placementMap.height_m;
+    equipmentSelect.disabled = true;
+    equipmentFeedback.textContent = "正在保存点位";
+    try {
+      const response = await fetch("/api/instruments/placement", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({instrument_id: id, x_m: x, y_m: y}),
+      });
+      if (!response.headers.get("Content-Type")?.includes("application/json")) {
+        throw new Error(`点位保存接口不可用（HTTP ${response.status}），请刷新页面后重试`);
+      }
+      const position = await response.json();
+      if (!response.ok) throw new Error(position.error || "保存失败");
+      equipment = equipment.map(item => item.instrument_id === id ? {...item, ...position} : item);
+      renderFloorPlan(placementMap);
+      equipmentSelect.value = "";
+      equipmentFeedback.textContent = `已保存 · ${x.toFixed(2)}, ${y.toFixed(2)} m`;
+    } catch (error) {
+      equipmentFeedback.textContent = error.message;
+    } finally {
+      equipmentSelect.disabled = false;
+    }
+  });
+}
 let instrumentAnchorsFetchedAt = 0;
 let interactionFetchPending = false;
 let interactionLastFetchMs = 0;
@@ -293,14 +384,18 @@ function floorMapLabel(item) {
 }
 
 async function fetchState() {
-  const [state, environment] = await Promise.all([
-    LivePolling.fetchJSON(`${API_BASE}/api/dashboard`, {timeoutMs:5000}),
+  const [state, environment, displayAlerts] = await Promise.all([
+    LivePolling.fetchJSON(screenDashboardUrl, {timeoutMs:6000}),
     HARDWARE_URL
       ? LivePolling.fetchJSON(HARDWARE_URL, {timeoutMs:2000}).catch(() => null)
       : Promise.resolve(null),
+    eventFeed
+      ? LivePolling.fetchJSON("/api/display/warnings", {timeoutMs:1000}).catch(() => null)
+      : Promise.resolve(null),
   ]);
   if (environment) state.environment = environment;
-  state.interaction_events = [...persistentInstrumentEvents, ...currentInteractionEvents()];
+  state.display_warnings = displayAlerts?.warnings || [];
+  state.interaction_events = [...currentInteractionEvents(), ...persistentInstrumentEvents];
   state.interaction_errors = latestInteractionErrors;
   state.interaction_analyses = latestAnalyses;
   return state;
@@ -311,8 +406,10 @@ function refreshInteractionResults() {
   if (now - instrumentAnchorsFetchedAt >= 30000) {
     instrumentAnchorsFetchedAt = now;
     LivePolling.fetchJSON("/api/instruments/anchors")
-      .then((payload) => { instrumentAnchors = Array.isArray(payload?.instruments) ? payload.instruments : []; })
-      .catch(() => { instrumentAnchors = []; });
+      .then((payload) => {
+        refreshEquipment(payload);
+      })
+      .catch(() => {});
   }
   if (interactionFetchPending || now - interactionLastFetchMs < 1000) return;
   interactionFetchPending = true;
@@ -398,6 +495,7 @@ function renderFloorPlan(floorMap) {
     zones: floorMap.zones,
     fixtures: floorMap.fixtures,
     cameras: floorMap.cameras,
+    equipment,
   });
   if (signature === floorMapSignature) return;
   floorMapSignature = signature;
@@ -463,6 +561,22 @@ function renderFloorPlan(floorMap) {
     );
   }
   appendMapLabel(floorMapStatic, 600, 550, "主通道", "map-area-label");
+  const icons = {
+    balance: "M-14 0h28v8h-28z M-9-3h18 M-5 4h10",
+    cleaner: "M-14-8h28v16h-28z M-10-3h20 M-8 2q4 4 8 0t8 0",
+    centrifuge: "M-13-6h26v14h-26z M-10-6a10 5 0 0 1 20 0 M-4 3h8",
+  };
+  for (const item of equipment) {
+    if (![item.x_m, item.y_m].every(Number.isFinite)) continue;
+    const point = mapPoint(floorMap, [item.x_m, item.y_m]);
+    const group = createSvg("g", {class: "map-equipment", transform: `translate(${point.x} ${point.y})`});
+    group.append(createSvg("title", {}, item.name),
+      createSvg("ellipse", {cx: 0, cy: 10, rx: 22, ry: 7, class: "map-equipment-shadow"}),
+      createSvg("rect", {x: -21, y: -17, width: 42, height: 34, rx: 7, class: "map-equipment-body"}),
+      createSvg("path", {d: icons[item.kind] || icons.balance, class: "map-equipment-icon"}));
+    appendMapLabel(group, 0, -23, item.name, "map-equipment-label");
+    floorMapStatic.append(group);
+  }
 }
 
 function personLabel(person) {
@@ -523,8 +637,24 @@ function updateFloorTrails(floorMap) {
 
 function renderFloorMap(floorMap) {
   if (!floorMap) return;
-  renderFloorPlan(floorMap);
+  placementMap = floorMap;
   updateFloorTrails(floorMap);
+  floorMapSvg.parentElement.classList.toggle("twin-viewport", twinView);
+  const clusterTwin = typeof ClusterTwin === "undefined" ? null : ClusterTwin;
+  const webgl = twinView && clusterTwin?.render(floorMapSvg.parentElement, floorMap, equipment, personLabel, floorTrails);
+  if (!twinView) clusterTwin?.hide();
+  twinLayer.style.display = twinView && !webgl ? "" : "none";
+  for (const layer of [floorMapStatic, floorMapPeopleLayer, floorMapTrailsLayer]) {
+    layer.style.display = twinView ? "none" : "";
+  }
+  if (equipmentSelect) equipmentSelect.closest("label").hidden = twinView;
+  if (equipmentFeedback) equipmentFeedback.hidden = twinView;
+  if (twinToggle) {
+    twinToggle.textContent = twinView ? "切换俯视图" : "切换立体图";
+    twinToggle.setAttribute("aria-pressed", String(twinView));
+  }
+  if (twinView && !webgl) LabTwin.render(twinLayer, floorMap, equipment, personLabel);
+  renderFloorPlan(floorMap);
   floorMapMode.textContent = floorMap.calibrated ? "四点标定 · 实时更新" : "示意映射 · 实时更新";
   floorMapMode.className = floorMap.calibrated ? "calibrated" : "schematic";
   const countedPeople = Number.isFinite(Number(floorMap.counted_people))
@@ -574,7 +704,7 @@ function renderFloorMap(floorMap) {
       <div class="floor-person-row">
         <span class="floor-person-indicator ${person.identified ? "identified" : "unknown"}"></span>
         <strong>${escapeHtml(personLabel(person))}</strong>
-        <span class="floor-person-location">${escapeHtml(person.map_visible === false ? "位置待确认" : ["内侧通道", "后端操作区"].includes(person.zone) ? "侧向通道" : person.zone)} · ${escapeHtml(person.cameras.join(" + "))}${person.position_source === "instrument_anchor" ? ` · ${escapeHtml(person.instrument_name)}仪器定位 ${person.position_score.toFixed(2)}` : person.handoff_waiting ? " · 跨摄定位中" : person.localization_state === "predicted" ? " · 短暂预测" : person.localization_state === "held" ? " · 定位保持" : person.position_estimated ? " · 脚点估算" : ""}</span>
+        <span class="floor-person-location">${escapeHtml(person.map_visible === false ? "位置待确认" : ["内侧通道", "后端操作区"].includes(person.zone) ? "侧向通道" : person.zone)} · ${escapeHtml(person.cameras.join(" + "))}${person.position_source === "instrument_anchor" ? ` · ${escapeHtml(person.instrument_name)}前方定位` : person.handoff_waiting ? " · 跨摄定位中" : person.localization_state === "predicted" ? " · 短暂预测" : person.localization_state === "held" ? " · 定位保持" : person.position_estimated ? " · 脚点估算" : ""}</span>
         <span class="floor-person-lock ${person.identity_lock_status === "locked" ? "locked" : "visual"}">${person.identity_lock_status === "locked" ? "已锁定" : person.count_status === "duplicate_suppressed" ? "跨摄疑似重复 · 不计数" : person.counted === false ? "临时候选 · 不计数" : "视觉追踪"}</span>
       </div>
     `).join("")
@@ -601,6 +731,7 @@ function modeText(camera) {
 }
 
 function renderPeopleList(people) {
+  if (!peopleList) return;
   const nextSignature = JSON.stringify(people.map((person) => [
     person.id,
     person.label,
@@ -663,9 +794,25 @@ function renderEventFeed(state) {
   const rows = [];
   const environment = state.environment || {};
   const activePeople = state.floor_map?.people || [];
+  const protectionLabels = {
+    "safety.no_mask": "未戴口罩",
+    "safety.no_lab_coat": "未穿实验服",
+    "safety.no_gloves": "未戴手套",
+  };
 
   if (environment.flame_alarm) {
     rows.push({time: now, text: "检测到火焰触点告警，请立即核查", tag: "环境告警", tone: "alarm"});
+  }
+
+  for (const warning of state.display_warnings || []) {
+    const red = warning.severity === "L3";
+    const label = protectionLabels[warning.event_type] || "穿戴违规";
+    rows.push({
+      time: evidenceTime(warning.observed_at),
+      text: red ? `${label} · 五次警告后仍未整改` : `${label} · 第 ${warning.warning_number}/5 次`,
+      tag: "防护检测",
+      tone: red ? "alarm" : "warning",
+    });
   }
 
   for (const camera of state.cameras || []) {
@@ -690,18 +837,20 @@ function renderEventFeed(state) {
     });
   }
 
+  const registeredNames = new Map((state.people || []).map(person => [person.id, person.name]));
   const rawInteractions = state.interaction_events || state.instrument_interaction?.events || state.interactions || [];
   for (const interaction of Array.isArray(rawInteractions) ? rawInteractions.slice(0, 3) : []) {
-    const interactionSubject = interaction.handoff_match_status
-      ? interaction.display_name || `匿名轨迹 ${interaction.global_id || interaction.track_id || "未知"}`
-      : interaction.display_name || interaction.person_name || interaction.track_id || "目标";
-    const interactionAction = interaction.interaction_label || interaction.message || interaction.description || interaction.event || "检测到交互";
+    const interactionSubject = registeredNames.get(interaction.person_id) || "未注册人员";
+    const stillObserved = interaction.session_status === "open" &&
+      Math.abs(Date.now() - Date.parse(interaction.last_observed_at)) <= 15000;
+    const interactionAction = stillObserved ? "正在操作" :
+      interaction.interaction_label || interaction.message || interaction.description || interaction.event || "正在操作";
     const interactionInstrument = interaction.instrument_name || interaction.instrument_id || "仪器";
     rows.push({
       time: evidenceTime(interaction.observed_at || interaction.captured_at || interaction.time || interaction.timestamp || now),
       text: `${interactionSubject} ${interactionAction} ${interactionInstrument}`,
       tag: interaction.camera_id ? `仪器交互 · ${interaction.camera_id}` : "仪器交互",
-      tone: interaction.level === "alarm" ? "alarm" : "normal",
+      tone: interaction.level === "alarm" ? "alarm" : interaction.level === "warning" ? "warning" : "normal",
     });
   }
 
@@ -718,7 +867,7 @@ function renderEventFeed(state) {
   for (const analysis of (state.interaction_analyses || []).slice(0, 3)) {
     if (analysis.status === "valid" && analysis.is_interacting !== false) continue;
     rows.push({time: evidenceTime(analysis.captured_at || now),
-      text: `${analysis.display_name || analysis.track_id || "仪器交互"}：${analysis.status === "valid" ? "模型判断未交互" : statusLabels[analysis.status] || "状态未知"} · ${analysis.reason_code || ""}`,
+      text: `${registeredNames.get(analysis.person_id) || "未注册人员"}：${analysis.status === "valid" ? "模型判断未交互" : statusLabels[analysis.status] || "状态未知"} · ${analysis.reason_code || ""}`,
       tag: "分析状态", tone: "warning"});
   }
 
@@ -749,11 +898,12 @@ function renderEventFeed(state) {
   if (nextSignature === eventFeedSignature) return;
   eventFeedSignature = nextSignature;
 
+  const levels = {normal: "一般通知", warning: "黄色警告", alarm: "红色预警"};
   eventFeed.innerHTML = rows.slice(0, 9).map((row) => `
     <div class="event-row ${escapeHtml(row.tone)}">
       <time>${escapeHtml(row.time)}</time>
       <strong>${escapeHtml(row.text)}</strong>
-      <span>${escapeHtml(row.tag)}</span>
+      <span>${escapeHtml(levels[row.tone] ? `${levels[row.tone]} · ${row.tag}` : row.tag)}</span>
     </div>
   `).join("");
 }
@@ -772,7 +922,7 @@ function renderInitial(state) {
         <span class="camera-badge ${escapeHtml(camera.status)}">${escapeHtml(camera.status)}</span>
       </header>
       <div class="camera-viewport">
-        <img data-camera-preview="${escapeHtml(camera.id)}" ${synchronizedReplay ? "" : `src="${API_BASE}/video/${encodeURIComponent(camera.id)}${remoteStream ? "?remote=1" : ""}"`} alt="${escapeHtml(camera.name)}">
+        <img data-camera-preview="${escapeHtml(camera.id)}" ${synchronizedReplay ? "" : `src="${screenVideoBase}/video/${encodeURIComponent(camera.id)}${remoteStream ? "?remote=1" : ""}"`} alt="${escapeHtml(camera.name)}">
       </div>
       <footer>
         <strong class="camera-identity">${escapeHtml(identityText(camera.identity))}</strong>
@@ -856,17 +1006,17 @@ function update(state) {
   }
   renderPeopleList(state.people || []);
   const runningCount = state.cameras.filter((camera) => camera.status === "running").length;
-  cameraSummary.textContent = `${runningCount}/${state.cameras.length} 路正常`;
+  if (cameraSummary) cameraSummary.textContent = `${runningCount}/${state.cameras.length} 路正常`;
   const identified = state.cameras.filter((camera) => camera.identity);
   const uniquePeople = [...new Set(identified.map((camera) => identityText(camera.identity)))];
-  identitySummary.textContent = uniquePeople.length ? uniquePeople.join("、") : "尚未确认";
+  if (identitySummary) identitySummary.textContent = uniquePeople.length ? uniquePeople.join("、") : "尚未确认";
   const handoff = identified.find((camera) => ["handoff", "overlap_handoff", "transition_handoff"].includes(camera.identity.identity_source));
-  handoffSummary.textContent = handoff
+  if (handoffSummary) handoffSummary.textContent = handoff
     ? `${handoff.identity.handoff_from_camera} → ${handoff.id} · ${identityText(handoff.identity)}`
     : "等待重叠区继承";
   // A missing optional instrument adapter must not stop the live map refresh.
   const visibleMap = typeof InstrumentLocation !== "undefined"
-    ? InstrumentLocation.apply(state.floor_map, latestInteractionEvents, instrumentAnchors)
+    ? InstrumentLocation.apply(state.floor_map, currentInteractionEvents(), equipment)
     : state.floor_map;
   renderFloorMap(visibleMap);
   renderRecording(state.recording, state.cameras);

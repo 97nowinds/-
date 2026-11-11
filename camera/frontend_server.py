@@ -42,6 +42,9 @@ FACES_TEMPLATE = ROOT / "templates" / "faces.html"
 RECORDINGS_TEMPLATE = ROOT / "templates" / "recordings.html"
 STATIC = ROOT / "static"
 INSTRUMENT_CONFIG = ROOT / "config" / "instruments.json"
+EQUIPMENT_POSITIONS = ROOT / "runtime" / "equipment_positions.json"
+EQUIPMENT_LOCK = threading.Lock()
+TWIN_RENDER_LOCK = threading.Lock()
 
 # Contains no camera content or people. This lets the handoff consumer verify
 # its allowlist, MIME checks and download path before real frames are shared.
@@ -551,6 +554,9 @@ class FrontendHandler(SimpleHTTPRequestHandler):
                 self._send_json({"error": "camera backend unavailable", "people": []}, status=503)
             return
         requested_api = parse_qs(parsed.query).get("api", [None])[0]
+        if route == "/api/screen/dashboard" or re.fullmatch(r"/api/screen/video/cam_(?:1|2|3|entrance)", route):
+            self._serve_screen_backend(route.removeprefix("/api/screen"), parsed.query)
+            return
         if requested_api and re.fullmatch(r"https?://[^\\s]+", requested_api):
             requested_api = requested_api.rstrip("/")
         else:
@@ -595,6 +601,10 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         if route == "/api/interaction-results/latest":
             self._proxy_interaction_results(parsed.query)
             return
+        if route == "/api/display/warnings":
+            runtime = self.server.management
+            self._send_json({'warnings': runtime.service.incidents.display_warnings() if runtime else []})
+            return
         if route == "/api/instrument-events":
             runtime = self.server.management
             if runtime is None:
@@ -603,7 +613,14 @@ class FrontendHandler(SimpleHTTPRequestHandler):
                 self._send_json(runtime.instrument_sync.snapshot())
             return
         if route == "/api/instruments/anchors":
-            self._send_json(json.loads(INSTRUMENT_CONFIG.read_text(encoding="utf-8")))
+            config = json.loads(INSTRUMENT_CONFIG.read_text(encoding="utf-8"))
+            positions = (json.loads(EQUIPMENT_POSITIONS.read_text(encoding="utf-8"))
+                         if EQUIPMENT_POSITIONS.exists() else {})
+            config["equipment"] = [
+                {**item, **positions.get(item["instrument_id"], {})}
+                for item in config.get("equipment", [])
+            ]
+            self._send_json(config)
             return
         if route == "/display":
             self._send_html(DISPLAY_TEMPLATE, requested_api)
@@ -640,6 +657,12 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         if handle_management(self, 'POST'):
             return
         route = urlsplit(self.path).path
+        if route == "/api/twin/frame":
+            self._render_twin_frame()
+            return
+        if route == "/api/instruments/placement":
+            self._save_equipment_position()
+            return
         allowed_routes = {
             "/api/integration/synthetic-round2": self._run_synthetic_round2,
             "/api/integration/synthetic-round3-frames": self._run_synthetic_round3_frames,
@@ -674,6 +697,43 @@ class FrontendHandler(SimpleHTTPRequestHandler):
                 },
                 status=500,
             )
+
+    def _save_equipment_position(self):
+        if (self.client_address[0] not in {"127.0.0.1", "::1"}
+                or self.headers.get("Host", "").split(":")[0] not in {"localhost", "127.0.0.1"}
+                or self.headers.get("Origin") != "http://" + self.headers.get("Host", "")
+                or self.headers.get_content_type() != "application/json"):
+            self._send_json({"error": "请在本机大屏设置点位"}, status=403)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if not 0 < length <= 512:
+                raise ValueError
+            data = json.loads(self.rfile.read(length))
+            instrument, x, y = data["instrument_id"], data["x_m"], data["y_m"]
+            catalog = json.loads(INSTRUMENT_CONFIG.read_text(encoding="utf-8"))["equipment"]
+            floor = json.loads((ROOT / "config" / "floor_map.json").read_text(encoding="utf-8"))
+            if (instrument not in {item["instrument_id"] for item in catalog}
+                    or not all(type(n) in {int, float} and math.isfinite(n) for n in (x, y))):
+                raise ValueError
+            fixture = next((f for f in floor["fixtures"] if f["type"] != "door"
+                            and f["x"] <= x <= f["x"] + f["width"]
+                            and f["y"] <= y <= f["y"] + f["height"]), None)
+            if fixture is None:
+                raise ValueError
+        except (ValueError, KeyError, TypeError, OverflowError):
+            self._send_json({"error": "请选择已登记仪器并点击实验台范围内的位置"}, status=400)
+            return
+        position = {"x_m": x, "y_m": y, "fixture_id": fixture["id"]}
+        with EQUIPMENT_LOCK:
+            positions = (json.loads(EQUIPMENT_POSITIONS.read_text(encoding="utf-8"))
+                         if EQUIPMENT_POSITIONS.exists() else {})
+            positions[instrument] = position
+            EQUIPMENT_POSITIONS.parent.mkdir(exist_ok=True)
+            temporary = EQUIPMENT_POSITIONS.with_suffix(".tmp")
+            temporary.write_text(json.dumps(positions, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(EQUIPMENT_POSITIONS)
+        self._send_json(position)
 
     @staticmethod
     def _member_step(response):
@@ -1260,6 +1320,75 @@ class FrontendHandler(SimpleHTTPRequestHandler):
                         self._send_json({'error': 'invalid result timestamps or association'}, status=502)
                         return
         self._send_json(body, status=response.status)
+
+    def _serve_screen_backend(self, route, query):
+        is_video = route.startswith("/video/")
+        upstream_path = route if is_video else "/api/dashboard"
+        if is_video and query == "remote=1":
+            upstream_path += "?remote=1"
+        try:
+            upstream = urlopen(self.server.api_base + upstream_path, timeout=5)
+        except OSError:
+            self._send_json({"error": "Camera backend unavailable"}, 503)
+            return
+        with upstream:
+            if not is_video:
+                try:
+                    data = upstream.read(4 * 1024 * 1024 + 1)
+                except OSError:
+                    self._send_json({"error": "Dashboard data unavailable"}, 503)
+                    return
+                if len(data) > 4 * 1024 * 1024:
+                    self._send_json({"error": "Dashboard response too large"}, 502)
+                    return
+                self._send_bytes(data, "application/json; charset=utf-8")
+                return
+            self.connection.settimeout(8)
+            self.send_response(200)
+            self.send_header("Content-Type", upstream.headers["Content-Type"])
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                while chunk := upstream.read1(64 * 1024):
+                    self.wfile.write(chunk)
+            except OSError:
+                return
+
+    def _render_twin_frame(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if not 0 < length <= 256 * 1024 or self.headers.get_content_type() != "application/json":
+            self._send_json({"error": "Invalid render request"}, 400)
+            return
+        if not TWIN_RENDER_LOCK.acquire(blocking=False):
+            self._send_json({"error": "Renderer busy"}, 503)
+            return
+        try:
+            self.connection.settimeout(4)
+            request = Request("http://127.0.0.1:5182/frame", data=self.rfile.read(length),
+                              headers={"Content-Type": "application/json", "Origin": "http://127.0.0.1:5173"})
+            with urlopen(request, timeout=4) as response:
+                frame = response.read(1024 * 1024 + 1)
+                bounds = response.headers.get("X-Instrument-Bounds")
+            if len(frame) > 1024 * 1024 or not frame.startswith(b"\xff\xd8"):
+                self._send_json({"error": "Invalid renderer response"}, 502)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(frame)))
+            if bounds:
+                self.send_header("X-Instrument-Bounds", bounds)
+            self.end_headers()
+            self.wfile.write(frame)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except OSError:
+            self._send_json({"error": "Renderer unavailable"}, 503)
+        finally:
+            TWIN_RENDER_LOCK.release()
 
     def _send_file(self, path, content_type):
         self._send_bytes(path.read_bytes(), content_type)

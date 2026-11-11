@@ -1,0 +1,25 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="presentation_blue.css">
+<style>
+  html,body,#scene { width:100%; height:100%; margin:0; overflow:hidden; }
+  #scene { position:relative; background:#071624; }
+  #scene .twin-reset, #scene .twin-stage-hint { display:none; }
+</style>
+<div id="scene" class="twin-viewport"></div>
+<script src="three-r160.min.js"></script>
+<script src="lab_twin_3d.js"></script>
+<script>
+  const gl = document.createElement("canvas").getContext("webgl2", {failIfMajorPerformanceCaveat:true});
+  const info = gl?.getExtension("WEBGL_debug_renderer_info");
+  window.labRendererGPU = info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : null;
+  gl?.getExtension("WEBGL_lose_context")?.loseContext();
+  window.renderLabFrame = ({map, equipment, trails, view}) => {
+    if (!LabTwin3D.render(document.querySelector("#scene"), map, equipment,
+        person => person.label, new Map(trails))) throw new Error("WebGL unavailable");
+    LabTwin3D.setCamera(view);
+    return new Promise(resolve => requestAnimationFrame(() =>
+      requestAnimationFrame(() => resolve(LabTwin3D.instrumentBounds()))));
+  };
+</script>
