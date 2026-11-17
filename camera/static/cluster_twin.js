@@ -9,7 +9,7 @@ const ClusterTwin = (() => {
   let nextRequest = 0;
 
   function schedule() {
-    if (!visible || pending || timer || !scene) return;
+    if (!visible || pending || timer || !scene || document.hidden) return;
     timer = setTimeout(requestFrame, Math.max(0,nextRequest-performance.now()));
   }
 
@@ -28,9 +28,17 @@ const ClusterTwin = (() => {
       if (!response.ok || !response.headers.get("Content-Type")?.startsWith("image/jpeg")) {
         throw new Error("Cluster frame unavailable");
       }
-      const url = URL.createObjectURL(await response.blob());
       const bounds = JSON.parse(response.headers.get("X-Instrument-Bounds") || "[]");
-      updateHotspots(bounds);
+      const url = URL.createObjectURL(await response.blob());
+      try {
+        const frame = new Image();
+        frame.src = url;
+        await frame.decode();
+        updateHotspots(bounds);
+      } catch (error) {
+        URL.revokeObjectURL(url);
+        throw error;
+      }
       const old = imageUrl;
       image.src = imageUrl = url;
       if (old) URL.revokeObjectURL(old);
@@ -39,9 +47,9 @@ const ClusterTwin = (() => {
       status.textContent = "集群渲染 · 拖动旋转 · 滚轮缩放";
     } catch {
       displayed = "";
-      image.hidden = true;
-      hotspots.replaceChildren();
-      status.textContent = "集群画面暂不可用 · 正在重连";
+      status.textContent = imageUrl
+        ? "画面更新中断 · 保留上一帧 · 正在重连"
+        : "集群画面暂不可用 · 正在重连";
       nextRequest = performance.now() + 1500;
     } finally {
       pending = false;
@@ -145,6 +153,16 @@ const ClusterTwin = (() => {
     timer = null;
     if (root) root.hidden = true;
   }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      clearTimeout(timer);
+      timer = null;
+    } else if (visible) {
+      displayed = "";
+      schedule();
+    }
+  });
 
   return {render,hide};
 })();

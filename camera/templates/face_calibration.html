@@ -1,5 +1,20 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>现场人脸补充标定</title><link rel="stylesheet" href="/static/face_calibration.css?v=2"></head><body><main>
-<header><div><a href="/">← 返回监控大屏</a><h1>现场人脸补充标定</h1><p>收集现场视角，核对人员归属，再补充注册图库。</p></div><span class="local">本机直接操作 · 无需令牌</span></header>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>现场样本标定</title><link rel="stylesheet" href="/static/face_calibration.css?v=3"></head><body><main>
+<header><div><a href="/">← 返回监控大屏</a><h1>现场样本标定</h1><nav aria-label="标定项目"><a href="#ppeReview">口罩与实验服标定</a> · <a href="#faceReview">人脸补充标定</a></nav></div><span class="local">本机直接操作 · 无需令牌</span></header>
+<section id="ppeReview">
+<h2>口罩与实验服标定</h2>
+<p>选择已录制录像，查看候选照片。分别确认口罩和实验服的穿戴状态后入库。</p>
+<div class="ppe-workbench"><div class="ppe-source">
+<div class="filters">
+<label>已录制录像<select id="ppeSavedVideo"><option value="">正在读取录像列表…</option></select></label><label>本机录像（可选）<input id="ppeVideoFile" type="file" accept="video/*"></label>
+<label>预览摄像头<select id="ppeVideoCamera"><option value="">请选择</option><option>cam_1</option><option>cam_2</option><option>cam_entrance</option></select></label>
+</div>
+</div><div class="ppe-preview"><div id="ppeSavedPreview" hidden><img id="ppeSavedFrame" alt="录制画面" style="width:min(100%,720px)"><label>录像位置<input id="ppeSavedPosition" type="range" min="0" value="0"><span id="ppeSavedTime"></span></label></div><video id="ppeVideo" controls playsinline preload="metadata" style="width:min(100%,720px)"></video>
+<div class="buttons"><button id="ppeSnap">截取当前帧</button><button id="ppeAuto" class="secondary">自动扫描整段录像</button></div>
+</div></div>
+<p id="ppeNotice" role="status">选择录像后开始。每张候选需要人工确认标签才会入库。</p>
+<h3 class="ppe-results-heading">精选候选</h3><div id="ppeCandidates"></div>
+</section>
+<h2 id="faceReview">人脸补充标定</h2>
 <section class="collection"><div><h2>1　间隔采集</h2><p id="session">正在连接集群采集服务…</p><small>最长24小时，每15秒检查一次，同相机至少间隔60秒存图；清晰度至少800才进入审核；保存人脸小图，不录视频。</small></div><div class="buttons"><button id="start">开始24小时采集</button><button id="stop" class="secondary">停止采集</button><button id="refresh" class="secondary">刷新候选</button></div></section>
 <div class="totals"><span>待审核 <b id="pendingCount">0</b></span><span>已审核待追加 <b id="approvedCount">0</b></span><span>已追加 <b id="enrolledCount">0</b></span><span>已拒绝 <b id="rejectedCount">0</b></span></div>
 <p id="notice" role="status">候选分组和建议姓名可能有误，请逐张核对。每位人员最多补充20张，原注册照片保留。</p>
@@ -8,4 +23,4 @@
 <div id="grid"></div><div class="pagination"><button id="prev" class="secondary">上一页</button><span id="page">第1页</span><button id="next" class="secondary">下一页</button><small>每页12张，翻页释放上一页图片，避免占用过多内存。</small></div></section>
 <section class="enrollment"><div><h2>3　追加已审核样本</h2><p id="personSummary">先选择人员并审核照片。</p><small>仅将人工确认的样本写入图库；自动建议不会直接注册。追加后在线重载，原库不覆盖。</small></div><div><button id="enroll" disabled>追加到此人员的图库</button><button id="retryReload" class="secondary" hidden>重试使图库生效</button></div></section>
 <details><summary>采集规则与提示</summary><p>每位建议人员最多保存20张，每路相机最多10张，优先保留不同视角；同姿态高度相似的照片会跳过。未知人员暂按轨迹分组，人工审核时合并归属。总量上限1000张，达到上限暂停保存。</p><p>鼻眼比例和倾斜标签只是关键点的近似分组，并非准确俯仰角。照片时间来自GPU源时钟。看不到脸、模糊、尺寸不足或多人脸归属不清时跳过，不凑满20张。</p></details>
-</main><script src="/static/face_calibration.js?v=2"></script></body></html>
+<script src="/static/recorded_ppe_review.js?v=9"></script></main><script src="/static/face_calibration.js?v=2"></script></body></html>

@@ -34,6 +34,14 @@ def handle_face_calibration(handler, method):
     if not principal:
         handler._send_json({'error':'请在本机通过 localhost 或 127.0.0.1 打开此页面'},status=403);return True
     action=path[len(prefix):]
+    if method == 'GET' and (action in {'ppe-recordings', 'ppe-prepared', 'ppe-prepared-all'} or action.startswith('ppe-recording-frame/')):
+        from recorded_ppe_api import serve_recording
+        serve_recording(handler, action)
+        return True
+    if method == 'POST' and action in {'ppe-scan', 'ppe-save'}:
+        from recorded_ppe_api import handle_recorded_ppe
+        handle_recorded_ppe(handler, action.removeprefix('ppe-'))
+        return True
     allowed=(method=='GET' and (action=='status' or re.fullmatch(r'images/[a-f0-9]{32}\.jpg',action))) or (method=='POST' and action in {'start','stop','review','unreview','enroll','reload'})
     if not allowed:handler._send_json({'error':'not found'},status=404);return True
     from feishu_app import load_credentials

@@ -142,6 +142,13 @@ h2 { font-size: 16px; }
   border-radius: 4px; pointer-events: auto; cursor: pointer; }
 .cluster-twin-hotspot:is(:hover,:focus-visible) { outline: 2px solid #9ddfff; }
 .cluster-twin .twin-reset { pointer-events: auto; }
+.cluster-twin:has(img[hidden]) .twin-reset { display: none; }
+.cluster-twin:has(img[hidden]) .twin-stage-hint {
+  top: 14px;
+  right: 14px;
+  bottom: auto;
+  left: auto;
+}
 .twin-tag {
   position: absolute; transform: translate(-50%, -100%); white-space: nowrap;
   padding: 4px 8px; color: #eaf6fb; border: 1px solid #567385;

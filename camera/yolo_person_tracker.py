@@ -2087,9 +2087,19 @@ class CrossCameraTrackCoordinator:
             and observation_count
             >= int(self.mtmc_config["counting"]["minimum_observations"])
         )
-        if identified or target.get("association_confirmed") or stable:
+        pending = self.pending.get(global_id, {})
+        candidate_id = pending.get("candidate_global_id")
+        candidate = self.global_tracks.get(candidate_id)
+        awaiting_handoff = bool(
+            not identified
+            and candidate is not None
+            and candidate_id != global_id
+            and candidate.get("camera_id") != target.get("camera_id")
+            and frozenset((global_id, candidate_id)) not in self.distinct_global_pairs
+        )
+        if identified or target.get("association_confirmed") or (stable and not awaiting_handoff):
             target["count_confirmed"] = True
-        counted = bool(target.get("count_confirmed"))
+        counted = bool(target.get("count_confirmed")) and not awaiting_handoff
         duplicate_of = None
         duplicate_score = None
         for group in self._count_duplicate_groups():

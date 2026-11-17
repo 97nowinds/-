@@ -156,3 +156,16 @@
   .presentation-blue .presentation-layout > .event-panel { max-height: 310px; }
   body.presentation-blue { overflow: auto; }
 }
+
+
+.presentation-blue .camera-viewport { position: relative; }
+.presentation-blue .camera-viewport:has(.preview-reconnecting)::after {
+  content: "视频连接中断 · 正在重连";
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  padding: 4px 8px;
+  color: #f0f7ff;
+  background: #153762;
+  border-radius: 4px;
+}

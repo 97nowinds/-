@@ -69,10 +69,11 @@ const LabTwin3D = (() => {
     let extent = 12;
     const target = new T.Vector3(0,.35,0);
     let drag;
+    let contextLost = false;
     let width = 0, height = 0, signature = "";
 
     function draw() {
-      if (root.hidden || !root.clientWidth || !root.clientHeight) return;
+      if (contextLost || root.hidden || !root.clientWidth || !root.clientHeight) return;
       const w = root.clientWidth, h = root.clientHeight;
       if (w !== width || h !== height) {
         renderer.setSize(w,h,false);
@@ -95,6 +96,15 @@ const LabTwin3D = (() => {
     }
     reset.onclick = () => { ({yaw,pitch,zoom}=overview); target.set(0,.35,0); draw(); };
     const canvas = renderer.domElement;
+    canvas.addEventListener("webglcontextlost", event => {
+      event.preventDefault();
+      contextLost = true;
+      root.hidden = true;
+    });
+    canvas.addEventListener("webglcontextrestored", () => {
+      contextLost = false;
+      width = height = 0;
+    });
     canvas.setAttribute("aria-label","三维实验室，拖动旋转，滚轮缩放");
     canvas.addEventListener("pointerdown", event => {
       if (!event.isPrimary || event.button !== 0) return;
@@ -654,7 +664,7 @@ const LabTwin3D = (() => {
         return [id,...[x,y,width,height].map(Math.round)];
       });
     }
-    return {root,update,setCamera,instrumentBounds};
+    return {root,update,setCamera,instrumentBounds, isReady: () => !contextLost};
   }
 
   function render(host,map,equipment,personLabel,trails) {
@@ -667,8 +677,16 @@ const LabTwin3D = (() => {
         return false;
       }
     }
-    view.update(map,equipment,personLabel,trails);
-    return true;
+    if (!view.isReady()) return false;
+    try {
+      view.update(map,equipment,personLabel,trails);
+      return true;
+    } catch (error) {
+      view.root.hidden = true;
+      unavailable = true;
+      console.warn("3D map rendering failed", error);
+      return false;
+    }
   }
   function hide() { if (view) view.root.hidden=true; }
   function setCamera(camera) { view?.setCamera(camera); }

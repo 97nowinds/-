@@ -98,14 +98,25 @@ class SafetyIncidents:
         return row is not None and not (before_red and (row['warning_event_id'] or '').endswith(':red'))
 
     def display_warnings(self):
-        # The public display only needs status, never identities or evidence.
+        # Include the confirmed name for mask warnings without exposing tracking data.
         with self.service.lock:
             rows = self.service.db.execute(
                 "SELECT e.payload FROM incidents i JOIN events e ON e.id=i.warning_event_id "
                 "WHERE i.kind='ppe' AND i.active=1 AND i.state='open' "
                 "ORDER BY i.warning_event_id LIKE '%:red' DESC,i.last_observed DESC LIMIT 9").fetchall()
         fields = ('event_type', 'severity', 'observed_at', 'warning_number')
-        return [{field: item[field] for field in fields} for item in (json.loads(row[0]) for row in rows)]
+        warnings = []
+        for row in rows:
+            item = json.loads(row[0])
+            warning = {field: item[field] for field in fields}
+            if item["event_type"] == "safety.no_mask":
+                name = item.get("display_name")
+                person_id = item.get("person_id")
+                if (isinstance(name, str) and name.strip() and isinstance(person_id, str)
+                        and person_id and not person_id.startswith("track:")):
+                    warning["display_name"] = name.strip()
+            warnings.append(warning)
+        return warnings
 
     def recover_ppe(self,incident,observed):
         s=self.service

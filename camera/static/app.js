@@ -63,8 +63,9 @@ const API_BASE = (
   location.origin
 ).replace(/\/$/, "");
 const HARDWARE_URL = window.__LAB_HARDWARE_URL__ || null;
-const useScreenProxy = ["127.0.0.1", "localhost", "[::1]"].includes(new URL(API_BASE, location.href).hostname)
-  && !new URLSearchParams(location.search).has("api");
+const loopbackHosts = ["127.0.0.1", "localhost", "[::1]"];
+const useScreenProxy = loopbackHosts.includes(new URL(API_BASE, location.href).hostname)
+  && (!new URLSearchParams(location.search).has("api") || !loopbackHosts.includes(location.hostname));
 const screenDashboardUrl = useScreenProxy ? "/api/screen/dashboard" : `${API_BASE}/api/dashboard`;
 const screenVideoBase = useScreenProxy ? "/api/screen" : API_BASE;
 const INTERACTION_URL = "/api/interaction-results/latest";
@@ -809,7 +810,9 @@ function renderEventFeed(state) {
 
   for (const warning of state.display_warnings || []) {
     const red = warning.severity === "L3";
-    const label = protectionLabels[warning.event_type] || "穿戴违规";
+    const label = warning.event_type === "safety.no_mask"
+      ? `${warning.display_name || "身份未确认人员"}未戴口罩`
+      : protectionLabels[warning.event_type] || "穿戴违规";
     rows.push({
       time: evidenceTime(warning.observed_at),
       text: red ? `${label} · 五次警告后仍未整改` : `${label} · 第 ${warning.warning_number}/5 次`,
@@ -925,7 +928,7 @@ function renderInitial(state) {
         <span class="camera-badge ${escapeHtml(camera.status)}">${escapeHtml(camera.status)}</span>
       </header>
       <div class="camera-viewport">
-        <img data-camera-preview="${escapeHtml(camera.id)}" ${synchronizedReplay ? "" : `src="${screenVideoBase}/video/${encodeURIComponent(camera.id)}${remoteStream ? "?remote=1" : ""}"`} alt="${escapeHtml(camera.name)}">
+        <img data-camera-preview="${escapeHtml(camera.id)}" alt="${escapeHtml(camera.name)}">
       </div>
       <footer>
         <strong class="camera-identity">${escapeHtml(identityText(camera.identity))}</strong>
@@ -935,8 +938,50 @@ function renderInitial(state) {
     </article>
   `).join("");
 
+  if (!synchronizedReplay) connectLivePreviews();
   renderPeopleList(state.people || []);
 }
+
+const livePreviewConnectors = new WeakMap();
+
+function connectLivePreviews(cameraId) {
+  for (const image of videoGrid.querySelectorAll("[data-camera-preview]")) {
+    if (cameraId && image.dataset.cameraPreview !== cameraId) continue;
+    const reconnect = livePreviewConnectors.get(image);
+    if (reconnect) {
+      reconnect();
+      continue;
+    }
+    const url = new URL(`${screenVideoBase}/video/${encodeURIComponent(image.dataset.cameraPreview)}`, location.href);
+    if (remoteStream) url.searchParams.set("remote", "1");
+    let timer;
+    let delay = 1000;
+    function connect() {
+      clearTimeout(timer);
+      if (!image.isConnected || synchronizedReplayEnabled || document.hidden) return;
+      if (!remoteStream) url.searchParams.set("_", Date.now());
+      image.src = url.href;
+    }
+    image.onload = () => {
+      delay = 1000;
+      image.classList.remove("preview-reconnecting");
+    };
+    image.onerror = () => {
+      if (!image.isConnected || synchronizedReplayEnabled) return;
+      image.classList.add("preview-reconnecting");
+      clearTimeout(timer);
+      timer = setTimeout(connect, delay);
+      delay = Math.min(delay * 2, 10000);
+    };
+    livePreviewConnectors.set(image, connect);
+    connect();
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && videoGrid && !synchronizedReplayEnabled) connectLivePreviews();
+});
+window.addEventListener("online", refresh);
 
 async function refreshSynchronizedReplay() {
   if (!synchronizedReplayEnabled || synchronizedReplayBusy) return;
@@ -992,9 +1037,10 @@ function configureSynchronizedReplay(state) {
   }
   for (const url of synchronizedReplayObjectUrls.values()) URL.revokeObjectURL(url);
   synchronizedReplayObjectUrls.clear();
+  connectLivePreviews();
 }
 
-function update(state) {
+function update(state, recovering) {
   if (videoGrid && videoGrid.children.length !== state.cameras.length) renderInitial(state);
   configureSynchronizedReplay(state);
   const replayCycles = state.cameras.map((camera) => camera.replay?.enabled ? camera.replay.cycle : null);
@@ -1030,6 +1076,8 @@ function update(state) {
     const card = document.querySelector(`[data-camera-id="${CSS.escape(camera.id)}"]`);
     if (!card) continue;
     const badge = card.querySelector(".camera-badge");
+    if (!recovering && !synchronizedReplayEnabled && camera.status === "running" &&
+        badge.textContent !== "running") connectLivePreviews(camera.id);
     badge.textContent = camera.status;
     badge.className = `camera-badge ${camera.status}`;
     card.querySelector(".camera-identity").textContent = identityText(camera.identity);
@@ -1055,9 +1103,11 @@ async function refresh() {
       serviceState.className = `service-state ${disconnected ? "error" : "delayed"}`;
       return;
     }
+    const recovering = consecutiveStateFailures > 0;
     consecutiveStateFailures = 0;
     lastStateReceivedAt = Date.now();
-    update(state);
+    update(state, recovering);
+    if (recovering && videoGrid && !synchronizedReplayEnabled) connectLivePreviews();
     serviceState.textContent = "服务在线";
     serviceState.className = "service-state online";
   } catch (error) {

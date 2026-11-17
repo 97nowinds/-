@@ -330,6 +330,30 @@ class CrossCameraTrackCoordinatorTests(unittest.TestCase):
         self.assertEqual(confirmed["count_status"], "confirmed")
         self.assertEqual(confirmed["observation_count"], 3)
 
+    def test_pending_cross_camera_handoff_does_not_add_to_occupancy(self):
+        coordinator = self.coordinator(self.UncalibratedFloorMap())
+        coordinator.global_tracks.update({
+            "person_1": {"camera_id": "cam_1", "count_confirmed": True},
+            "person_2": {
+                "camera_id": "cam_2", "first_seen": 1.0, "last_seen": 3.0,
+                "observation_count": 5, "count_confirmed": True,
+            },
+        })
+        coordinator.pending["person_2"] = {
+            "candidate_global_id": "person_1", "expires_at": 6.0,
+        }
+
+        self.assertTrue(coordinator._count_state("person_1")["counted"])
+        pending = coordinator._count_state("person_2")
+        self.assertFalse(pending["counted"])
+        self.assertEqual(pending["count_status"], "pending_association")
+
+        coordinator.distinct_global_pairs[frozenset(("person_1", "person_2"))] = 3.0
+        self.assertTrue(coordinator._count_state("person_2")["counted"])
+        coordinator.distinct_global_pairs.clear()
+        coordinator.pending.pop("person_2")
+        self.assertTrue(coordinator._count_state("person_2")["counted"])
+
     def test_batch_update_is_one_to_one_and_order_independent(self):
         floor_map = self.TransitionFloorMap()
 

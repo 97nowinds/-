@@ -11,6 +11,7 @@ import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen, build_opener, ProxyHandler
 from handoff_transport import ImmutableSnapshots, bearer_authorized, load_demo_config
 
@@ -120,6 +121,9 @@ class MapHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        if self.path == '/api/handoff/ppe-results':
+            self._forward_ppe_results()
+            return
         received_at = time.time()
         if self.path != '/api/handoff/time-sync':
             self._json({'error': 'not found'}, 404)
@@ -146,6 +150,33 @@ class MapHandler(BaseHTTPRequestHandler):
         self._json({**data, 'authority_clock': self.server.authority_clock,
             'authority_received_at': datetime.fromtimestamp(received_at, timezone.utc).isoformat(),
             'authority_sent_at': datetime.fromtimestamp(time.time(), timezone.utc).isoformat()})
+
+    def _forward_ppe_results(self):
+        authorization = self.headers.get('Authorization')
+        if not authorization:
+            self._json({'error': 'authentication required'}, 401)
+            return
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            if not 0 < length <= 262144:
+                raise ValueError()
+        except ValueError:
+            self._json({'error': 'invalid PPE body size'}, 400)
+            return
+        request = Request('http://127.0.0.1:5173/api/management/ppe-live',
+            data=self.rfile.read(length),
+            headers={'Authorization': authorization, 'Content-Type': 'application/json'})
+        try:
+            with build_opener(ProxyHandler({})).open(request, timeout=15) as response:
+                payload = json.load(response)
+        except HTTPError as error:
+            error.close()
+            self._json({'error': 'PPE intake rejected the submission'}, error.code)
+            return
+        except (OSError, ValueError):
+            self._json({'error': 'PPE intake unavailable'}, 502)
+            return
+        self._json(payload)
 
     def do_GET(self):
         route = self.path.split('?')[0]
