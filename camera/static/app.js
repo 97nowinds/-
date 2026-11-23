@@ -944,12 +944,82 @@ function renderInitial(state) {
 
 const livePreviewConnectors = new WeakMap();
 
+function latestPreviewConnector(image) {
+  const url = new URL(
+    `${screenVideoBase}/api/live/latest-frame/${encodeURIComponent(image.dataset.cameraPreview)}.jpg`,
+    location.href,
+  );
+  if (remoteStream) url.searchParams.set("remote", "1");
+  let pending = false;
+  let timer;
+  let displayedUrl;
+  let lastCapture;
+  let lastSequence;
+  const frameInterval = remoteStream ? 100 : 125;
+  const shouldRun = () => image.isConnected && !synchronizedReplayEnabled && !document.hidden;
+
+  async function connect() {
+    clearTimeout(timer);
+    if (!image.isConnected && displayedUrl) {
+      URL.revokeObjectURL(displayedUrl);
+      displayedUrl = undefined;
+    }
+    if (pending || !shouldRun()) return;
+    pending = true;
+    const startedAt = performance.now();
+    let failed = false;
+    let nextUrl;
+    try {
+      if (lastSequence) url.searchParams.set("after", lastSequence);
+      const response = await fetch(url, {cache: "no-store", signal: AbortSignal.timeout(4500)});
+      if (!response.ok || !response.headers.get("Content-Type")?.startsWith("image/jpeg")) {
+        throw new Error("Fresh camera preview unavailable");
+      }
+      const capture = response.headers.get("X-Capture-Unix-Time");
+      const sequence = response.headers.get("X-Frame-Sequence");
+      const blob = await response.blob();
+      if (shouldRun() && (!capture || capture !== lastCapture || image.src !== displayedUrl)) {
+        nextUrl = URL.createObjectURL(blob);
+        const preload = new Image();
+        preload.src = nextUrl;
+        await preload.decode();
+        if (shouldRun()) {
+          image.src = nextUrl;
+          if (displayedUrl) URL.revokeObjectURL(displayedUrl);
+          displayedUrl = nextUrl;
+          lastCapture = capture;
+          nextUrl = undefined;
+        }
+      }
+      lastSequence = sequence;
+      image.classList.remove("preview-reconnecting");
+    } catch {
+      if (shouldRun()) image.classList.add("preview-reconnecting");
+      failed = true;
+    } finally {
+      if (nextUrl) URL.revokeObjectURL(nextUrl);
+      pending = false;
+      if (shouldRun() || !image.isConnected) {
+        const delay = failed ? 350 : Math.max(0, frameInterval - (performance.now() - startedAt));
+        timer = setTimeout(connect, delay);
+      }
+    }
+  }
+  return connect;
+}
+
 function connectLivePreviews(cameraId) {
   for (const image of videoGrid.querySelectorAll("[data-camera-preview]")) {
     if (cameraId && image.dataset.cameraPreview !== cameraId) continue;
     const reconnect = livePreviewConnectors.get(image);
     if (reconnect) {
       reconnect();
+      continue;
+    }
+    if (location.pathname === "/display") {
+      const connect = latestPreviewConnector(image);
+      livePreviewConnectors.set(image, connect);
+      connect();
       continue;
     }
     const url = new URL(`${screenVideoBase}/video/${encodeURIComponent(image.dataset.cameraPreview)}`, location.href);

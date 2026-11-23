@@ -554,6 +554,9 @@ class FrontendHandler(SimpleHTTPRequestHandler):
                 self._send_json({"error": "camera backend unavailable", "people": []}, status=503)
             return
         requested_api = parse_qs(parsed.query).get("api", [None])[0]
+        if re.fullmatch(r"/api/screen/api/live/latest-frame/cam_(?:1|2|3|entrance)\.jpg", route):
+            self._serve_latest_preview(route.removeprefix("/api/screen"), parsed.query)
+            return
         if route == "/api/screen/dashboard" or re.fullmatch(r"/api/screen/video/cam_(?:1|2|3|entrance)", route):
             self._serve_screen_backend(route.removeprefix("/api/screen"), parsed.query)
             return
@@ -1320,6 +1323,45 @@ class FrontendHandler(SimpleHTTPRequestHandler):
                         self._send_json({'error': 'invalid result timestamps or association'}, status=502)
                         return
         self._send_json(body, status=response.status)
+
+    def _serve_latest_preview(self, route, query):
+        params = parse_qs(query, keep_blank_values=True)
+        after = params.get("after", [None])[0]
+        if after is not None and not re.fullmatch(r"[0-9]{1,18}", after):
+            self._send_json({"error": "Invalid preview frame sequence"}, 400)
+            return
+        fields = []
+        if params.get("remote") == ["1"]:
+            fields.append("remote=1")
+        if after is not None:
+            fields.append("after=" + after)
+        suffix = "?" + "&".join(fields) if fields else ""
+        limit = 1024 * 1024
+        try:
+            with urlopen(self.server.api_base + route + suffix, timeout=4) as upstream:
+                frame = upstream.read(limit + 1)
+                sequence = upstream.headers.get("X-Frame-Sequence", "")
+                captured = upstream.headers.get("X-Capture-Unix-Time", "")
+                if (upstream.headers.get_content_type() != "image/jpeg" or len(frame) > limit
+                        or not frame.startswith(b"\xff\xd8") or not frame.endswith(b"\xff\xd9")
+                        or not re.fullmatch(r"\d+", sequence)
+                        or not re.fullmatch(r"\d+\.\d+", captured)):
+                    self._send_json({"error": "Invalid camera preview frame"}, 502)
+                    return
+        except OSError:
+            self._send_json({"error": "Fresh camera frame unavailable"}, 503)
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(frame)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Frame-Sequence", sequence)
+            self.send_header("X-Capture-Unix-Time", captured)
+            self.end_headers()
+            self.wfile.write(frame)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _serve_screen_backend(self, route, query):
         is_video = route.startswith("/video/")

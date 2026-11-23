@@ -547,6 +547,7 @@ class CameraWorker:
         self.display_sequence = 0
         self.jpeg_condition = threading.Condition()
         self.jpeg_frames = {False: None, True: None}
+        self.jpeg_capture_at = {False: None, True: None}
         self.jpeg_subscribers = {False: 0, True: 0}
         self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
         self.thread = threading.Thread(target=self.process_loop, daemon=True)
@@ -822,6 +823,8 @@ class CameraWorker:
                     profiles[remote] = (jpeg_sequence, encoded.tobytes(), host_to_jpeg_ms)
             with self.jpeg_condition:
                 self.jpeg_frames.update(profiles)
+                for profile in profiles:
+                    self.jpeg_capture_at[profile] = preview_capture_at
                 self.jpeg_condition.notify_all()
             self.record_preview_frame()
 
@@ -2935,6 +2938,39 @@ def api_health():
                     "service_revision": "hd-same-frame-20261011-r1",
                     "snapshot_schema_version": "lab-handoff-1.2",
                     "freeze_enabled": os.environ.get('LAB_HANDOFF_FREEZE_ENABLED', '0') == '1'})
+
+
+@app.route("/api/live/latest-frame/<camera_id>.jpg")
+def latest_live_frame(camera_id):
+    worker = camera_manager.workers.get(camera_id)
+    if worker is None:
+        return "camera not found", 404
+    remote = request.args.get("remote") == "1"
+    after = request.args.get("after")
+    if after is not None and not re.fullmatch(r"[0-9]{1,18}", after):
+        return jsonify(error="Invalid preview frame sequence"), 400
+    after_sequence = int(after) if after is not None else None
+    worker.add_jpeg_subscriber(remote)
+    try:
+        with worker.jpeg_condition:
+            def fresh():
+                captured = worker.jpeg_capture_at[remote]
+                return (worker.jpeg_frames[remote] is not None
+                        and worker.jpeg_frames[remote][0] != after_sequence
+                        and captured is not None and 0 <= time.time() - captured <= 0.22)
+
+            worker.jpeg_condition.wait_for(lambda: not worker.running or fresh(), timeout=1.0)
+            if not worker.running or not fresh():
+                return jsonify(error="Fresh camera frame unavailable"), 503
+            sequence, jpeg, _ = worker.jpeg_frames[remote]
+            captured = worker.jpeg_capture_at[remote]
+    finally:
+        worker.remove_jpeg_subscriber(remote)
+    return Response(jpeg, mimetype="image/jpeg", headers={
+        "Cache-Control": "no-store",
+        "X-Frame-Sequence": str(sequence),
+        "X-Capture-Unix-Time": f"{captured:.6f}",
+    })
 
 
 @app.route("/video/<camera_id>")
