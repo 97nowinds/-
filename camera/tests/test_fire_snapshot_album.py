@@ -7,6 +7,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from management_notifications import ManagementNotifications, iso
 from fire_snapshot_album import FireSnapshotAlbums, CAMERAS, scene_time
+from hazard_live_worker import FlameAlertWindow, face_overlap
 
 
 class FireAlbumTests(unittest.TestCase):
@@ -74,6 +75,62 @@ class FireAlbumTests(unittest.TestCase):
     def test_visual_alarm_uses_same_three_camera_path(self):
         self.event('fire_signal_fusion'); self.worker.capture_once()
         self.assertCountEqual(self.calls,CAMERAS)
+
+    def test_visual_prewarning_sends_only_the_triggering_camera_frame(self):
+        event = {'event_id': 'visual-fire', 'event_type': 'environment.visual_flame',
+                 'lab_id': 'synthetic-lab', 'device_id': 'cam_2', 'camera_id': 'cam_2',
+                 'observed_at': iso(self.now), 'evidence_source': 'cluster_visual',
+                 'visual_confidence': '76.6%', 'evidence_id': 'trigger-frame'}
+        self.assertTrue(self.service.record(event))
+        self.assertFalse(self.worker.capture_once())
+        self.assertFalse(self.worker.deliver_once())
+        self.deliver_texts(); self.deliver_albums()
+        self.assertEqual(len(self.sent), 6)
+        for _, payload in self.sent[3:]:
+            rows = payload['content']['post']['zh_cn']['content']
+            self.assertEqual(sum(tag['tag'] == 'img' for row in rows for tag in row), 1)
+            self.assertIn('触发视觉预警的模型输入画面', rows[0][0]['text'])
+
+    def test_smoke_evidence_and_text_are_sent_together_once(self):
+        event = {'event_id': 'visual-smoke', 'event_type': 'environment.visual_smoke',
+                 'lab_id': 'synthetic-lab', 'device_id': 'cam_entrance', 'camera_id': 'cam_entrance',
+                 'observed_at': iso(self.now), 'evidence_source': 'cluster_visual',
+                 'visual_confidence': '62.7%'}
+        self.assertTrue(self.service.record(event))
+        self.assertTrue(self.service.deliver_once())
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.service.record({**event, 'evidence_id': 'smoke-frame'}))
+        self.now += 3
+        with patch('notification_delivery.evidence_image_key', return_value='smoke-image'):
+            self.deliver_texts()
+        self.assertFalse(self.worker.capture_once())
+        self.assertFalse(self.worker.deliver_once())
+        self.assertEqual(len(self.sent), 3)
+        for _, payload in self.sent:
+            post = payload['content']['post']['zh_cn']
+            self.assertIn('烟雾视觉预警', post['title'])
+            self.assertEqual(sum(tag['tag'] == 'img' for row in post['content'] for tag in row), 1)
+
+    def test_visual_flame_repeats_while_present_and_restarts_after_clear(self):
+        window = FlameAlertWindow()
+        results = [window.observe(True, i / 4) for i in range(45)]
+        self.assertEqual([result for result in results if result], ['visual_initial', 'visual_ongoing'])
+        self.assertTrue(all(window.observe(False, 12 + i / 4) is None for i in range(5)))
+        results = [window.observe(True, 14 + i / 4) for i in range(3)]
+        self.assertEqual(results, [None, None, 'visual_initial'])
+        for index, stage in enumerate(('visual_initial', 'visual_ongoing', 'visual_initial')):
+            self.now += 10
+            ident = f'flame-{index}'
+            self.assertTrue(self.service.record({'event_id': ident, 'event_type': 'environment.visual_flame',
+                'lab_id': 'synthetic-lab', 'camera_id': 'cam_2', 'device_id': 'cam_2', 'observed_at': iso(self.now),
+                'visual_confidence': '76.6%', 'evidence_source': 'cluster_visual', 'fire_stage': stage}))
+        self.assertEqual(self.service.db.execute('SELECT count(*) FROM outbox').fetchone()[0], 9)
+
+    def test_flame_face_filter_requires_high_mutual_overlap(self):
+        face = (1320, 899, 141, 177)
+        self.assertTrue(face_overlap((1301, 862, 156, 204), face))
+        self.assertFalse(face_overlap((1420, 900, 32, 54), face))
+        self.assertFalse(face_overlap((1470, 869, 28, 44), face))
 
     def test_one_offline_camera_retries_then_sends_two_images_with_missing_label(self):
         capture=self.worker.capture

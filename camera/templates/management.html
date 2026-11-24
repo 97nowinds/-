@@ -9,7 +9,7 @@
 <small>身份、时间或画面对齐不明确时不生成实名违规通知。权限覆盖通知管理模块；原监控服务的访问控制需要另外部署。</small></main><script>
 let token='',role='',epoch=0;const images=new Set();const $=id=>document.getElementById(id);
 const roles={admin:'维护管理员',producer:'检测服务'};
-const labels={'person.entered':'进入实验室','instrument.started':'开始使用仪器','instrument.ended':'结束使用仪器','safety.no_mask':'未戴口罩','safety.no_lab_coat':'未穿实验服','safety.no_gloves':'未戴手套','environment.flame':'火焰报警','environment.flame_recovered':'火焰信号恢复，待核查'};
+const labels={'person.entered':'进入实验室','instrument.started':'开始使用仪器','instrument.ended':'结束使用仪器','safety.no_mask':'未戴口罩','safety.no_lab_coat':'未穿实验服','safety.no_gloves':'未戴手套','environment.flame':'火焰报警','environment.flame_recovered':'火焰信号恢复，待核查','environment.visual_smoke':'烟雾视觉预警 · 待复核','environment.visual_flame':'火焰视觉预警 · 待复核'};
 const levels={L0:['一般通知','normal'],L1:['黄色警告','warning'],L2:['黄色警告','warning'],L3:['红色预警','danger']};
 const states={open:'待确认',acknowledged:'已认领',recovered:'已恢复，待核查关闭',closed:'已关闭'};
 function node(tag,text){const n=document.createElement(tag);n.textContent=text;return n;}function report(e){$('status').textContent=e.message||String(e);}

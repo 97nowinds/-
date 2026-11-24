@@ -56,6 +56,16 @@ class AlertEvidence:
                 or not parsed.path.startswith('/api/handoff/') or not parsed.path.endswith('.jpg')):
             raise EvidenceUnavailable('snapshot origin not allowlisted')
         jpeg=self.fetch(url)
+        return self._store(row, frame, track, jpeg, scene)
+
+    def store_scene_jpeg(self, row, jpeg, width, height):
+        """Store a trusted observer or recording frame already received as bytes."""
+        frame = {'image_sha256': hashlib.sha256(jpeg).hexdigest(), 'frame_width': width,
+                 'frame_height': height, 'source_frame_id': row.get('source_frame_id')}
+        track = {'bbox': row.get('fire_bbox') or [0, 0, width, height], 'bbox_format': 'xywh_pixels'}
+        return self._store(row, frame, track, jpeg, True, circle=True)
+
+    def _store(self, row, frame, track, jpeg, scene, circle=False):
         if len(jpeg)>10*1024*1024 or hashlib.sha256(jpeg).hexdigest()!=frame.get('image_sha256'):
             raise EvidenceUnavailable('snapshot digest mismatch')
         try:
@@ -75,7 +85,13 @@ class AlertEvidence:
                 # Preserve original; create a separate annotated copy for group viewing.
                 annotated=image.convert('RGB')
                 if not scene or row.get('fire_bbox') is not None:
-                    ImageDraw.Draw(annotated).rectangle((x,y,x+w,y+h),outline=(255,60,30),width=4)
+                    painter = ImageDraw.Draw(annotated)
+                    if circle:
+                        cx, cy = x + w / 2, y + h / 2
+                        radius = max(24, math.hypot(w, h) / 2 + 10)
+                        painter.ellipse((cx-radius, cy-radius, cx+radius, cy+radius), outline=(255, 50, 30), width=7)
+                    else:
+                        painter.rectangle((x,y,x+w,y+h),outline=(255,60,30),width=4)
                 output=BytesIO();annotated.save(output,format='JPEG',quality=90)
         except EvidenceUnavailable:
             raise
@@ -88,7 +104,7 @@ class AlertEvidence:
             if old['source_sha256']!=frame['image_sha256'] or old['bbox']!=box:
                 raise EvidenceUnavailable('snapshot evidence changed')
         metadata={key:row.get(key) for key in ('camera_id','snapshot_id','track_id','person_id','captured_at')}
-        if scene:metadata.update(track_id=None,person_id=None,kind='fire_scene')
+        if scene:metadata.update(track_id=None,person_id=None,kind=row.get('kind','fire_scene'))
         metadata.update(source_sha256=frame['image_sha256'],source_frame_id=frame.get('source_frame_id'),
                         bbox=box,frame_width=frame['frame_width'],frame_height=frame['frame_height'])
         for name,content in [('original.dpapi',jpeg),('annotated.dpapi',output.getvalue()),
@@ -111,9 +127,10 @@ class AlertEvidence:
 
 def group_evidence_payload(text,image_key,secret='',now=None,title='实验室防护告警｜证据快照'):
     from management_notifications import feishu_payload
+    image_keys = image_key if isinstance(image_key, list) else [image_key]
     payload={'msg_type':'post','content':{'post':{'zh_cn':{
         'title':title,
-        'content':[[{'tag':'text','text':text}],[{'tag':'img','image_key':image_key}]]}}}}
+        'content':[[{'tag':'text','text':text}]] + [[{'tag':'img','image_key':key}] for key in image_keys]}}}}
     signed=feishu_payload('',secret,now)
     for key in ('timestamp','sign'):
         if key in signed:payload[key]=signed[key]

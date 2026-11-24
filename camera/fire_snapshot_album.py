@@ -6,6 +6,7 @@ import math
 import threading
 import time
 from urllib.request import Request, build_opener, ProxyHandler
+from hazard_feed import VISUAL_PREWARNINGS
 
 CAMERAS = ('cam_1', 'cam_2', 'cam_entrance')
 
@@ -32,10 +33,27 @@ def initialize(service):
 
 
 def enqueue(service, event):
+    if event['event_type'] == VISUAL_PREWARNINGS['flame'] and event.get('evidence_id'):
+        enqueue_visual_snapshot(service, event, event['evidence_id'])
+        return
     if event['event_type'] != 'environment.flame':
         return
     service.db.execute('INSERT OR IGNORE INTO fire_snapshot_jobs VALUES(?,?,?,?)',
                        (event['event_id'], service.wall()+20, '{}', 'pending'))
+
+
+def enqueue_visual_snapshot(service, event, evidence_id, recording_frame=None):
+    """Queue the already acquired one-camera visual frame in the current transaction."""
+    camera = event['camera_id']
+    item = {'status': 'available', 'camera_id': camera, 'evidence_id': evidence_id}
+    if recording_frame is not None:
+        item['recording_frame'] = recording_frame
+    now = service.wall()
+    service.db.execute('INSERT OR IGNORE INTO fire_snapshot_jobs VALUES(?,?,?,?)',
+                       (event['event_id'], now + 300, json.dumps({camera: item}), 'captured'))
+    service.db.execute('INSERT OR IGNORE INTO fire_snapshot_deliveries '
+                       'SELECT event_id,route_id,\'pending\',0,?,NULL FROM outbox WHERE event_id=?',
+                       (now, event['event_id']))
 
 
 def scene_time(frozen, authority, now, alarm):
@@ -120,6 +138,14 @@ class FrozenSceneCapture:
 
 def album_payload(event, items, keys, secret, now):
     from management_notifications import feishu_payload, stamp
+    if event['event_type'] == VISUAL_PREWARNINGS['flame']:
+        from alert_evidence import group_evidence_payload
+        from management_notifications import ManagementNotifications
+        camera = event['camera_id']
+        frame = items[camera].get('recording_frame')
+        source = f'录像补发｜{frame}' if frame else '触发视觉预警的模型输入画面（红圈标出模型检出位置）'
+        return group_evidence_payload(ManagementNotifications.message(event) + '\n图片：' + source,
+            keys[camera], secret, now, title='实验室火焰视觉预警｜报警快照')
     local = lambda value: datetime.fromtimestamp(stamp(value), timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
     rows = [[{'tag': 'text', 'text': '火焰报警现场快照（不代表三路均发现火焰）\n'
         '群内图片为压缩预览，原始快照加密保留后台。\n报警时间：'+local(event['observed_at'])+' 北京时间\n'
@@ -201,21 +227,20 @@ class FireSnapshotAlbums:
 
     def deliver_once(self):
         from feishu_app import EVIDENCE_CREDENTIALS, FeishuAppClient, load_credentials
-        from management_notifications import scoped
+        from management_notifications import route_accepts
         s = self.service
         with s.lock, s.db:
             s.db.execute("UPDATE fire_snapshot_deliveries SET state='pending' WHERE state='sending' AND due<=?", (s.wall(),))
-            row = s.db.execute("SELECT d.*,j.items,e.payload,e.received FROM fire_snapshot_deliveries d "
+            row = s.db.execute("SELECT d.*,j.items,j.deadline,e.payload,e.received FROM fire_snapshot_deliveries d "
                 'JOIN fire_snapshot_jobs j ON j.event_id=d.event_id JOIN events e ON e.id=d.event_id '
                 'JOIN outbox o ON o.event_id=d.event_id AND o.route_id=d.route_id '
                 "WHERE d.state='pending' AND d.due<=? AND o.state='sent' ORDER BY e.received LIMIT 1", (s.wall(),)).fetchone()
             if not row: return False
             event, items = json.loads(row['payload']), json.loads(row['items'])
             route = next((r for r in s.config['routes'] if r['id'] == row['route_id']), None)
-            if (not route or event['event_type'] not in route['event_types'] or not scoped(
-                    dict(role='route', labs=route['labs'], instruments=route.get('instruments')), event)):
+            if event['event_type'] == VISUAL_PREWARNINGS['smoke'] or not route or not route_accepts(route, event):
                 state = 'cancelled'
-            elif s.wall()-row['received'] > 300:
+            elif s.wall() > (row['deadline'] if event['event_type'] == VISUAL_PREWARNINGS['flame'] else row['received'] + 300):
                 state = 'expired'
             else: state = None
             if state:
@@ -234,8 +259,7 @@ class FireSnapshotAlbums:
                         s.image_client = FeishuAppClient(load_credentials(EVIDENCE_CREDENTIALS), wall=s.wall)
                         s.image_credentials_revision = revision
                     client = s.image_client; app_id = client.credentials['app_id']
-                    for camera in CAMERAS:
-                        item = items[camera]
+                    for camera, item in items.items():
                         if item['status'] != 'available': continue
                         with s.lock:
                             saved = s.db.execute('SELECT image_key FROM evidence_uploads WHERE evidence_id=? AND app_id=?',

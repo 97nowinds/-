@@ -7,6 +7,7 @@ from urllib.request import urlopen
 
 from management_notifications import ManagementNotifications, EvidenceAdapter
 from handoff_result_index import SnapshotTrackIndex
+from hazard_feed import forward_visual_prewarnings
 
 
 class ManagementRuntime:
@@ -66,6 +67,7 @@ class ManagementRuntime:
         self.shared_index=SnapshotTrackIndex(max_snapshots=1200)
         self.stop_event = threading.Event()
         self.last_poll_status = 'starting'
+        self.visual_hazard_path = Path(config_path).parent.parent / 'runtime' / 'visual_hazard_observations.json'
         self.ppe_live_status = {'state': 'waiting', 'received_frames': 0}
         self.handoff_credentials = handoff_credentials
         self.thread = None
@@ -105,9 +107,11 @@ class ManagementRuntime:
         self.instrument_sync.start()
         self.environment_thread=threading.Thread(target=self._poll_environment,daemon=True,name='lab-local-alarm')
         self.environment_thread.start()
+        self.visual_hazard_thread = threading.Thread(target=self._poll_visual_hazards, daemon=True,
+                                                    name='lab-visual-prewarnings')
+        self.visual_hazard_thread.start()
         self.thread = threading.Thread(target=self._poll, daemon=True, name='lab-management-evidence')
         self.thread.start()
-
     def _poll_environment(self):
         while not self.stop_event.is_set():
             try:
@@ -117,6 +121,15 @@ class ManagementRuntime:
             except Exception:
                 pass
             self.stop_event.wait(.25)
+
+    def _poll_visual_hazards(self):
+        started_at = self.service.wall()
+        while not self.stop_event.is_set():
+            try:
+                forward_visual_prewarnings(self.service, self.visual_hazard_path, started_at)
+            except (OSError, ValueError) as error:
+                print(f'Visual prewarning ingestion failed: {type(error).__name__}', flush=True)
+            self.stop_event.wait(1)
 
     def _poll(self):
         while not self.stop_event.is_set():
@@ -156,6 +169,8 @@ class ManagementRuntime:
         if self.thread:
             self.thread.join(timeout=7)
         if getattr(self,'environment_thread',None):self.environment_thread.join(timeout=2)
+        if getattr(self, 'visual_hazard_thread', None):
+            self.visual_hazard_thread.join(timeout=2)
         self.service.stop()
 
 

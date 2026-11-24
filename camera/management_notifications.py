@@ -18,8 +18,10 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from hazard_feed import VISUAL_PREWARNINGS, VISUAL_FLAME_STAGES
+
 KINDS = {'person.entered', 'instrument.started', 'instrument.ended', 'safety.no_mask', 'safety.no_lab_coat', 'safety.no_gloves',
-         'environment.flame','environment.flame_recovered'}
+         'environment.flame','environment.flame_recovered', *VISUAL_PREWARNINGS.values()}
 ROLES = {'admin', 'producer'}
 
 
@@ -51,8 +53,24 @@ def route_accepts(route, event):
     if event['event_type'].startswith('safety.'):
         if (event.get('severity') == 'L3') != (audience == 'administrators'):
             return False
-    return (event['event_type'] in route['event_types'] and scoped(principal, event)
+    event_type = event['event_type']
+    subscribed = event_type in route['event_types'] or (
+        event_type in VISUAL_PREWARNINGS.values() and 'environment.flame' in route['event_types'])
+    return (subscribed and scoped(principal, event)
             and (not event.get('audiences') or audience in event['audiences'].split(',')))
+
+
+def cooldown_key(event):
+    event_type = event['event_type']
+    if event_type in VISUAL_PREWARNINGS.values():
+        return event_type, event.get('camera_id')
+    return event_type, event.get('person_id'), event.get('instrument_id')
+
+
+def uses_visual_flame_timing(event):
+    return (event['event_type'] == VISUAL_PREWARNINGS['flame']
+            and event.get('evidence_source') == 'cluster_visual'
+            and event.get('fire_stage') in VISUAL_FLAME_STAGES)
 
 
 def feishu_payload(text, secret='', now=None):
@@ -182,7 +200,7 @@ class ManagementNotifications:
                   'camera_id', 'snapshot_id', 'track_id', 'global_id',
                   'instrument_id', 'instrument_name', 'observed_at', 'evidence_source', 'evidence_id',
                   'severity','incident_id','device_id','audiences','warning_number','fire_stage','zone_id','sources','image_observed_at',
-                  'hardware_observed_at','visual_observed_at','source_frame_id','time_domain'}
+                  'hardware_observed_at','visual_observed_at','source_frame_id','time_domain','visual_confidence'}
         item = {k: v for k, v in event.items() if k in fields}
         item.setdefault('severity','L0' if item.get('event_type') in {'person.entered','instrument.started','instrument.ended'} else 'L1')
         if (item.get('event_type') not in KINDS or item.get('lab_id') != self.config['lab_id']
@@ -201,19 +219,27 @@ class ManagementNotifications:
             encoded = json.dumps(item, ensure_ascii=False, sort_keys=True)
             previous = self.db.execute('SELECT payload FROM events WHERE id=?', (item['event_id'],)).fetchone()
             if previous:
-                if item.get('warning_number'):
+                if item['event_type'] in VISUAL_PREWARNINGS.values() and item.get('evidence_id'):
+                    saved = json.loads(previous['payload'])
+                    if saved['event_type'] == item['event_type'] and not saved.get('evidence_id'):
+                        from fire_snapshot_album import enqueue_visual_snapshot
+                        saved['evidence_id'] = item['evidence_id']
+                        self.db.execute('UPDATE events SET payload=? WHERE id=?',
+                                        (json.dumps(saved, ensure_ascii=False, sort_keys=True), item['event_id']))
+                        if item['event_type'] == VISUAL_PREWARNINGS['flame']:
+                            enqueue_visual_snapshot(self, saved, saved['evidence_id'])
+                if item.get('warning_number') or item['event_type'] in VISUAL_PREWARNINGS.values():
                     return False
                 if previous['payload'] != encoded:
                     raise ValueError('event_id conflict')
                 return False
             # Cooldown is persistent and shared across cameras; short ID churn does not spam.
-            semantic = (item['event_type'], item.get('person_id'), item.get('instrument_id'))
-            for row in self.db.execute('SELECT payload FROM events WHERE received>?',
-                                       (self.wall() - self.config.get('cooldown_seconds', 120),)):
-                old = json.loads(row['payload'])
-                if (not item.get('incident_id') and item.get('severity')!='L3' and
-                        (old['event_type'], old.get('person_id'), old.get('instrument_id')) == semantic):
-                    return False
+            if not item.get('incident_id') and item.get('severity') != 'L3' and not uses_visual_flame_timing(item):
+                semantic = cooldown_key(item)
+                for row in self.db.execute('SELECT payload FROM events WHERE received>?',
+                                           (self.wall() - self.config.get('cooldown_seconds', 120),)):
+                    if cooldown_key(json.loads(row['payload'])) == semantic:
+                        return False
             if item.get('warning_number') and not self.ppe_policy.commit_warning(item, stamp(item['observed_at'])):
                 return False
             self.db.execute('INSERT INTO events(id,payload,received) VALUES(?,?,?)',
@@ -222,8 +248,9 @@ class ManagementNotifications:
                 self.incidents.note_ppe(item)
             for route in self.config.get('routes', []):
                 if item['event_type'] not in self.config.get('silent_events', []) and route_accepts(route, item):
+                    priority = 3 if item['severity'] == 'L3' or item['event_type'] == VISUAL_PREWARNINGS['flame'] else 1
                     self.db.execute('INSERT INTO outbox(event_id,route_id,state,due,priority) VALUES(?,?,?,?,?)',
-                                    (item['event_id'], route['id'], 'pending', self.wall(),3 if item.get('severity')=='L3' else 1))
+                                    (item['event_id'], route['id'], 'pending', self.wall(), priority))
             from fire_snapshot_album import enqueue as enqueue_fire_snapshots
             enqueue_fire_snapshots(self, item)
             self._audit('system', 'event.record', item['event_id'])
@@ -234,13 +261,13 @@ class ManagementNotifications:
                         (self.wall(), actor, action, target))
 
     def cooling_down(self,event):
-        if event.get('incident_id'):return False
-        semantic=(event['event_type'],event.get('person_id'),event.get('instrument_id'))
+        if event.get('incident_id') or uses_visual_flame_timing(event):return False
+        semantic=cooldown_key(event)
         with self.lock:
             for row in self.db.execute('SELECT payload FROM events WHERE received>?',
                 (self.wall()-self.config.get('cooldown_seconds',120),)):
                 previous=json.loads(row['payload'])
-                if (previous['event_type'],previous.get('person_id'),previous.get('instrument_id'))==semantic:
+                if cooldown_key(previous) == semantic:
                     return True
         return False
 
@@ -303,6 +330,16 @@ class ManagementNotifications:
                     f"\n人员：{event['display_name']}\n仪器：{event['instrument_name']}"
                     f"\n摄像头：{event['camera_id']}\n开始：{local(event['started_at'])}{ending}"
                     f"\n时间依据：源画面（北京时间）\n会话：{event['session_id']}\n事件：{event['event_id']}")
+        if event['event_type'] in VISUAL_PREWARNINGS.values():
+            hazard = '烟雾' if event['event_type'] == VISUAL_PREWARNINGS['smoke'] else '火焰'
+            observed = datetime.fromtimestamp(stamp(event['observed_at']), timezone(timedelta(hours=8)))
+            camera = {'cam_1': '实验室 1', 'cam_2': '实验室 2', 'cam_entrance': '入口'}.get(
+                event['camera_id'], event['camera_id'])
+            title = ('实验室火焰持续预警' if event.get('fire_stage') == 'visual_ongoing'
+                     else f'实验室{hazard}视觉预警')
+            return (f"{title} · 待复核\n摄像头：{camera}\n"
+                    f"观测时间（北京时间）：{observed:%Y-%m-%d %H:%M:%S}\n"
+                    f"模型置信度：{event['visual_confidence']}\n请核对现场或安全大屏。\n事件：{event['event_id']}")
         if event['event_type'].startswith('environment.'):
             stage=event.get('fire_stage')
             title=('【L3 紧急】视觉与硬件双源火焰确认，需现场核查' if stage=='dual_confirmed' else

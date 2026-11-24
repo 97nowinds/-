@@ -1,15 +1,57 @@
 """Claim durable delivery jobs, then perform network I/O outside the DB lock."""
 import json
 import uuid
+from hazard_feed import VISUAL_PREWARNINGS
+
+
+def evidence_image_key(service, evidence_id, preview=None):
+    from feishu_app import EVIDENCE_CREDENTIALS, FeishuAppClient, load_credentials
+
+    with service.image_lock:
+        if service.evidence is None or not EVIDENCE_CREDENTIALS.exists():
+            raise ValueError('evidence transport unavailable')
+        revision = EVIDENCE_CREDENTIALS.stat().st_mtime_ns
+        if service.image_client is None or service.image_credentials_revision != revision:
+            service.image_client = FeishuAppClient(load_credentials(EVIDENCE_CREDENTIALS), wall=service.wall)
+            service.image_credentials_revision = revision
+        client = service.image_client
+        app_id = client.credentials['app_id']
+        with service.lock:
+            saved = service.db.execute('SELECT image_key FROM evidence_uploads WHERE evidence_id=? AND app_id=?',
+                                       (evidence_id, app_id)).fetchone()
+        if saved:
+            return saved['image_key']
+        jpeg = service.evidence.read(evidence_id)
+        key = client.upload_image(preview(jpeg) if preview else jpeg)
+        with service.lock, service.db:
+            service.db.execute('INSERT OR REPLACE INTO evidence_uploads VALUES(?,?,?)', (evidence_id, app_id, key))
+        return key
+
+
+def smoke_payload(service, event, route, attempts):
+    from alert_evidence import group_evidence_payload
+    from fire_snapshot_album import group_preview
+    from management_notifications import feishu_payload
+
+    secret = service.env.get(route.get('secret_env', ''), '')
+    text = service.message(event)
+    if event.get('evidence_id'):
+        try:
+            key = evidence_image_key(service, event['evidence_id'], group_preview)
+        except Exception:
+            if not attempts:
+                raise
+        else:
+            return group_evidence_payload(text, key, secret, service.wall(), title='实验室烟雾视觉预警｜报警快照')
+    return feishu_payload(text + '\n触发快照未取得或上传失败，请核对现场。', secret, service.wall())
 
 
 def deliver(service):
     from management_notifications import route_accepts,stamp,feishu_payload
-    from feishu_app import EVIDENCE_CREDENTIALS,FeishuAppClient,load_credentials
     now=service.wall()
     with service.lock,service.db:
         service.db.execute("UPDATE outbox SET state='pending' WHERE state='sending' AND lease_until<=?",(now,))
-        row=service.db.execute('SELECT o.*,e.payload FROM outbox o JOIN events e ON e.id=o.event_id '
+        row=service.db.execute('SELECT o.*,e.payload,e.received FROM outbox o JOIN events e ON e.id=o.event_id '
             "WHERE o.state='pending' AND o.due<=? ORDER BY o.priority DESC,o.due LIMIT 1",(now,)).fetchone()
         if not row or now-service.last_send<1:return False
         event=json.loads(row['payload'])
@@ -29,6 +71,10 @@ def deliver(service):
         if not url:
             service.db.execute('UPDATE outbox SET due=? WHERE event_id=? AND route_id=?',(now+30,row['event_id'],row['route_id']))
             return False
+        if event['event_type'] == VISUAL_PREWARNINGS['smoke'] and not event.get('evidence_id') and now < row['received'] + 3:
+            service.db.execute('UPDATE outbox SET due=? WHERE event_id=? AND route_id=?',
+                               (row['received'] + 3, row['event_id'], row['route_id']))
+            return True
         claim=uuid.uuid4().hex
         changed=service.db.execute("UPDATE outbox SET state='sending',lease_until=?,claim=? WHERE event_id=? AND route_id=? AND state='pending'",
                         (now+60,claim,row['event_id'],row['route_id'])).rowcount
@@ -40,26 +86,20 @@ def deliver(service):
             # supplements every destination with the same three-camera album.
             payload=feishu_payload(service.message(event)+'\n三路现场快照随后补发；不代表三路均已检测到火焰。',
                 service.env.get(route.get('secret_env',''),''),service.wall())
+        elif event['event_type'] == VISUAL_PREWARNINGS['smoke']:
+            payload = smoke_payload(service, event, route, row['attempts'])
+        elif event['event_type'] == VISUAL_PREWARNINGS['flame']:
+            text = service.message(event)
+            if event.get('evidence_id'):
+                text += '\n触发画面将随后补发。'
+            payload = feishu_payload(text, service.env.get(route.get('secret_env', ''), ''), service.wall())
         elif event.get('warning_number') and event['severity'] == 'L3':
             # Escalation text must reach administrators even if image upload is unavailable.
             payload = feishu_payload(service.message(event)+'\n证据与处置记录：实验室通知管理 → 告警处置',
                                      service.env.get(route.get('secret_env', ''), ''), service.wall())
         elif event.get('evidence_id'):
             from alert_evidence import group_evidence_payload
-            with service.image_lock:
-                if service.evidence is None or not EVIDENCE_CREDENTIALS.exists():raise ValueError('evidence transport unavailable')
-                revision=EVIDENCE_CREDENTIALS.stat().st_mtime_ns
-                if service.image_client is None or service.image_credentials_revision!=revision:
-                    service.image_client=FeishuAppClient(load_credentials(EVIDENCE_CREDENTIALS),wall=service.wall)
-                    service.image_credentials_revision=revision
-                client=service.image_client;app_id=client.credentials['app_id']
-                with service.lock:
-                    old=service.db.execute('SELECT image_key FROM evidence_uploads WHERE evidence_id=? AND app_id=?',
-                        (event['evidence_id'],app_id)).fetchone()
-                key=old['image_key'] if old else client.upload_image(service.evidence.read(event['evidence_id']))
-                if not old:
-                    with service.lock,service.db:
-                        service.db.execute('INSERT OR REPLACE INTO evidence_uploads VALUES(?,?,?)',(event['evidence_id'],app_id,key))
+            key = evidence_image_key(service, event['evidence_id'])
             payload=group_evidence_payload(service.message(event),key,service.env.get(route.get('secret_env',''),''),service.wall(),
                 title='实验室火焰报警｜证据快照' if event['event_type'].startswith('environment.') else '🟡 实验室防护警告｜证据快照')
         else:payload=feishu_payload(service.message(event),service.env.get(route.get('secret_env',''),''),service.wall())

@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from management_notifications import ManagementNotifications, EvidenceAdapter, feishu_payload, iso
 from handoff_result_index import SnapshotTrackIndex
+from hazard_feed import forward_visual_prewarnings
 
 
 class NotificationTests(unittest.TestCase):
@@ -80,6 +81,36 @@ class NotificationTests(unittest.TestCase):
         self.service = self.make_service()
         self.assertEqual(self.service.events({'role': 'admin'})[0]['deliveries'][0]['state'], 'sent')
         self.assertFalse(EvidenceAdapter(self.service).analysis(self.row(), self.index))
+
+    def test_live_visual_prewarnings_use_fire_routes_without_triggering_hardware_alarm(self):
+        self.service.config['routes'][0]['event_types'].append('environment.flame')
+        feed = self.path.with_suffix('.json')
+        checked_at = self.now
+        events = [
+            {'kind': 'smoke', 'at': checked_at - 1, 'source_at': 1700000000, 'score': .72},
+            {'kind': 'flame', 'at': checked_at - 1, 'source_at': 1700000001, 'score': .85},
+            {'kind': 'spark', 'at': checked_at - 1, 'source_at': 1700000002},
+            {'kind': 'smoke', 'at': checked_at - 10, 'source_at': 1699999990, 'score': .95},
+        ]
+        payload = {'observed_at_unix': checked_at, 'cameras': {
+            'cam_entrance': {'online': True, 'frames': 4, 'recent': events},
+            'cam_1': {'online': True, 'frames': 4, 'recent': [events[0]]},
+        }}
+        feed.write_text(json.dumps(payload))
+        forward_visual_prewarnings(self.service, feed, checked_at - 5)
+        for event in events[:2]:
+            event['at'] += .1
+        feed.write_text(json.dumps(payload))
+        forward_visual_prewarnings(self.service, feed, checked_at - 5)
+        self.assertEqual(self.service.db.execute('SELECT count(*) FROM events').fetchone()[0], 3)
+        self.assertEqual(self.service.db.execute('SELECT count(*) FROM fire_snapshot_jobs').fetchone()[0], 0)
+        self.now += 3
+        for _ in range(3):
+            self.assertTrue(self.service.deliver_once())
+            self.now += 1
+        texts = [message['content']['text'] for _, message in self.sent]
+        self.assertEqual(sum('烟雾视觉预警 · 待复核' in text for text in texts), 2)
+        self.assertEqual(sum('火焰视觉预警 · 待复核' in text for text in texts), 1)
 
     def test_failure_retry_does_not_leak_webhook(self):
         self.adapter.analysis(self.row(), self.index)

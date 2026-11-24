@@ -35,6 +35,7 @@ from member_integration import (
 
 
 ROOT = Path(__file__).resolve().parent
+from hazard_feed import read_hazard_feed
 TEMPLATE = ROOT / "templates" / "index.html"
 DISPLAY_TEMPLATE = ROOT / "templates" / "display.html"
 ANNOTATE_TEMPLATE = ROOT / "templates" / "annotate.html"
@@ -43,6 +44,7 @@ RECORDINGS_TEMPLATE = ROOT / "templates" / "recordings.html"
 STATIC = ROOT / "static"
 INSTRUMENT_CONFIG = ROOT / "config" / "instruments.json"
 EQUIPMENT_POSITIONS = ROOT / "runtime" / "equipment_positions.json"
+VISUAL_HAZARD_FEED = ROOT / "runtime" / "visual_hazard_observations.json"
 EQUIPMENT_LOCK = threading.Lock()
 TWIN_RENDER_LOCK = threading.Lock()
 
@@ -614,6 +616,9 @@ class FrontendHandler(SimpleHTTPRequestHandler):
                 self._send_json({'sessions': [], 'sync': {'state': 'disabled'}}, status=503)
             else:
                 self._send_json(runtime.instrument_sync.snapshot())
+            return
+        if route == "/api/hazards/observations":
+            self._send_json(read_hazard_feed(VISUAL_HAZARD_FEED))
             return
         if route == "/api/instruments/anchors":
             config = json.loads(INSTRUMENT_CONFIG.read_text(encoding="utf-8"))

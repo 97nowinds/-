@@ -1,5 +1,6 @@
 """Read-only readiness of the group notification chain; never expose secrets."""
 from feishu_app import EVIDENCE_CREDENTIALS
+from hazard_feed import VISUAL_PREWARNINGS
 
 
 def notification_status(runtime):
@@ -39,8 +40,15 @@ def notification_status(runtime):
     if enabled_ppe and not any(g['webhook_configured'] and enabled_ppe <= set(g['event_types'])
                                and g['audience'] == 'administrators' for g in groups):
         blockers.append('administrators_ppe_route_missing')
+    visual_thread = getattr(runtime, 'visual_hazard_thread', None)
     return {
         'groups': groups, 'silent_events': silent, 'ppe_rules': rules,
+        'visual_prewarnings': {
+            'running': visual_thread is not None and visual_thread.is_alive(),
+            'smoke_message_mode': 'single_with_snapshot',
+            'routes': [g['id'] for g in groups if g['webhook_configured'] and
+                       {'environment.flame', *VISUAL_PREWARNINGS.values()}.intersection(g['event_types'])],
+        },
         'ppe_live': dict(getattr(runtime, 'ppe_live_status', {})),
         'ppe_preparation': dict(service.config.get('ppe_preparation',{})),
         'outbox_counts': outbox,
