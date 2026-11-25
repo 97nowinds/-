@@ -11,11 +11,13 @@ import time
 import cv2
 
 from fire_detector import FireDetector
+from smoke_guard import SmokeGuard
 from visual_hazard_observer import spark_boxes
 
 CAMERAS = ("cam_1", "cam_2", "cam_entrance")
 THRESHOLDS = {"smoke": .60, "flame": .65}
 FLAME_REPEAT_SECONDS = 10.0
+FLAME_CONFIRM_WINDOW_SECONDS = 1.5
 FACE_MODEL = 'models/face_detection_yunet_2023mar.onnx'
 SPARK = SimpleNamespace(spark_luma=205, spark_delta=60, spark_min_area=2,
                         spark_max_area=120, spark_global_fraction=.08)
@@ -45,17 +47,21 @@ class SparkAlertWindow:
 
 
 class FlameAlertWindow:
-    """Require 3 of 5 detections and periodically report continuing flames."""
+    """Require three recent hits among up to five samples and repeat ongoing alerts."""
 
     def __init__(self):
         self.history = deque(maxlen=5)
         self.last_alert = None
 
     def observe(self, detected, now):
-        self.history.append(detected)
-        if not any(self.history):
+        while self.history and now - self.history[0][0] > FLAME_CONFIRM_WINDOW_SECONDS:
+            self.history.popleft()
+        if not self.history:
             self.last_alert = None
-        if not detected or sum(self.history) < 3:
+        self.history.append((now, detected))
+        if not any(hit for _, hit in self.history):
+            self.last_alert = None
+        if not detected or sum(hit for _, hit in self.history) < 3:
             return None
         if self.last_alert is None:
             self.last_alert = now
@@ -120,16 +126,34 @@ class Camera:
         self.generation = 0
         self.counts = Counter()
         self.events = deque(maxlen=32)
+        self.last_flame_delivery = None
 
-    def record(self, kind, score=None, snapshot=None, stage=None):
+    def record(self, kind, score=None, snapshot=None, stage=None, *, source=None, at=None):
         self.counts[kind] += 1
-        event = {"kind": kind, "camera": self.name, "at": time.time(), "score": score,
+        event = {"kind": kind, "camera": self.name, "at": time.time() if at is None else at, "score": score,
                  "sequence": self.counts[kind]}
         if snapshot is not None:
             event["snapshot"] = snapshot
         if stage is not None:
             event['stage'] = stage
+        if source is not None:
+            event['model'] = source
         self.events.append(event)
+
+    def record_flame(self, frame, frame_id, box, stage, score, source, captured):
+        now = time.monotonic()
+        previous = self.last_flame_delivery
+        if previous and previous[0] != source and now - previous[1] < FLAME_REPEAT_SECONDS:
+            from qwen_flame import covers_same_area
+            if covers_same_area(box, previous[2]):
+                return
+        snapshot = trigger_snapshot(frame, frame_id, box)
+        if source == 'qwen' and snapshot is None:
+            self.counts['qwen_snapshot_errors'] += 1
+            return
+        self.last_flame_delivery = source, now, box
+        self.record('flame', score, snapshot, stage, source=source,
+                    at=time.time() - max(0, now-captured))
 
     def capture(self):
         url = f"rtsp://127.0.0.1:8554/{self.name}"
@@ -172,7 +196,7 @@ class Camera:
                     self.generation += 1
             time.sleep(2)
 
-    def infer(self, detector, face_filter):
+    def infer(self, detector, face_filter, smoke_guard=None):
         generation = -1
         previous_frame = 0
         flame = FlameAlertWindow()
@@ -186,15 +210,19 @@ class Camera:
                     flame = FlameAlertWindow()
                     smoke_history.clear()
                     smoke_active = False
-                frame, frame_id = self.latest, self.counts["frames"]
+                frame, frame_id, captured = self.latest, self.counts["frames"], self.received
             if frame is not None and frame_id != previous_frame:
                 previous_frame = frame_id
                 try:
                     scores = {name: 0.0 for name in THRESHOLDS}
                     boxes = {}
+                    smoke_candidates = []
                     for item in detector.predict(frame, min(THRESHOLDS.values()))["detections"]:
                         name = item["class_name"].casefold()
                         name = "flame" if name == "fire" else name
+                        if name == 'smoke':
+                            smoke_candidates.append(item)
+                            continue
                         if name in scores and item["confidence"] > scores[name]:
                             if name == 'flame' and item['confidence'] >= THRESHOLDS['flame'] and face_filter:
                                 try:
@@ -209,9 +237,21 @@ class Camera:
                                         continue
                             scores[name] = item["confidence"]
                             boxes[name] = item['bbox']
+                    rejected_smoke = Counter()
+                    if smoke_guard is not None:
+                        try:
+                            smoke_candidates, rejected_smoke = smoke_guard.screen(frame, smoke_candidates)
+                        except (ValueError, RuntimeError, cv2.error):
+                            with self.lock:
+                                self.counts['smoke_guard_errors'] += 1
+                    if smoke_candidates:
+                        best = max(smoke_candidates, key=lambda item: item['confidence'])
+                        scores['smoke'] = best['confidence']
+                        boxes['smoke'] = best['bbox']
                     with self.lock:
                         if generation == self.generation:
                             self.counts["smoke_samples"] += 1
+                            self.counts.update({'smoke_rejected_'+reason: n for reason, n in rejected_smoke.items()})
                             smoke_history.append(scores['smoke'] >= THRESHOLDS['smoke'])
                             if not smoke_active and smoke_history[-1] and sum(smoke_history) >= 3:
                                 self.record('smoke', round(scores['smoke'], 4),
@@ -222,8 +262,8 @@ class Camera:
 
                             stage = flame.observe(scores['flame'] >= THRESHOLDS['flame'], time.monotonic())
                             if stage:
-                                self.record('flame', round(scores['flame'], 4),
-                                            trigger_snapshot(frame, frame_id, boxes['flame']), stage)
+                                self.record_flame(frame, frame_id, boxes['flame'], stage,
+                                                  round(scores['flame'], 4), 'yolo', captured)
                 except (RuntimeError, ValueError, cv2.error):
                     with self.lock:
                         self.counts["inference_errors"] += 1
@@ -245,6 +285,15 @@ class Camera:
                 "inference_errors": self.counts["inference_errors"],
                 'flame_face_candidates_rejected': self.counts['flame_face_candidates_rejected'],
                 'flame_face_filter_errors': self.counts['flame_face_filter_errors'],
+                'smoke_guard_errors': self.counts['smoke_guard_errors'],
+                'smoke_rejected_person': self.counts['smoke_rejected_person'],
+                'smoke_rejected_reflection': self.counts['smoke_rejected_reflection'],
+                'smoke_rejected_gray_frame': self.counts['smoke_rejected_gray_frame'],
+                'qwen_samples': self.counts['qwen_samples'],
+                'qwen_candidates': self.counts['qwen_candidates'],
+                'qwen_load_errors': self.counts['qwen_load_errors'],
+                'qwen_inference_errors': self.counts['qwen_inference_errors'],
+                'qwen_snapshot_errors': self.counts['qwen_snapshot_errors'],
                 "recent": [dict(event) for event in self.events],
             }
 
@@ -259,14 +308,27 @@ def main():
         face_filters = [FlameFaceFilter(root / FACE_MODEL) for _ in cameras]
     except (AttributeError, cv2.error):
         face_filters = [None] * len(cameras)
-    for camera, detector, face_filter in zip(cameras, detectors, face_filters):
+    try:
+        smoke_config = json.loads((root / 'config/smoke_guard.json').read_text(encoding='utf-8'))
+        smoke_guards = [SmokeGuard(root, smoke_config, cam.name) for cam in cameras]
+    except (OSError, ValueError, KeyError, RuntimeError):
+        smoke_guards = [None] * len(cameras)
+    for camera, detector, face_filter, smoke_guard in zip(cameras, detectors, face_filters, smoke_guards):
         threading.Thread(target=camera.capture, daemon=True).start()
-        threading.Thread(target=camera.infer, args=(detector, face_filter), daemon=True).start()
+        threading.Thread(target=camera.infer, args=(detector, face_filter, smoke_guard), daemon=True).start()
+    qwen_config = root / 'config/qwen_flame.json'
+    if qwen_config.is_file():
+        qwen = json.loads(qwen_config.read_text(encoding='utf-8'))
+        if qwen['enabled']:
+            from qwen_flame import run_qwen
+            threading.Thread(target=run_qwen, args=(cameras, qwen['model_path']), daemon=True,
+                             name='qwen-flame').start()
     while True:
         data = {"observed_at_unix": time.time(), "flame_snapshot": "trigger_frame",
                 'smoke_snapshot': 'trigger_frame',
                 'flame_repeat_seconds': FLAME_REPEAT_SECONDS,
                 'flame_face_filter': 'active' if all(face_filters) else 'unavailable',
+                'smoke_guard': 'active' if all(smoke_guards) else 'unavailable',
                 "spark_rule": {"count": 3, "seconds": 3},
                 "cameras": {cam.name: cam.status() for cam in cameras}}
         print(json.dumps(data, separators=(",", ":")), flush=True)

@@ -88,6 +88,14 @@ def deliver(service):
                 service.env.get(route.get('secret_env',''),''),service.wall())
         elif event['event_type'] == VISUAL_PREWARNINGS['smoke']:
             payload = smoke_payload(service, event, route, row['attempts'])
+        elif event['event_type'] == VISUAL_PREWARNINGS['flame'] and event.get('visual_model') == 'qwen':
+            from alert_evidence import group_evidence_payload
+            from fire_snapshot_album import group_preview
+            key = evidence_image_key(service, event['evidence_id'], group_preview)
+            title = ('实验室火焰持续预警｜Qwen' if event.get('fire_stage') == 'visual_ongoing'
+                     else '实验室火焰视觉预警｜Qwen')
+            payload = group_evidence_payload(service.message(event), key,
+                service.env.get(route.get('secret_env', ''), ''), service.wall(), title=title)
         elif event['event_type'] == VISUAL_PREWARNINGS['flame']:
             text = service.message(event)
             if event.get('evidence_id'):

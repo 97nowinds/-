@@ -48,6 +48,8 @@ def read_hazard_feed(path, now=None, *, notifications=False):
                                        and math.isfinite(score) and 0 <= score <= 1 else None})
                         if kind == 'flame' and event.get('stage') in VISUAL_FLAME_STAGES:
                             recent[-1]['stage'] = event['stage']
+                        if kind == 'flame' and event.get('model') == 'qwen':
+                            recent[-1]['visual_model'] = 'qwen'
                         if notifications:
                             key = f"{name}/{kind}/{source_at:.6f}"
                             recent[-1]["event_id"] = "visual-hazard:" + hashlib.sha256(key.encode()).hexdigest()
@@ -69,12 +71,19 @@ def forward_visual_prewarnings(service, path, started_at):
     feed = read_hazard_feed(path, now, notifications=True)
     oldest = max(started_at, now - service.config.get("event_max_age_seconds", 15))
     for event in reversed(feed.get("recent", ())):
-        if event["at"] < oldest or event["score"] is None:
+        qwen = event.get('visual_model') == 'qwen'
+        if event["at"] < oldest or (not qwen and event["score"] is None):
+            continue
+        if qwen and (not event.get('evidence_id') or not event.get('stage')):
             continue
         payload = {"event_id": event["event_id"], "event_type": VISUAL_PREWARNINGS[event["kind"]],
                         "lab_id": service.config["lab_id"], "device_id": event["camera"],
                         "camera_id": event["camera"], "observed_at": iso(event["at"]),
-                        "evidence_source": "cluster_visual", "visual_confidence": f'{event["score"]:.1%}'}
+                        "evidence_source": "cluster_visual"}
+        if qwen:
+            payload['visual_model'] = 'qwen'
+        else:
+            payload['visual_confidence'] = f'{event["score"]:.1%}'
         if event.get('evidence_id'):
             payload['evidence_id'] = event['evidence_id']
         if event.get('stage'):

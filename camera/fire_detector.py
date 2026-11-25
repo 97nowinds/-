@@ -10,7 +10,7 @@ import numpy as np
 
 
 class FireDetector:
-    def __init__(self,model,sha256,threads=2,session=None):
+    def __init__(self,model,sha256,threads=2,session=None,*,classes=None):
         if not 1<=threads<=4:raise ValueError('fire CPU thread limit must be 1..4')
         path=Path(model)
         if hashlib.sha256(path.read_bytes()).hexdigest()!=sha256:raise ValueError('fire model checksum mismatch')
@@ -29,7 +29,13 @@ class FireDetector:
         if set(names)!=set(range(len(names))):raise ValueError('contiguous model class IDs required')
         self.names=names
         self.fire_ids={k for k,v in names.items() if v.lower() in {'fire','flame'}}
-        if not self.fire_ids:raise ValueError('model has no explicit fire class')
+        if classes is None:
+            if not self.fire_ids:raise ValueError('model has no explicit fire class')
+            self.detect_ids = tuple(names)
+        else:
+            self.detect_ids = tuple(key for key, name in names.items() if name.casefold() in classes)
+            if {names[key].casefold() for key in self.detect_ids} != set(classes):
+                raise ValueError('model missing a required object class')
 
     def preprocess(self,image):
         if image is None or image.ndim!=3 or image.shape[2]!=3 or image.dtype!=np.uint8:
@@ -52,7 +58,8 @@ class FireDetector:
         rows=output[0].T
         if not np.isfinite(rows).all():raise ValueError('non-finite model output')
         left,top,sx,sy=transform;h,w=image.shape[:2];detections=[]
-        for class_id,name in self.names.items():
+        for class_id in self.detect_ids:
+            name = self.names[class_id]
             selected=rows[rows[:,4+class_id]>=threshold]
             boxes=[];scores=[]
             for row in selected:

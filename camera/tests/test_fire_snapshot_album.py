@@ -8,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from management_notifications import ManagementNotifications, iso
 from fire_snapshot_album import FireSnapshotAlbums, CAMERAS, scene_time
 from hazard_live_worker import FlameAlertWindow, face_overlap
+from hazard_feed import forward_visual_prewarnings
+from qwen_flame import QwenFlameWindow
 
 
 class FireAlbumTests(unittest.TestCase):
@@ -106,6 +108,39 @@ class FireAlbumTests(unittest.TestCase):
         self.assertFalse(self.worker.capture_once())
         self.assertFalse(self.worker.deliver_once())
         self.assertEqual(len(self.sent), 3)
+
+    def test_qwen_fire_feed_delivers_one_message_with_evidence(self):
+        self.service.config['routes'] = [self.service.config['routes'][0]]
+        path = Path(self.tmp.name) / 'hazard.json'
+        payload = {'observed_at_unix': self.now, 'cameras': {'cam_2': {
+            'online': True, 'frames': 10, 'recent': [{
+                'kind': 'flame', 'stage': 'visual_initial', 'model': 'qwen',
+                'source_at': self.now, 'at': self.now, 'score': None,
+                'evidence_id': 'a' * 64}]}}}
+        path.write_text(json.dumps(payload))
+        forward_visual_prewarnings(self.service, path, self.now - 1)
+        forward_visual_prewarnings(self.service, path, self.now - 1)
+        with patch('notification_delivery.evidence_image_key', return_value='qwen-image'):
+            self.assertTrue(self.service.deliver_once())
+            self.assertFalse(self.service.deliver_once())
+        self.assertEqual(len(self.sent), 1)
+        _, message = self.sent[0]
+        post = message['content']['post']['zh_cn']
+        self.assertIn('Qwen', post['title'])
+        self.assertEqual(sum(x['tag'] == 'img' for row in post['content'] for x in row), 1)
+        self.assertEqual(self.service.db.execute('SELECT count(*) FROM fire_snapshot_jobs').fetchone()[0], 0)
+
+    def test_qwen_flame_requires_repeat_at_the_same_location(self):
+        window = QwenFlameWindow()
+        tray, door = [5, 5, 30, 30], [200, 100, 30, 30]
+        self.assertIsNone(window.observe([tray], 0.0))
+        self.assertIsNone(window.observe([], 0.5))
+        self.assertIsNone(window.observe([door], 1.0))
+        self.assertIsNone(window.observe([tray], 4.0))
+        self.assertEqual(window.observe([tray], 5.0), ('visual_initial', tray))
+        for t in range(6, 15):
+            self.assertIsNone(window.observe([tray], t))
+        self.assertEqual(window.observe([tray], 15), ('visual_ongoing', tray))
         for _, payload in self.sent:
             post = payload['content']['post']['zh_cn']
             self.assertIn('烟雾视觉预警', post['title'])
@@ -125,6 +160,16 @@ class FireAlbumTests(unittest.TestCase):
                 'lab_id': 'synthetic-lab', 'camera_id': 'cam_2', 'device_id': 'cam_2', 'observed_at': iso(self.now),
                 'visual_confidence': '76.6%', 'evidence_source': 'cluster_visual', 'fire_stage': stage}))
         self.assertEqual(self.service.db.execute('SELECT count(*) FROM outbox').fetchone()[0], 9)
+
+    def test_visual_flame_expires_stale_samples_and_ignores_one_flash(self):
+        window = FlameAlertWindow()
+        self.assertIsNone(window.observe(True, 0.0))
+        self.assertIsNone(window.observe(True, 0.25))
+        self.assertIsNone(window.observe(True, 10.0))
+        self.assertIsNone(window.observe(False, 10.25))
+        self.assertIsNone(window.observe(True, 12.0))
+        self.assertIsNone(window.observe(True, 12.25))
+        self.assertEqual(window.observe(True, 12.50), 'visual_initial')
 
     def test_flame_face_filter_requires_high_mutual_overlap(self):
         face = (1320, 899, 141, 177)

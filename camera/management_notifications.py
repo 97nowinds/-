@@ -200,7 +200,8 @@ class ManagementNotifications:
                   'camera_id', 'snapshot_id', 'track_id', 'global_id',
                   'instrument_id', 'instrument_name', 'observed_at', 'evidence_source', 'evidence_id',
                   'severity','incident_id','device_id','audiences','warning_number','fire_stage','zone_id','sources','image_observed_at',
-                  'hardware_observed_at','visual_observed_at','source_frame_id','time_domain','visual_confidence'}
+                  'hardware_observed_at','visual_observed_at','source_frame_id','time_domain','visual_confidence',
+                  'visual_model'}
         item = {k: v for k, v in event.items() if k in fields}
         item.setdefault('severity','L0' if item.get('event_type') in {'person.entered','instrument.started','instrument.ended'} else 'L1')
         if (item.get('event_type') not in KINDS or item.get('lab_id') != self.config['lab_id']
@@ -337,9 +338,12 @@ class ManagementNotifications:
                 event['camera_id'], event['camera_id'])
             title = ('实验室火焰持续预警' if event.get('fire_stage') == 'visual_ongoing'
                      else f'实验室{hazard}视觉预警')
+            detection = ('识别来源：Qwen3-VL-4B-Instruct（同一区域多帧确认）'
+                         if event.get('visual_model') == 'qwen'
+                         else f"模型置信度：{event['visual_confidence']}")
             return (f"{title} · 待复核\n摄像头：{camera}\n"
                     f"观测时间（北京时间）：{observed:%Y-%m-%d %H:%M:%S}\n"
-                    f"模型置信度：{event['visual_confidence']}\n请核对现场或安全大屏。\n事件：{event['event_id']}")
+                    f"{detection}\n请核对现场或安全大屏。\n事件：{event['event_id']}")
         if event['event_type'].startswith('environment.'):
             stage=event.get('fire_stage')
             title=('【L3 紧急】视觉与硬件双源火焰确认，需现场核查' if stage=='dual_confirmed' else

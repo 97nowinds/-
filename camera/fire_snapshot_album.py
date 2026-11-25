@@ -44,6 +44,8 @@ def enqueue(service, event):
 
 def enqueue_visual_snapshot(service, event, evidence_id, recording_frame=None):
     """Queue the already acquired one-camera visual frame in the current transaction."""
+    if event.get('visual_model') == 'qwen':
+        return
     camera = event['camera_id']
     item = {'status': 'available', 'camera_id': camera, 'evidence_id': evidence_id}
     if recording_frame is not None:

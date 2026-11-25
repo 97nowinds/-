@@ -33,12 +33,20 @@ with tempfile.TemporaryDirectory(prefix='aims-hazard-live-') as temp:
 def bundle(root):
     config = root / "config/fire_model.json"
     model = json.loads(config.read_text(encoding="utf-8"))["path"]
+    smoke_config = root / 'config/smoke_guard.json'
     payload = io.BytesIO()
     with tarfile.open(fileobj=payload, mode="w") as archive:
         for name in ("fire_detector.py", "config/fire_model.json", model, "visual_hazard_observer.py",
-                     'models/face_detection_yunet_2023mar.onnx'):
+                     'models/face_detection_yunet_2023mar.onnx', 'smoke_guard.py'):
             archive.add(root / name, arcname=name)
+        if smoke_config.is_file():
+            smoke_model = json.loads(smoke_config.read_text(encoding='utf-8'))['person_model']['path']
+            for name in ('config/smoke_guard.json', smoke_model):
+                archive.add(root / name, arcname=name)
         archive.add(Path(__file__).with_name("hazard_live_worker.py"), arcname="hazard_live_worker.py")
+        if (root / "config/qwen_flame.json").is_file():
+            for name in ("qwen_flame.py", "config/qwen_flame.json"):
+                archive.add(root / name, arcname=name)
     return payload.getvalue()
 
 
